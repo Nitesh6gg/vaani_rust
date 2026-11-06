@@ -1,0 +1,32 @@
+[package]
+name = "vaani"
+version = "0.1.0"
+edition = "2024"
+description = "Real-time voice agent: Asterisk ARI + AudioSocket media plane + Sarvam STT/TTS + OpenAI-compatible LLM (Rust port of vaani)"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.23"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+chrono-tz = "0.10"
+deadpool-postgres = "0.14"
+earshot = "1.2"
+futures-util = "0.3"
+rand = "0.10"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "json", "stream"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
+tokio-util = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+unicode-properties = "0.1.5"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
