@@ -14,6 +14,8 @@ pub const KIND_SLIN16: u8 = 0x12;
 
 pub const HEADER_SIZE: usize = 3;
 
+// One frame per 20ms tick, moved by value: boxing it would put an allocation on the hot path.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, PartialEq, Eq)]
 pub enum Inbound {
     /// A full 640-byte slin16 frame.

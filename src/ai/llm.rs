@@ -368,7 +368,10 @@ impl ToolCallAssembler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpListener};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
 
     fn delta(index: Option<i64>, id: &str, name: &str, args: &str) -> ToolCallDelta {
         ToolCallDelta {
@@ -428,10 +431,7 @@ mod tests {
         let mut c = LlmClient::new(&url, "k", "m");
         c.retry_max_wait = Duration::from_millis(50);
         let mut text = String::new();
-        let calls = c
-            .stream(&CancellationToken::new(), &[Message::new("user", "hi")], &[], &mut |t| text.push_str(t))
-            .await
-            .unwrap();
+        let calls = c.stream(&CancellationToken::new(), &[Message::new("user", "hi")], &[], &mut |t| text.push_str(t)).await.unwrap();
         assert_eq!(text, "Hello");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "end_call");

@@ -124,7 +124,7 @@ pub fn build(wf: &WorkflowJson, vars: &Map<String, Value>, tool_rows: &[ToolRow]
         }
     }
 
-    let global_prompt = wf.nodes.iter().filter(|n| n.kind == GLOBAL_NODE).last().map(|n| render(&n.data.prompt)).unwrap_or_default();
+    let global_prompt = wf.nodes.iter().rfind(|n| n.kind == GLOBAL_NODE).map(|n| render(&n.data.prompt)).unwrap_or_default();
 
     let (mut nodes, mut index, mut start): (Vec<Node>, HashMap<&str, usize>, Option<usize>) = (vec![], HashMap::new(), None);
     for n in wf.nodes.iter().filter(|n| n.kind != GLOBAL_NODE) {
@@ -173,7 +173,10 @@ pub fn build(wf: &WorkflowJson, vars: &Map<String, Value>, tool_rows: &[ToolRow]
         };
         let name = edge_function_name(&e.data.label);
         if nodes[from].tools.iter().any(|t| t.def.name == name) {
-            warnings.push(format!("node {:?}: edge {:?} and a tool share the function name {name:?}; the edge wins", nodes[from].name, e.data.label));
+            warnings.push(format!(
+                "node {:?}: edge {:?} and a tool share the function name {name:?}; the edge wins",
+                nodes[from].name, e.data.label
+            ));
         }
         let speech = if e.data.transition_speech_type == "audio" {
             warnings.push(format!("edge {:?}: audio transitions aren't supported yet; nothing is said", e.data.label));
@@ -181,11 +184,7 @@ pub fn build(wf: &WorkflowJson, vars: &Map<String, Value>, tool_rows: &[ToolRow]
         } else {
             render(&e.data.transition_speech)
         };
-        nodes[from].edges.push(Edge {
-            def: FunctionDef { name, description: e.data.condition.clone(), parameters: None },
-            speech,
-            to,
-        });
+        nodes[from].edges.push(Edge { def: FunctionDef { name, description: e.data.condition.clone(), parameters: None }, speech, to });
     }
     Ok((Workflow { nodes, start }, warnings))
 }
@@ -257,7 +256,10 @@ mod tests {
 
         let no_start = WorkflowJson::parse(r#"{"nodes":[{"id":"1","type":"agentNode","data":{}}]}"#).unwrap();
         assert!(build(&no_start, &Map::new(), &[], Utc::now()).is_err());
-        let bad_edge = WorkflowJson::parse(r#"{"nodes":[{"id":"1","data":{"is_start":true}}],"edges":[{"source":"1","target":"9","data":{"label":"x"}}]}"#).unwrap();
+        let bad_edge = WorkflowJson::parse(
+            r#"{"nodes":[{"id":"1","data":{"is_start":true}}],"edges":[{"source":"1","target":"9","data":{"label":"x"}}]}"#,
+        )
+        .unwrap();
         assert!(build(&bad_edge, &Map::new(), &[], Utc::now()).is_err());
         let two = WorkflowJson::parse(r#"{"nodes":[{"id":"1","data":{"is_start":true}},{"id":"2","data":{"is_start":true}}]}"#).unwrap();
         assert!(build(&two, &Map::new(), &[], Utc::now()).is_err());

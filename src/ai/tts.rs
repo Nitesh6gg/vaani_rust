@@ -15,7 +15,7 @@
 //! Events (audio, done, closed) travel on ONE channel, so a generation's audio
 //! is always delivered before its Done.
 
-use super::{ws_connect, urlenc, WsStream};
+use super::{WsStream, urlenc, ws_connect};
 use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use futures_util::{SinkExt, StreamExt};

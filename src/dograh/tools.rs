@@ -116,7 +116,8 @@ pub fn build_tool(r: &ToolRow) -> Result<(Tool, Option<String>)> {
                 } else {
                     cfg.end_call_reason_description.clone()
                 };
-                def.parameters = Some(json!({"type":"object","properties":{"reason":{"type":"string","description":desc}},"required":["reason"]}));
+                def.parameters =
+                    Some(json!({"type":"object","properties":{"reason":{"type":"string","description":desc}},"required":["reason"]}));
             }
             Ok((Tool { def, kind: ToolKind::EndCall, message }, None))
         }
@@ -137,14 +138,20 @@ fn build_http_tool(r: &ToolRow, cfg: ToolConfig, mut def: FunctionDef) -> Result
     if !cfg.credential_uuid.is_empty() {
         match &r.credential {
             None => {
-                warning = Some(format!("http tool {:?} ({}): credential {} not found or not active; calling without it", r.name, r.uuid, cfg.credential_uuid))
+                warning = Some(format!(
+                    "http tool {:?} ({}): credential {} not found or not active; calling without it",
+                    r.name, r.uuid, cfg.credential_uuid
+                ))
             }
             Some(c) => match auth_header(c) {
                 Ok(Some((k, v))) => {
                     headers.insert(k, v);
                 }
                 Ok(None) => {}
-                Err(e) => warning = Some(format!("http tool {:?} ({}): credential {}: {e}; calling without it", r.name, r.uuid, cfg.credential_uuid)),
+                Err(e) => {
+                    warning =
+                        Some(format!("http tool {:?} ({}): credential {}: {e}; calling without it", r.name, r.uuid, cfg.credential_uuid))
+                }
             },
         }
     }
@@ -197,7 +204,9 @@ fn auth_header(c: &Credential) -> Result<Option<(String, String)>> {
     Ok(match c.kind.as_str() {
         "bearer_token" => Some(("Authorization".into(), format!("Bearer {}", get("token", "")))),
         "api_key" => Some((get("header_name", "X-API-Key"), get("api_key", ""))),
-        "basic_auth" => Some(("Authorization".into(), format!("Basic {}", STANDARD.encode(format!("{}:{}", get("username", ""), get("password", "")))))),
+        "basic_auth" => {
+            Some(("Authorization".into(), format!("Basic {}", STANDARD.encode(format!("{}:{}", get("username", ""), get("password", ""))))))
+        }
         "custom_header" => Some((get("header_name", "X-Custom"), get("header_value", ""))),
         _ => None,
     })
@@ -283,10 +292,20 @@ impl HttpTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpListener};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
 
     fn row(category: &str, name: &str, def: Value) -> ToolRow {
-        ToolRow { uuid: "u".into(), name: name.into(), description: String::new(), category: category.into(), definition: def, credential: None }
+        ToolRow {
+            uuid: "u".into(),
+            name: name.into(),
+            description: String::new(),
+            category: category.into(),
+            definition: def,
+            credential: None,
+        }
     }
 
     #[test]
@@ -306,11 +325,15 @@ mod tests {
 
     #[test]
     fn http_tool_schema_and_credentials() {
-        let mut r = row("http_api", "Lookup", json!({"config": {
+        let mut r = row(
+            "http_api",
+            "Lookup",
+            json!({"config": {
             "url": "http://x/y", "method": "get", "credential_uuid": "c1", "customMessage": "One moment",
             "parameters": [
                 {"name": "id", "type": "number", "description": "order"},
-                {"name": "tags", "type": "array", "required": false, "item_schema": [{"name":"k","type":"weird"}]}]}}));
+                {"name": "tags", "type": "array", "required": false, "item_schema": [{"name":"k","type":"weird"}]}]}}),
+        );
         r.credential = Some(Credential { kind: "bearer_token".into(), data: json!({"token": "tok"}) });
         let (t, w) = build_tool(&r).unwrap();
         assert!(w.is_none());
@@ -355,7 +378,12 @@ mod tests {
     #[tokio::test]
     async fn get_sends_query_params_and_wraps_the_reply() {
         let (url, req) = serve(r#"{"ok":true}"#).await;
-        let t = HttpTool { method: "GET".into(), url: format!("{url}/o?x=1"), headers: [("X-A".into(), "b".into())].into(), timeout: Duration::from_secs(2) };
+        let t = HttpTool {
+            method: "GET".into(),
+            url: format!("{url}/o?x=1"),
+            headers: [("X-A".into(), "b".into())].into(),
+            timeout: Duration::from_secs(2),
+        };
         let out: Value = serde_json::from_str(&t.run(json!({"id": 5, "on": true, "tags": ["a", "b"]})).await).unwrap();
         assert_eq!(out, json!({"status":"success","status_code":200,"data":{"ok":true}}));
         let head = req.await.unwrap();
@@ -375,7 +403,12 @@ mod tests {
         assert_eq!(out["data"], json!({"raw_response": "plain text"}));
         assert!(req.await.unwrap().contains(r#"{"a":1}"#));
 
-        let dead = HttpTool { method: "GET".into(), url: "http://127.0.0.1:1/".into(), headers: Default::default(), timeout: Duration::from_secs(1) };
+        let dead = HttpTool {
+            method: "GET".into(),
+            url: "http://127.0.0.1:1/".into(),
+            headers: Default::default(),
+            timeout: Duration::from_secs(1),
+        };
         let out: Value = serde_json::from_str(&dead.run(Value::Null).await).unwrap();
         assert_eq!(out["status"], "error");
         assert_eq!(py_seconds(Duration::from_secs(5)), "5.0");

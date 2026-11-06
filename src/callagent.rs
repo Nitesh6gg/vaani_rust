@@ -41,10 +41,8 @@ pub struct Prepared {
 /// Loads the workflow and opens the STT. Runs concurrently with Asterisk
 /// connecting the media socket, so neither waits for the other.
 pub async fn prepare(cfg: &Config, store: &Store, info: &CallInfo, cancel: &CancellationToken) -> Result<Prepared> {
-    let vars: Map<String, Value> = json!({"caller_number": info.caller_number, "called_number": info.called_number})
-        .as_object()
-        .cloned()
-        .unwrap_or_default();
+    let vars: Map<String, Value> =
+        json!({"caller_number": info.caller_number, "called_number": info.called_number}).as_object().cloned().unwrap_or_default();
     let wf = tokio::time::timeout(LOAD_TIMEOUT, store.workflow(cfg.dograh_workflow_id, &vars))
         .await
         .context("dograh: workflow load timed out")??;

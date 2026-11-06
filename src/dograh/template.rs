@@ -7,8 +7,7 @@ use regex::{Captures, Regex};
 use serde_json::{Map, Value};
 use std::sync::LazyLock;
 
-static VAR: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\{\{\s*([^|\s}]+)(?:\s*\|\s*([^:}]+)(?::([^}]+))?)?\s*\}\}").unwrap());
+static VAR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\{\{\s*([^|\s}]+)(?:\s*\|\s*([^:}]+)(?::([^}]+))?)?\s*\}\}").unwrap());
 /// The zone of a `{{current_time_<Zone>}}`/`{{current_weekday_<Zone>}}`, which a
 /// bare `{{current_weekday}}`/`{{current_time}}` in the same template inherits.
 static BUILTIN_TZ: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\{\{\s*(?:current_time|current_weekday)_([^|\s}]+)").unwrap());
@@ -25,18 +24,18 @@ pub fn render(s: &str, vars: &Map<String, Value>, now: DateTime<Utc>) -> String 
         }
         let mut value = lookup(vars, path);
         let empty = matches!(&value, None | Some(Value::Null)) || value == Some(&Value::String(String::new()));
-        if let Some(filter) = m.get(2).map(|f| f.as_str().trim()).filter(|f| !f.is_empty()) {
-            if empty {
-                let fallback = if filter == "fallback" {
-                    match m.get(3).map(|f| f.as_str().trim()).filter(|f| !f.is_empty()) {
-                        Some(fb) => fb.to_string(),
-                        None => py_title(path),
-                    }
-                } else {
-                    filter.to_string()
-                };
-                return fallback;
-            }
+        if let Some(filter) = m.get(2).map(|f| f.as_str().trim()).filter(|f| !f.is_empty())
+            && empty
+        {
+            let fallback = if filter == "fallback" {
+                match m.get(3).map(|f| f.as_str().trim()).filter(|f| !f.is_empty()) {
+                    Some(fb) => fb.to_string(),
+                    None => py_title(path),
+                }
+            } else {
+                filter.to_string()
+            };
+            return fallback;
         }
         value.take().map(format_value).unwrap_or_default()
     });
@@ -50,10 +49,9 @@ fn builtin(path: &str, default_tz: &str, now: DateTime<Utc>) -> Option<String> {
         (z, false)
     } else if path == "current_weekday" {
         (default_tz, true)
-    } else if let Some(z) = path.strip_prefix("current_weekday_") {
-        (z, true)
     } else {
-        return None;
+        let z = path.strip_prefix("current_weekday_")?;
+        (z, true)
     };
     // An unknown zone isn't a built-in (Dograh logs it and falls through to vars).
     let tz: chrono_tz::Tz = if zone.is_empty() { chrono_tz::UTC } else { zone.parse().ok()? };

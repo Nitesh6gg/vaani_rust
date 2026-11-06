@@ -2,7 +2,7 @@
 //! any parent is loaded first; real env vars win). Same variable names as the
 //! Go server. Model/provider settings are NOT here: they come from Dograh.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::{env, time::Duration};
 
 #[derive(Debug, Clone)]
@@ -137,5 +137,40 @@ impl Config {
             bail!("config: DOGRAH_DB_MAX_CONNS must be at least 1");
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+impl Config {
+    /// A config for tests: loopback media on a small port range, no caps.
+    pub fn for_test(db_url: &str) -> Self {
+        Config {
+            ari_url: "http://127.0.0.1:1/ari".into(),
+            ari_user: "u".into(),
+            ari_pass: "p".into(),
+            ari_app: "vaani".into(),
+            media_ip: "127.0.0.1".into(),
+            media_port_base: 41000,
+            media_port_count: 4,
+            dograh_db_url: db_url.into(),
+            dograh_db_max_conns: 4,
+            dograh_workflow_id: 42,
+            barge_in_enabled: true,
+            barge_in_min_speech: Duration::from_millis(200),
+            barge_in_guard: Duration::from_millis(300),
+            post_cut_silence: Duration::from_millis(1200),
+            ack_filter: true,
+            ack_end_margin: Duration::from_millis(300),
+            metrics_addr: String::new(),
+            stt_ws_url: String::new(),
+            tts_ws_url: String::new(),
+            vad_threshold: 0.5,
+            max_call_duration: Duration::ZERO,
+            media_dead_timeout: Duration::from_secs(5),
+            llm_retries: 0,
+            llm_retry_max_wait: Duration::from_millis(50),
+            llm_max_failed_turns: 3,
+            llm_fallback_text: String::new(),
+        }
     }
 }

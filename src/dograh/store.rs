@@ -96,12 +96,28 @@ impl Store {
         let tool_rows = self.tools(&db, &wf.tool_uuids(), org_id).await?;
         let (workflow, mut warnings) =
             wfjson::build(&wf, &vars, &tool_rows, Utc::now()).with_context(|| format!("dograh: workflow {workflow_id}"))?;
-        let (services, w) = services::resolve(&user_config, &def_config).with_context(|| format!("dograh: workflow {workflow_id}: models"))?;
+        let (services, w) =
+            services::resolve(&user_config, &def_config).with_context(|| format!("dograh: workflow {workflow_id}: models"))?;
         warnings.extend(w);
         let (idle_timeout, max_duration, w) = call_limits(&def_config);
         warnings.extend(w);
 
         Ok(LoadedWorkflow { id: workflow_id, definition_id: def_id, org_id, workflow, services, idle_timeout, max_duration, warnings })
+    }
+
+    /// A store on its own fresh schema of the Postgres named by
+    /// `DOGRAH_TEST_DB_URL` (tests run in parallel and must not share tables);
+    /// `None` when the variable is unset. `sql` creates and fills the fixtures.
+    #[cfg(test)]
+    pub async fn for_test(schema: &str, sql: &str) -> Option<(Self, String)> {
+        let url = std::env::var("DOGRAH_TEST_DB_URL").ok()?;
+        let admin = Self::open(&url, 1).await.unwrap();
+        let db = admin.pool.get().await.unwrap();
+        db.batch_execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema};")).await.unwrap();
+        let scoped = format!("{url}?options=-csearch_path%3D{schema}");
+        let store = Self::open(&scoped, 4).await.unwrap();
+        store.pool.get().await.unwrap().batch_execute(sql).await.unwrap();
+        Some((store, scoped))
     }
 
     /// The active tools among `uuids` that belong to `org_id`, each with its
@@ -134,7 +150,8 @@ impl Store {
                     description: r.get(2),
                     category: r.get(3),
                     definition: serde_json::from_str(&def).unwrap_or(Value::Null),
-                    credential: kind.map(|kind| Credential { kind, data: data.and_then(|d| serde_json::from_str(&d).ok()).unwrap_or(Value::Null) }),
+                    credential: kind
+                        .map(|kind| Credential { kind, data: data.and_then(|d| serde_json::from_str(&d).ok()).unwrap_or(Value::Null) }),
                 })
             })
             .collect()
@@ -194,21 +211,12 @@ mod tests {
         assert_eq!(template_vars(r#"{"a":1}"#)["a"], 1);
     }
 
-    /// Runs against a real Postgres when `DOGRAH_TEST_DB_URL` is set (it
-    /// recreates the handful of Dograh tables this module reads, with Dograh's
-    /// column types: uuid tool ids, enum category/status, jsonb documents).
+    /// Runs against a real Postgres when `DOGRAH_TEST_DB_URL` is set. Recreates
+    /// the handful of Dograh tables this module reads, with Dograh's column
+    /// types: uuid tool ids, enum category/status, jsonb documents.
     #[tokio::test]
     async fn loads_a_workflow_from_postgres() {
-        let Ok(url) = std::env::var("DOGRAH_TEST_DB_URL") else {
-            eprintln!("skipped: DOGRAH_TEST_DB_URL not set");
-            return;
-        };
-        let store = Store::open(&url, 2).await.unwrap();
-        let db = store.pool.get().await.unwrap();
-        db.batch_execute(
-            r#"
-            DROP TABLE IF EXISTS external_credentials, tools, user_configurations, workflow_definitions, workflows CASCADE;
-            DROP TYPE IF EXISTS tool_category, tool_status;
+        let Some((store, _)) = Store::for_test("t_store", r#"
             CREATE TYPE tool_category AS ENUM ('http_api', 'end_call', 'transfer_call');
             CREATE TYPE tool_status AS ENUM ('active', 'archived');
             CREATE TABLE workflows (id serial PRIMARY KEY, user_id int, organization_id int,
@@ -241,11 +249,10 @@ mod tests {
               ('33333333-3333-3333-3333-333333333333', 99, 'Other org', '', 'end_call', 'active', '{}');
             INSERT INTO external_credentials (credential_uuid, organization_id, credential_type, credential_data, is_active)
               VALUES ('cred-1', 3, 'bearer_token', '{"token":"t0k"}', true);
-            "#,
-        )
-        .await
-        .unwrap();
-        drop(db);
+            "#).await else {
+            eprintln!("skipped: DOGRAH_TEST_DB_URL not set");
+            return;
+        };
 
         let vars = serde_json::json!({"caller_number": "98765"});
         let w = store.workflow(42, vars.as_object().unwrap()).await.unwrap();

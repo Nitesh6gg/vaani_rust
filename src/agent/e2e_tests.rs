@@ -7,140 +7,26 @@ use super::{
     workflow::{Node, Workflow},
 };
 use crate::{
-    ai::{llm::LlmClient, stt::{SttClient, SttConfig}, tts::TtsConfig},
-    media::{FRAME_SIZE, Frame, SILENCE, call::{MediaIo, MediaStats}},
+    ai::{
+        llm::LlmClient,
+        stt::{SttClient, SttConfig},
+        tts::TtsConfig,
+    },
+    media::{
+        Frame, SILENCE,
+        call::{MediaIo, MediaStats},
+    },
+    testkit::*,
 };
-use base64::{Engine, engine::general_purpose::STANDARD};
-use futures_util::{SinkExt, StreamExt};
 use std::{
-    sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering::SeqCst}},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering::SeqCst},
+    },
     time::Duration,
 };
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpListener,
-    sync::mpsc,
-};
-use tokio_tungstenite::tungstenite::Message as Ws;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-
-const TONE: i16 = 1000;
-
-fn tone_b64(frames: usize) -> String {
-    let mut pcm = Vec::with_capacity(frames * FRAME_SIZE);
-    for _ in 0..frames * FRAME_SIZE / 2 {
-        pcm.extend_from_slice(&TONE.to_le_bytes());
-    }
-    STANDARD.encode(pcm)
-}
-
-#[derive(Default)]
-struct TtsLog {
-    texts: Mutex<Vec<String>>,
-    connections: AtomicUsize,
-    closed: AtomicUsize,
-}
-
-/// Mock Sarvam TTS: every `text`+`flush` is answered with `frames` frames of
-/// tone, then a `final` event.
-async fn mock_tts(frames: usize) -> (String, Arc<TtsLog>) {
-    let lis = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("ws://{}/ws", lis.local_addr().unwrap());
-    let log = Arc::new(TtsLog::default());
-    let l = log.clone();
-    tokio::spawn(async move {
-        loop {
-            let (s, _) = lis.accept().await.unwrap();
-            let l = l.clone();
-            tokio::spawn(async move {
-                let mut ws = tokio_tungstenite::accept_async(s).await.unwrap();
-                l.connections.fetch_add(1, SeqCst);
-                let mut pending = String::new();
-                while let Some(Ok(m)) = ws.next().await {
-                    let Ws::Text(t) = m else { continue };
-                    let v: serde_json::Value = serde_json::from_str(t.as_str()).unwrap();
-                    match v["type"].as_str() {
-                        Some("text") => pending = v["data"]["text"].as_str().unwrap().to_string(),
-                        Some("flush") => {
-                            l.texts.lock().unwrap().push(std::mem::take(&mut pending));
-                            let audio = format!(r#"{{"type":"audio","data":{{"audio":"{}"}}}}"#, tone_b64(frames));
-                            let _ = ws.send(Ws::text(audio)).await;
-                            let _ = ws.send(Ws::text(r#"{"type":"event","data":{"event_type":"final"}}"#)).await;
-                        }
-                        _ => {}
-                    }
-                }
-                l.closed.fetch_add(1, SeqCst);
-            });
-        }
-    });
-    (url, log)
-}
-
-/// Mock Sarvam STT: counts audio messages, sends whatever the test pushes.
-async fn mock_stt() -> (String, mpsc::UnboundedSender<String>, Arc<AtomicUsize>) {
-    let lis = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("ws://{}/ws", lis.local_addr().unwrap());
-    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
-    let audio = Arc::new(AtomicUsize::new(0));
-    let a = audio.clone();
-    tokio::spawn(async move {
-        let (s, _) = lis.accept().await.unwrap();
-        let mut ws = tokio_tungstenite::accept_async(s).await.unwrap();
-        loop {
-            tokio::select! {
-                m = ws.next() => match m {
-                    Some(Ok(Ws::Text(t))) => {
-                        if t.as_str().contains("\"audio\"") { a.fetch_add(1, SeqCst); }
-                    }
-                    Some(Ok(_)) => {}
-                    _ => break,
-                },
-                Some(out) = rx.recv() => { let _ = ws.send(Ws::text(out)).await; }
-            }
-        }
-    });
-    (url, tx, audio)
-}
-
-/// Mock LLM: answers each request with `reply(request_body)` as SSE.
-async fn mock_llm(reply: impl Fn(&serde_json::Value) -> String + Send + Sync + 'static) -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
-    let lis = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}", lis.local_addr().unwrap());
-    let reqs = Arc::new(Mutex::new(vec![]));
-    let r = reqs.clone();
-    let reply = Arc::new(reply);
-    tokio::spawn(async move {
-        loop {
-            let (mut s, _) = lis.accept().await.unwrap();
-            let (r, reply) = (r.clone(), reply.clone());
-            tokio::spawn(async move {
-                let mut buf = vec![];
-                let body = loop {
-                    let mut chunk = [0u8; 8192];
-                    let n = s.read(&mut chunk).await.unwrap_or(0);
-                    if n == 0 { return; }
-                    buf.extend_from_slice(&chunk[..n]);
-                    let text = String::from_utf8_lossy(&buf).to_string();
-                    if let Some((head, body)) = text.split_once("\r\n\r\n") {
-                        let len = head.to_lowercase().split("content-length:").nth(1).and_then(|v| v.split("\r\n").next()?.trim().parse::<usize>().ok()).unwrap_or(0);
-                        if body.len() >= len { break serde_json::from_str::<serde_json::Value>(&body[..len]).unwrap(); }
-                    }
-                };
-                let sse = reply(&body);
-                r.lock().unwrap().push(body);
-                let head = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", sse.len());
-                let _ = s.write_all(head.as_bytes()).await;
-                let _ = s.write_all(sse.as_bytes()).await;
-            });
-        }
-    });
-    (url, reqs)
-}
-
-fn sse(text: &str) -> String {
-    format!("data: {}\n\ndata: [DONE]\n\n", serde_json::json!({"choices":[{"delta":{"content":text}}]}))
-}
 
 struct Rig {
     inbound: mpsc::Sender<Frame>,
@@ -195,7 +81,9 @@ async fn rig(tts_frames: usize, allow_interrupt: bool, llm_text: &'static str) -
         max_duration: Duration::ZERO,
         llm_max_failed_turns: 3,
         llm_fallback_text: String::new(),
-        hangup: Arc::new(move || { h.fetch_add(1, SeqCst); }),
+        hangup: Arc::new(move || {
+            h.fetch_add(1, SeqCst);
+        }),
     };
     let done = tokio::spawn(run(cfg, AgentIo { media, stt, stt_events }, cancel.clone()));
     Rig { inbound: in_tx, outbound: out_rx, stt_tx, stt_audio, tts, llm_reqs, cancel, hangups, done }
@@ -212,7 +100,9 @@ async fn collect_tone(r: &mut Rig, n: usize, max: Duration) -> usize {
         while let Some(f) = r.outbound.recv().await {
             if is_tone(&f) {
                 seen += 1;
-                if seen >= n { break; }
+                if seen >= n {
+                    break;
+                }
             }
         }
     })
@@ -271,7 +161,9 @@ async fn confirmed_barge_in_pauses_then_cuts_all_five() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     let mut during_pause = 0;
     while let Ok(f) = r.outbound.try_recv() {
-        if is_tone(&f) { during_pause += 1; }
+        if is_tone(&f) {
+            during_pause += 1;
+        }
     }
     assert_eq!(during_pause, 0, "paused: no reply audio plays");
     assert_eq!(r.tts.closed.load(SeqCst), 0, "a pause is not a cut: TTS connection stays open");
@@ -315,4 +207,108 @@ async fn backchannel_over_a_paused_reply_resumes_it() {
     r.cancel.cancel();
     let s = r.done.await.unwrap();
     assert_eq!((s.interruptions, s.false_interruptions), (0, 1));
+}
+
+/// Rough capacity probe, not a unit test: `BENCH_CALLS=500 cargo test --release bench_concurrent_agents -- --ignored --nocapture`.
+/// N agents run against shared mock providers (so the figures include the mocks'
+/// own work in this process -- an upper bound). Prints RSS and CPU time per call
+/// and the worst 20ms tick lateness seen by one probe agent.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn bench_concurrent_agents() {
+    fn rss_kb() -> u64 {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| s.lines().find(|l| l.starts_with("VmRSS:"))?.split_whitespace().nth(1)?.parse().ok())
+            .unwrap_or(0)
+    }
+    fn cpu_secs() -> f64 {
+        let s = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+        let f: Vec<&str> = s.rsplit(") ").next().unwrap_or("").split_whitespace().collect();
+        (f.get(11).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0) + f.get(12).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0))
+            / 100.0
+    }
+
+    let n: usize = std::env::var("BENCH_CALLS").ok().and_then(|v| v.parse().ok()).unwrap_or(200);
+    let secs: u64 = std::env::var("BENCH_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
+    let (tts_url, _tts) = mock_tts(10).await;
+    let (stt_url, stt_audio) = mock_stt_multi().await;
+    let (llm_url, _reqs) = mock_llm(|_| sse("Namaste. Main aapki kya madad kar sakti hoon?")).await;
+    let cancel = CancellationToken::new();
+
+    let (rss0, cpu0) = (rss_kb(), cpu_secs());
+    for i in 0..n {
+        let (stt, stt_events) = SttClient::connect(
+            "b",
+            SttConfig { ws_url: stt_url.clone(), api_key: "k".into(), model: "m".into(), language: "hi-IN".into() },
+            cancel.clone(),
+        )
+        .await
+        .unwrap();
+        let (in_tx, in_rx) = mpsc::channel(5);
+        let (out_tx, mut out_rx) = mpsc::channel(5);
+        let media = MediaIo { inbound: in_rx, outbound: out_tx, closed: CancellationToken::new(), stats: Arc::new(MediaStats::default()) };
+        // Stand-in for the writer task: drain agent frames, as the AudioSocket writer would.
+        tokio::spawn(async move { while out_rx.recv().await.is_some() {} });
+        let wf =
+            Workflow { start: 0, nodes: vec![Node { name: "s".into(), prompt: "p".into(), allow_interrupt: true, ..Default::default() }] };
+        let cfg = AgentConfig {
+            call_id: format!("b{i}"),
+            workflow: Arc::new(wf),
+            llm: LlmClient::new(&llm_url, "k", "m"),
+            tts: TtsConfig {
+                ws_url: tts_url.clone(),
+                api_key: "k".into(),
+                model: "bulbul:v3".into(),
+                voice: "v".into(),
+                language: "hi-IN".into(),
+            },
+            vad: Box::new(VoteDetector::earshot(0.5)),
+            barge_in_enabled: true,
+            barge_in_min_speech: Duration::from_millis(200),
+            barge_in_guard: Duration::from_millis(300),
+            post_cut_silence: Duration::from_millis(1200),
+            ack_filter: true,
+            ack_end_margin: Duration::from_millis(300),
+            idle_timeout: Duration::ZERO,
+            max_duration: Duration::ZERO,
+            llm_max_failed_turns: 3,
+            llm_fallback_text: String::new(),
+            hangup: Arc::new(|| {}),
+        };
+        let c = cancel.clone();
+        tokio::spawn(async move {
+            let h = tokio::spawn(run(cfg, AgentIo { media, stt, stt_events }, c));
+            // Caller side: a steady stream of (silent) frames at 20ms.
+            let mut t = crate::media::call::new_ticker();
+            while !h.is_finished() {
+                t.tick().await;
+                let _ = in_tx.try_send(SILENCE);
+            }
+        });
+    }
+
+    // Probe: how late does a 20ms tick fire while all of that runs?
+    let mut t = crate::media::call::new_ticker();
+    let (mut worst, mut last) = (Duration::ZERO, tokio::time::Instant::now());
+    let end = tokio::time::Instant::now() + Duration::from_secs(secs);
+    t.tick().await;
+    while tokio::time::Instant::now() < end {
+        t.tick().await;
+        let now = tokio::time::Instant::now();
+        worst = worst.max((now - last).saturating_sub(Duration::from_millis(20)));
+        last = now;
+    }
+    let (rss1, cpu1) = (rss_kb(), cpu_secs());
+    println!(
+        "calls={n} over {secs}s: RSS {:.1} MB ({:.0} KB/call), CPU {:.2}s ({:.1}% of one core, {:.3}% per call), worst tick lateness {:?}, stt msgs {}",
+        (rss1 - rss0) as f64 / 1024.0,
+        (rss1 - rss0) as f64 / n as f64,
+        cpu1 - cpu0,
+        (cpu1 - cpu0) / secs as f64 * 100.0,
+        (cpu1 - cpu0) / secs as f64 * 100.0 / n as f64,
+        worst,
+        stt_audio.load(SeqCst),
+    );
+    cancel.cancel();
 }

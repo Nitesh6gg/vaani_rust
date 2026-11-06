@@ -2,7 +2,10 @@
 //! `/healthz`). Hand-rolled on purpose: four numbers don't need a dependency.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
-use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpListener};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+};
 
 pub static CALLS_ACTIVE: AtomicU64 = AtomicU64::new(0);
 pub static CALLS_STARTED: AtomicU64 = AtomicU64::new(0);
@@ -41,7 +44,8 @@ pub async fn serve(addr: String) {
                 Some("/healthz") => ("503 Service Unavailable", "ari disconnected\n".into()),
                 _ => ("404 Not Found", String::new()),
             };
-            let resp = format!("HTTP/1.1 {code}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            let resp =
+                format!("HTTP/1.1 {code}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
             let _ = s.write_all(resp.as_bytes()).await;
         });
     }

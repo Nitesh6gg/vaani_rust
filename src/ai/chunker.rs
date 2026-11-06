@@ -79,12 +79,12 @@ impl SentenceChunker {
                 if last_space > 0 {
                     return Some(last_space);
                 }
-                if count >= HARD_LIMIT {
-                    if let Some(&(_, next)) = iter.peek() {
-                        if !is_mark(next) && r != VIRAMA {
-                            return Some(end);
-                        }
-                    }
+                if count >= HARD_LIMIT
+                    && let Some(&(_, next)) = iter.peek()
+                    && !is_mark(next)
+                    && r != VIRAMA
+                {
+                    return Some(end);
                 }
             }
 
@@ -158,7 +158,7 @@ mod tests {
     fn never_splits_a_devanagari_syllable() {
         let long: String = "बिजली".repeat(60); // one enormous "word", 300 chars
         let (o, rest) = run(&[&long]);
-        assert!(o.len() >= 1);
+        assert!(!o.is_empty());
         for chunk in &o {
             assert!(!chunk.ends_with(VIRAMA));
         }

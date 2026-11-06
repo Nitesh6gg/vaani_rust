@@ -11,7 +11,7 @@
 //! * Reconnect is lazy and one-shot with backoff, never a retry loop: a failed
 //!   send drops that frame and the next frame triggers one redial.
 
-use super::{ws_connect, urlenc, WsStream};
+use super::{WsStream, urlenc, ws_connect};
 use crate::media::Frame;
 use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -75,11 +75,7 @@ impl SttClient {
 fn build_url(cfg: &SttConfig) -> String {
     let base = if cfg.ws_url.is_empty() { BASE_URL } else { &cfg.ws_url };
     let lang = if cfg.language.is_empty() { "unknown" } else { &cfg.language };
-    format!(
-        "{base}?model={}&language-code={}&mode=transcribe&sample_rate={SAMPLE_RATE}&vad_signals=true",
-        urlenc(&cfg.model),
-        urlenc(lang)
-    )
+    format!("{base}?model={}&language-code={}&mode=transcribe&sample_rate={SAMPLE_RATE}&vad_signals=true", urlenc(&cfg.model), urlenc(lang))
 }
 
 #[derive(Deserialize)]
@@ -202,6 +198,9 @@ mod tests {
     #[test]
     fn url_carries_model_language_and_vad_signals() {
         let u = build_url(&SttConfig { ws_url: String::new(), api_key: "k".into(), model: "saaras:v4".into(), language: "hi-IN".into() });
-        assert_eq!(u, "wss://api.sarvam.ai/speech-to-text/ws?model=saaras%3Av4&language-code=hi-IN&mode=transcribe&sample_rate=16000&vad_signals=true");
+        assert_eq!(
+            u,
+            "wss://api.sarvam.ai/speech-to-text/ws?model=saaras%3Av4&language-code=hi-IN&mode=transcribe&sample_rate=16000&vad_signals=true"
+        );
     }
 }

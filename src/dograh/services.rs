@@ -117,7 +117,9 @@ pub fn resolve(user_cfg: &str, workflow_cfg: &str) -> Result<(Services, Vec<Stri
         .or_else(|| Some(s(&l, "base_url")).filter(|u| !u.is_empty()))
         .or_else(|| default_base_url(&provider).map(String::from));
     let Some(base_url) = base_url else {
-        bail!("llm provider {provider:?} isn't supported (Vaani needs an OpenAI-compatible one: openai, google, groq, openrouter, sarvam, bifrost, speaches)");
+        bail!(
+            "llm provider {provider:?} isn't supported (Vaani needs an OpenAI-compatible one: openai, google, groq, openrouter, sarvam, bifrost, speaches)"
+        );
     };
     let llm = LlmConfig { base_url, api_key: api_key(&l), model: s(&l, "model") };
     if llm.model.is_empty() {

@@ -25,12 +25,14 @@ pub(crate) async fn ws_connect(
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     let mut req = url.into_client_request()?;
     req.headers_mut().insert(header, key.parse()?);
-    let (ws, resp) = tokio::time::timeout(timeout, tokio_tungstenite::connect_async(req))
+    // tungstenite's default 128 KiB read + write buffers per socket, times two
+    // sockets per call, dominated a call's memory. Audio messages are ~1-2 KB.
+    let cfg = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default().read_buffer_size(16 * 1024).write_buffer_size(0);
+    let (ws, resp) = tokio::time::timeout(timeout, tokio_tungstenite::connect_async_with_config(req, Some(cfg), false))
         .await
         .map_err(|_| anyhow::anyhow!("handshake timed out"))??;
-    let rid = ["x-request-id", "request-id", "x-sarvam-request-id"]
-        .iter()
-        .find_map(|h| resp.headers().get(*h)?.to_str().ok().map(String::from));
+    let rid =
+        ["x-request-id", "request-id", "x-sarvam-request-id"].iter().find_map(|h| resp.headers().get(*h)?.to_str().ok().map(String::from));
     Ok((ws, rid))
 }
 

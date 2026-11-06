@@ -10,6 +10,8 @@ mod config;
 mod dograh;
 mod media;
 mod metrics;
+#[cfg(test)]
+mod testkit;
 
 use anyhow::{Context, Result};
 use std::sync::Arc;

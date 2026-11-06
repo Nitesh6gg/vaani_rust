@@ -32,7 +32,10 @@ use crate::{
         stt::{SttClient, SttEvent},
         tts::{TtsClient, TtsConfig, TtsEvent},
     },
-    media::{FRAME_SIZE, Frame, SILENCE, call::{MediaIo, new_ticker}},
+    media::{
+        FRAME_SIZE, Frame, SILENCE,
+        call::{MediaIo, new_ticker},
+    },
 };
 use std::{
     collections::{HashMap, VecDeque},
@@ -61,7 +64,8 @@ const TOOL_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_UTTERANCE_AGE: Duration = Duration::from_secs(60);
 
 /// Dograh's caller-silence instructions, added as user messages exactly as it does.
-const IDLE_FIRST: &str = "The user has been quiet. Politely and briefly ask if they're still there in the language that the user has been speaking so far.";
+const IDLE_FIRST: &str =
+    "The user has been quiet. Politely and briefly ask if they're still there in the language that the user has been speaking so far.";
 const IDLE_FINAL: &str = "The user has been quiet. We will be disconnecting the call now. Wish them a good day in the language that the user has been speaking so far.";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -113,12 +117,25 @@ pub struct Summary {
 
 enum Event {
     /// TTS connection `conn` was opened by a turn task.
-    TtsOpened { conn: u64, client: Arc<TtsClient> },
-    TtsOpenFailed { generation: u64 },
-    Tts { conn: u64, ev: TtsEvent },
-    NodeEntered { generation: u64, idx: usize },
+    TtsOpened {
+        conn: u64,
+        client: Arc<TtsClient>,
+    },
+    TtsOpenFailed {
+        generation: u64,
+    },
+    Tts {
+        conn: u64,
+        ev: TtsEvent,
+    },
+    NodeEntered {
+        generation: u64,
+        idx: usize,
+    },
     /// The call is ending (end_call tool, or an end node was reached): no more interruptions.
-    Closing { generation: u64 },
+    Closing {
+        generation: u64,
+    },
     LlmDone(LlmDone),
     Resume(u64),
     Idle(u64),
@@ -646,7 +663,9 @@ impl Agent {
                 None
             };
             match drop_why {
-                Some(why) => tracing::info!(call_id = %self.id, event = "agent.speech.dropped", why, text = %h.text, "held caller speech dropped"),
+                Some(why) => {
+                    tracing::info!(call_id = %self.id, event = "agent.speech.dropped", why, text = %h.text, "held caller speech dropped")
+                }
                 None => {
                     at.get_or_insert(h.at);
                     answer.push(h.text);
@@ -1104,10 +1123,10 @@ impl TurnCtx {
         if self.cancel.is_cancelled() {
             return; // turn already cancelled
         }
-        if let Err(e) = tts.speak(text, self.generation) {
-            if !self.cancel.is_cancelled() {
-                tracing::warn!(call_id = %self.call_id, event = "tts.error", generation = self.generation, error = %e, "tts speak failed");
-            }
+        if let Err(e) = tts.speak(text, self.generation)
+            && !self.cancel.is_cancelled()
+        {
+            tracing::warn!(call_id = %self.call_id, event = "tts.error", generation = self.generation, error = %e, "tts speak failed");
         }
     }
 }

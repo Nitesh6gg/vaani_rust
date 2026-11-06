@@ -318,7 +318,9 @@ impl Manager {
             // Hangups are routine 404s when the far end beat us to it: debug-level.
             // A bridge that survives holds Asterisk resources with no event that
             // would ever clean it up: that one warns.
-            if let Some(b) = bridge && let Err(e) = m.ari.delete_bridge(&b).await {
+            if let Some(b) = bridge
+                && let Err(e) = m.ari.delete_bridge(&b).await
+            {
                 tracing::warn!(call_id = %call.info.id, error = %e, "failed to delete bridge");
             }
             if let Err(e) = m.ari.hangup(&call.info.id).await {
@@ -338,5 +340,190 @@ impl Manager {
         for c in calls {
             self.teardown(&c);
         }
+    }
+}
+
+/// Whole-call test: a mock Asterisk (ARI REST + AudioSocket client), a real
+/// Postgres holding the Dograh workflow, and mock Sarvam/LLM servers. Runs only
+/// with `DOGRAH_TEST_DB_URL` set (see `dograh::store` tests).
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        ari::{Channel, Event},
+        media::{FRAME_SIZE, audiosocket},
+        testkit::*,
+    };
+    use std::sync::atomic::Ordering::SeqCst;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpStream,
+    };
+
+    /// Mock ARI REST: records "METHOD path" lines and answers 200 to all of them.
+    /// The externalMedia request's body is forwarded so the test can play Asterisk.
+    async fn mock_ari() -> (String, Arc<Mutex<Vec<String>>>, mpsc::UnboundedReceiver<serde_json::Value>) {
+        let lis = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/ari", lis.local_addr().unwrap());
+        let log = Arc::new(Mutex::new(vec![]));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let l = log.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut s, _) = lis.accept().await.unwrap();
+                let (l, tx) = (l.clone(), tx.clone());
+                tokio::spawn(async move {
+                    let mut buf = vec![];
+                    let (line, body) = loop {
+                        let mut c = [0u8; 4096];
+                        let n = s.read(&mut c).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&c[..n]);
+                        let t = String::from_utf8_lossy(&buf).to_string();
+                        if let Some((head, body)) = t.split_once("\r\n\r\n") {
+                            let len = head
+                                .to_lowercase()
+                                .split("content-length:")
+                                .nth(1)
+                                .and_then(|v| v.split("\r\n").next()?.trim().parse::<usize>().ok())
+                                .unwrap_or(0);
+                            if body.len() >= len {
+                                let mut it = head.lines().next().unwrap().split_whitespace();
+                                break (format!("{} {}", it.next().unwrap(), it.next().unwrap()), body[..len].to_string());
+                            }
+                        }
+                    };
+                    if line.contains("/channels/externalMedia") {
+                        let _ = tx.send(serde_json::from_str(&body).unwrap());
+                    }
+                    l.lock().unwrap().push(line);
+                    let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").await;
+                });
+            }
+        });
+        (url, log, rx)
+    }
+
+    fn channel(id: &str) -> Channel {
+        Channel { id: id.into(), ..Default::default() }
+    }
+
+    async fn wait_for(what: &str, cond: impl Fn() -> bool) {
+        for _ in 0..200 {
+            if cond() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    #[tokio::test]
+    async fn a_call_from_stasis_start_to_agent_audio_to_teardown() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let (tts_url, _tts) = mock_tts(10).await;
+        let (stt_url, _stt_tx, stt_audio) = mock_stt().await;
+        let (llm_url, llm_reqs) = mock_llm(|_| sse("Namaste, how can I help?")).await;
+        let (ari_url, ari_log, mut ext_req) = mock_ari().await;
+
+        let Some((store, db_url)) = Store::for_test("t_manager", &format!(
+            r#"
+                CREATE TABLE workflows (id serial PRIMARY KEY, user_id int, organization_id int, released_definition_id int, template_context_variables jsonb);
+                CREATE TABLE workflow_definitions (id serial PRIMARY KEY, workflow_id int, workflow_json jsonb, template_context_variables jsonb, workflow_configurations jsonb, is_current bool);
+                CREATE TABLE user_configurations (id serial PRIMARY KEY, user_id int, configuration jsonb);
+                CREATE TABLE tools (tool_uuid uuid, organization_id int, name text, description text, category text, status text, definition jsonb);
+                CREATE TABLE external_credentials (credential_uuid varchar, organization_id int, credential_type text, credential_data jsonb, is_active bool);
+                INSERT INTO user_configurations (user_id, configuration) VALUES (7, '{{
+                  "llm": {{"provider":"speaches","base_url":"{llm_url}","api_key":"k","model":"m"}},
+                  "stt": {{"provider":"sarvam","api_key":"k"}}, "tts": {{"provider":"sarvam","api_key":"k"}}}}');
+                INSERT INTO workflows (id, user_id, organization_id) VALUES (42, 7, 3);
+                INSERT INTO workflow_definitions (workflow_id, workflow_json, is_current)
+                  VALUES (42, '{{"nodes":[{{"id":"1","type":"startCall","data":{{"name":"Start","prompt":"Greet {{{{caller_number}}}}","is_start":true}}}}]}}', true);
+                "#)).await else {
+            eprintln!("skipped: DOGRAH_TEST_DB_URL not set");
+            return;
+        };
+
+        let mut cfg = Config::for_test(&db_url);
+        cfg.ari_url = ari_url.clone();
+        cfg.stt_ws_url = stt_url;
+        cfg.tts_ws_url = tts_url;
+        let mgr = Manager::new(Ari::new(&ari_url, "u", "p", "vaani"), Arc::new(cfg), store);
+        let (ev_tx, ev_rx) = mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        let run = tokio::spawn(mgr.clone().run(ev_rx, cancel.clone()));
+
+        // 1. The caller arrives: answered, and a media port is bound and listening.
+        let mut caller = channel("caller-1");
+        caller.caller = Some(crate::ari::Number { number: "98765".into() });
+        ev_tx.send(Event::StasisStart { channel: caller }).unwrap();
+        let ext = tokio::time::timeout(Duration::from_secs(5), ext_req.recv()).await.unwrap().unwrap();
+        assert_eq!(
+            (ext["encapsulation"].as_str(), ext["transport"].as_str(), ext["connection_type"].as_str()),
+            (Some("audiosocket"), Some("tcp"), Some("client"))
+        );
+        assert_eq!(ext["format"], "slin16");
+        assert!(ext["data"].as_str().is_some_and(|u| u.len() == 36), "the audiosocket uuid");
+        assert_eq!(mgr.ports.in_use(), 1);
+
+        // 2. Playing Asterisk: connect to external_host. It was bound BEFORE the
+        //    externalMedia request returned, so this can't be refused (invariant #9).
+        let mut asterisk = TcpStream::connect(ext["external_host"].as_str().unwrap()).await.unwrap();
+        let mut scratch = [0u8; audiosocket::HEADER_SIZE + FRAME_SIZE];
+        audiosocket::write_frame(&mut asterisk, &mut scratch, 0x01, ext["data"].as_str().unwrap().as_bytes()).await.unwrap();
+
+        // 3. The externalMedia leg enters Stasis: the bridge is built, the agent starts.
+        ev_tx.send(Event::StasisStart { channel: channel(ext["channelId"].as_str().unwrap()) }).unwrap();
+        let (mut rd, mut wr) = asterisk.into_split();
+        tokio::spawn(async move {
+            let mut scratch = [0u8; audiosocket::HEADER_SIZE + FRAME_SIZE];
+            let mut tick = media_call::new_ticker();
+            loop {
+                tick.tick().await;
+                if audiosocket::write_frame(&mut wr, &mut scratch, audiosocket::KIND_SLIN16, &[0u8; FRAME_SIZE]).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // 4. The agent speaks: tone frames arrive on the AudioSocket.
+        let mut tone = 0;
+        tokio::time::timeout(Duration::from_secs(8), async {
+            while let Ok(audiosocket::Inbound::Audio(f)) = audiosocket::read_frame(&mut rd).await {
+                if f[..2] == TONE.to_le_bytes() {
+                    tone += 1;
+                }
+                if tone >= 10 {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(tone, 10, "the agent's reply plays over AudioSocket");
+        assert!(stt_audio.load(SeqCst) > 0, "caller audio reaches the STT");
+        let req = llm_reqs.lock().unwrap()[0].clone();
+        assert_eq!(req["messages"][0]["content"], "Greet 98765", "Dograh's prompt, variables filled");
+        assert!(metrics::CALLS_ACTIVE.load(SeqCst) >= 1);
+
+        // 5. Hangup: everything is released exactly once.
+        ev_tx.send(Event::StasisEnd { channel: channel("caller-1") }).unwrap();
+        ev_tx.send(Event::StasisEnd { channel: channel(ext["channelId"].as_str().unwrap()) }).unwrap(); // the other leg's StasisEnd
+        wait_for("the port to be freed", || mgr.ports.in_use() == 0).await;
+        wait_for("ARI cleanup", || {
+            let l = ari_log.lock().unwrap();
+            l.iter().any(|x| x.starts_with("DELETE /ari/bridges/")) && l.iter().any(|x| x == "DELETE /ari/channels/caller-1")
+        })
+        .await;
+        let l = ari_log.lock().unwrap().clone();
+        assert!(l.contains(&"POST /ari/channels/caller-1/answer".to_string()), "{l:?}");
+        assert_eq!(l.iter().filter(|x| x.starts_with("DELETE /ari/bridges/")).count(), 1, "bridge deleted once: {l:?}");
+        assert!(mgr.calls.lock().unwrap().is_empty());
+
+        cancel.cancel();
+        run.await.unwrap();
     }
 }

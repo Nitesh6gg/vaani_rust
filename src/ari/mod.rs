@@ -48,9 +48,17 @@ impl Channel {
 
 #[derive(Debug, Clone)]
 pub enum Event {
-    StasisStart { channel: Channel },
-    StasisEnd { channel: Channel },
-    ChannelDestroyed { channel: Channel, cause: i64, cause_txt: String },
+    StasisStart {
+        channel: Channel,
+    },
+    StasisEnd {
+        channel: Channel,
+    },
+    ChannelDestroyed {
+        channel: Channel,
+        cause: i64,
+        cause_txt: String,
+    },
     /// The events WebSocket came back after a drop: anything that happened in
     /// the gap -- StasisEnd above all -- is lost for good.
     Reconnected,
@@ -129,11 +137,13 @@ impl Ari {
     }
 
     pub async fn create_bridge(&self, id: &str) -> Result<()> {
-        self.send(http().post(format!("{}/bridges?type=mixing&bridgeId={}&name={}", self.base, urlenc(id), urlenc(id))), "create bridge").await
+        self.send(http().post(format!("{}/bridges?type=mixing&bridgeId={}&name={}", self.base, urlenc(id), urlenc(id))), "create bridge")
+            .await
     }
 
     pub async fn add_to_bridge(&self, bridge: &str, channels: &[&str]) -> Result<()> {
-        self.send(http().post(format!("{}/bridges/{bridge}/addChannel?channel={}", self.base, urlenc(&channels.join(",")))), "add channel").await
+        self.send(http().post(format!("{}/bridges/{bridge}/addChannel?channel={}", self.base, urlenc(&channels.join(",")))), "add channel")
+            .await
     }
 
     pub async fn delete_bridge(&self, id: &str) -> Result<()> {
@@ -189,7 +199,9 @@ pub async fn run_events(url: String, tx: mpsc::UnboundedSender<Event>, connected
                     let msg = tokio::select! { _ = cancel.cancelled() => return, m = ws.next() => m };
                     match msg {
                         Some(Ok(Ws::Text(t))) => {
-                            if let Some(ev) = parse_event(t.as_str()) && tx.send(ev).is_err() {
+                            if let Some(ev) = parse_event(t.as_str())
+                                && tx.send(ev).is_err()
+                            {
                                 return;
                             }
                         }
@@ -229,7 +241,10 @@ mod tests {
         assert_eq!((channel.id.as_str(), channel.caller_number().as_str(), channel.called_number().as_str()), ("c1", "1001", "2000"));
         assert!(matches!(parse_event(r#"{"type":"StasisEnd","channel":{"id":"c1"}}"#), Some(Event::StasisEnd { .. })));
         let Some(Event::ChannelDestroyed { cause, cause_txt, .. }) =
-            parse_event(r#"{"type":"ChannelDestroyed","cause":16,"cause_txt":"Normal Clearing","channel":{"id":"c1"}}"#) else { panic!() };
+            parse_event(r#"{"type":"ChannelDestroyed","cause":16,"cause_txt":"Normal Clearing","channel":{"id":"c1"}}"#)
+        else {
+            panic!()
+        };
         assert_eq!((cause, cause_txt.as_str()), (16, "Normal Clearing"));
         assert!(parse_event(r#"{"type":"ChannelVarset"}"#).is_none());
         assert!(parse_event("garbage").is_none());
