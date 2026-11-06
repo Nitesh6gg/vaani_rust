@@ -34,6 +34,8 @@ pub struct SttConfig {
     pub api_key: String,
     pub model: String,
     pub language: String,
+    /// Ask Sarvam to honour `flush` messages (`flush_signal=true`).
+    pub flush_signal: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,8 +45,11 @@ pub enum SttEvent {
     Final(String),
 }
 
+// One frame per 20ms tick, moved by value: boxing it would put an allocation on the hot path.
+#[allow(clippy::large_enum_variant)]
 enum Cmd {
     Audio(Frame),
+    Flush,
 }
 
 #[derive(Clone)]
@@ -70,12 +75,22 @@ impl SttClient {
     pub fn feed(&self, frame: &Frame) -> bool {
         self.tx.try_send(Cmd::Audio(*frame)).is_ok()
     }
+
+    /// Asks Sarvam to finalize the current utterance now (`{"type":"flush"}`).
+    pub fn flush(&self) -> bool {
+        self.tx.try_send(Cmd::Flush).is_ok()
+    }
 }
 
 fn build_url(cfg: &SttConfig) -> String {
     let base = if cfg.ws_url.is_empty() { BASE_URL } else { &cfg.ws_url };
     let lang = if cfg.language.is_empty() { "unknown" } else { &cfg.language };
-    format!("{base}?model={}&language-code={}&mode=transcribe&sample_rate={SAMPLE_RATE}&vad_signals=true", urlenc(&cfg.model), urlenc(lang))
+    let flush = if cfg.flush_signal { "&flush_signal=true" } else { "" };
+    format!(
+        "{base}?model={}&language-code={}&mode=transcribe&sample_rate={SAMPLE_RATE}&vad_signals=true{flush}",
+        urlenc(&cfg.model),
+        urlenc(lang)
+    )
 }
 
 #[derive(Deserialize)]
@@ -166,9 +181,11 @@ async fn run(
                         }
                     }
                 }
-                let Cmd::Audio(f) = cmd;
-                let payload = serde_json::json!({"audio": {
-                    "data": STANDARD.encode(f), "sample_rate": SAMPLE_RATE, "encoding": "audio/wav"}});
+                let payload = match cmd {
+                    Cmd::Audio(f) => serde_json::json!({"audio": {
+                        "data": STANDARD.encode(f), "sample_rate": SAMPLE_RATE, "encoding": "audio/wav"}}),
+                    Cmd::Flush => serde_json::json!({"type": "flush"}),
+                };
                 if let Some(s) = sink.as_mut() && s.send(Ws::text(payload.to_string())).await.is_err() {
                     (sink, rd) = (None, None); // drop this frame; the next one redials
                 }
@@ -197,10 +214,16 @@ mod tests {
 
     #[test]
     fn url_carries_model_language_and_vad_signals() {
-        let u = build_url(&SttConfig { ws_url: String::new(), api_key: "k".into(), model: "saaras:v4".into(), language: "hi-IN".into() });
+        let u = build_url(&SttConfig {
+            ws_url: String::new(),
+            api_key: "k".into(),
+            model: "saaras:v4".into(),
+            language: "hi-IN".into(),
+            flush_signal: true,
+        });
         assert_eq!(
             u,
-            "wss://api.sarvam.ai/speech-to-text/ws?model=saaras%3Av4&language-code=hi-IN&mode=transcribe&sample_rate=16000&vad_signals=true"
+            "wss://api.sarvam.ai/speech-to-text/ws?model=saaras%3Av4&language-code=hi-IN&mode=transcribe&sample_rate=16000&vad_signals=true&flush_signal=true"
         );
     }
 }

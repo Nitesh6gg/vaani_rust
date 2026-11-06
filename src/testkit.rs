@@ -69,12 +69,12 @@ pub(crate) async fn mock_tts(frames: usize) -> (String, Arc<TtsLog>) {
 }
 
 /// Mock Sarvam STT: counts audio messages, sends whatever the test pushes.
-pub(crate) async fn mock_stt() -> (String, mpsc::UnboundedSender<String>, Arc<AtomicUsize>) {
+pub(crate) async fn mock_stt() -> (String, mpsc::UnboundedSender<String>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
     let lis = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}/ws", lis.local_addr().unwrap());
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
-    let audio = Arc::new(AtomicUsize::new(0));
-    let a = audio.clone();
+    let (audio, flushes) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let (a, f) = (audio.clone(), flushes.clone());
     tokio::spawn(async move {
         let (s, _) = lis.accept().await.unwrap();
         let mut ws = tokio_tungstenite::accept_async(s).await.unwrap();
@@ -83,6 +83,7 @@ pub(crate) async fn mock_stt() -> (String, mpsc::UnboundedSender<String>, Arc<At
                 m = ws.next() => match m {
                     Some(Ok(Ws::Text(t))) => {
                         if t.as_str().contains("\"audio\"") { a.fetch_add(1, SeqCst); }
+                        if t.as_str().contains("\"flush\"") { f.fetch_add(1, SeqCst); }
                     }
                     Some(Ok(_)) => {}
                     _ => break,
@@ -91,7 +92,7 @@ pub(crate) async fn mock_stt() -> (String, mpsc::UnboundedSender<String>, Arc<At
             }
         }
     });
-    (url, tx, audio)
+    (url, tx, audio, flushes)
 }
 
 /// Mock LLM: answers each request with `reply(request_body)` as SSE.

@@ -26,6 +26,7 @@ use super::{
     extract::{self, Finisher},
     recorder::MixRecorder,
     recordings::{ClipRouter, RECORDING_MARKER, strip_recording_refs},
+    sttgate::{GateConfig, SttGate},
     vad::BargeInDetector,
     workflow::{Clip, Edge, Node, ToolKind, Workflow, plain_history, request_messages},
 };
@@ -90,6 +91,10 @@ pub struct AgentConfig {
     pub barge_in_min_speech: Duration,
     pub barge_in_guard: Duration,
     pub post_cut_silence: Duration,
+    /// 0 = off: see `Config::stt_flush_after`.
+    pub stt_flush_after: Duration,
+    /// `Some`: send the STT only the caller's speech (see `sttgate`).
+    pub stt_gate: Option<GateConfig>,
     pub ack_filter: bool,
     pub ack_end_margin: Duration,
     /// 0 disables caller-silence handling.
@@ -194,6 +199,8 @@ struct Agent {
     log: CallLog,
     recorder: MixRecorder,
     stt_frames: u64,
+    gate: Option<SttGate>,
+    flushed_utt: Option<Instant>,
     llm_usage_key: String,
     turn_speech_end: Option<Instant>,
     /// Extractions running in the background, in the order they started.
@@ -268,6 +275,7 @@ pub async fn run(cfg: AgentConfig, io: AgentIo, cancel: CancellationToken) -> (S
     let AgentIo { mut media, stt, mut stt_events } = io;
     let now = Instant::now();
     let node = cfg.workflow.start;
+    let gate = cfg.stt_gate.map(|g| SttGate::new(g, now));
     let llm_usage_key = format!("LLM|||{}", cfg.llm.model);
     let mut a = Agent {
         id: cfg.call_id.clone(),
@@ -278,6 +286,8 @@ pub async fn run(cfg: AgentConfig, io: AgentIo, cancel: CancellationToken) -> (S
         log: CallLog::default(),
         recorder: MixRecorder::default(),
         stt_frames: 0,
+        gate,
+        flushed_utt: None,
         llm_usage_key,
         turn_speech_end: None,
         extracting: vec![],
@@ -392,9 +402,55 @@ impl Agent {
         self.log.error(stage);
     }
 
-    /// The caller audio handed to the STT is what Sarvam bills: every frame of the call.
+    /// The caller audio handed to the STT is what Sarvam bills: every frame of the
+    /// call, or with the gate only the speech (and its pre-roll).
     fn stt_frames_to_log(&mut self) {
-        self.log.stt_seconds = self.stt_frames as f64 * crate::media::FRAME_INTERVAL.as_secs_f64();
+        self.log.stt_seconds = match &self.gate {
+            Some(g) => g.sent_seconds(),
+            None => self.stt_frames as f64 * crate::media::FRAME_INTERVAL.as_secs_f64(),
+        };
+        self.log.stt_gated = self.gate.is_some();
+    }
+
+    /// Hands the caller's frame to the STT: all of them, or with the gate only
+    /// the speech (the gate keeps the audio before it).
+    fn feed_stt(&mut self, pcm: &Frame) {
+        let Some(gate) = self.gate.as_mut() else {
+            self.stt_frames += 1;
+            if !self.stt.feed(pcm) {
+                self.log.error("stt");
+            }
+            return;
+        };
+        let now = Instant::now();
+        let why = gate.cfg().voiced(self.cfg.vad.last_speech_at(), now, pcm);
+        let (stt, mut failed) = (&self.stt, false);
+        if gate.frame(pcm, why, now, &mut |f| failed |= !stt.feed(f)) {
+            tracing::debug!(call_id = %self.id, component = "stt", event = "stt.gate_open", reason = ?why, preroll_ms = 0, "stt gate open");
+        }
+        if failed {
+            self.log.error("stt");
+        }
+    }
+
+    /// Asks the STT to finalize the current utterance once the VAD has heard
+    /// `stt_flush_after` of quiet after it -- at most once per utterance.
+    fn maybe_flush_stt(&mut self) {
+        /// The VAD's last speech must be no older than this before the STT's onset.
+        const ONSET_SLACK: Duration = Duration::from_millis(500);
+        let Some(utt) = self.utt_start.filter(|u| self.caller_speaking && self.flushed_utt != Some(*u)) else { return };
+        // The VAD didn't hear this utterance: no flush, the STT's own end-of-speech decides.
+        let Some(last) = self.cfg.vad.last_speech_at().filter(|l| *l >= utt.checked_sub(ONSET_SLACK).unwrap_or(utt)) else { return };
+        let quiet = last.elapsed();
+        if quiet < self.cfg.stt_flush_after {
+            return;
+        }
+        self.flushed_utt = Some(utt);
+        if self.stt.flush() {
+            tracing::debug!(call_id = %self.id, event = "stt.flush", quiet_ms = quiet.as_millis() as u64, "stt flush sent");
+        } else {
+            self.log.error("stt");
+        }
     }
 
     fn interruptible(&self) -> bool {
@@ -438,9 +494,9 @@ impl Agent {
         // doing: feeding only while listening clipped the first syllable of
         // answers given over the agent. What to do with each transcript is
         // decided when it arrives.
-        self.stt_frames += 1;
-        if !self.stt.feed(pcm) {
-            self.agent_error("stt");
+        self.feed_stt(pcm);
+        if !self.cfg.stt_flush_after.is_zero() {
+            self.maybe_flush_stt();
         }
         match self.state {
             State::Speaking => self.process_speaking_frame(pcm),

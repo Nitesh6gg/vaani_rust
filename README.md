@@ -22,16 +22,17 @@ Milestones 1 and 2 are done and tested: a Rust call is now a complete call, reco
 | **Dograh call record**: `workflow_runs` created at call start and completed at the end (conversation events, nodes visited, disposition + organization mapping, usage/cost info, call tags) | done |
 | **Recording + transcript** mixed to mono WAV and uploaded to Dograh's MinIO (hand-written SigV4, checked against the MinIO Python client) | done |
 | **Recorded clips**: audio greeting, audio transitions, tool messages, and the `● recording_id` / `▸ text` reply mode (MinIO → ffmpeg → trimmed, cached in memory and on disk) | done |
+| **Variable extraction** (per node on leaving it, and at call end after teardown) feeding `gathered_context`, the disposition and call tags | done |
+| **STT speech-only gate** (pre-roll, hangover, keepalive) and **early flush** | done |
 | `/metrics` (Prometheus text) and `/healthz` | done |
 
 Not ported yet (in rough priority order):
 
-1. Variable extraction (feeds `gathered_context` and disposition)
-2. `transfer_call` tool (needs ARI dial + bridge swap, hold music)
-3. QA analysis nodes and cost pricing (usage is recorded; `cost_info` holds only the duration)
-4. Outbound campaigns (`Manager.Dial`, Redis limiter) — ARI only
-5. STT speech-only gate / early flush (cuts Sarvam STT audio to about half), debug WAV recording, OpenTelemetry
-6. TLS to Dograh's Postgres (`tokio-postgres-rustls`)
+1. `transfer_call` tool (needs ARI dial + bridge swap, hold music)
+2. QA analysis nodes and cost pricing (usage is recorded; `cost_info` holds only the duration)
+3. Outbound campaigns (`Manager.Dial`, Redis limiter) — ARI only
+4. Debug WAV recording, OpenTelemetry
+5. TLS to Dograh's Postgres (`tokio-postgres-rustls`)
 
 Needs on the server: **ffmpeg** on `PATH` (recorded clips) and Dograh's `MINIO_*` settings (see below).
 
@@ -74,6 +75,8 @@ Same names as the Go server.
 | `VAD_THRESHOLD` | `0.5` | Earshot speech probability |
 | `MAX_CALL_DURATION_SECONDS` | `0` | backstop; 0 = off |
 | `MEDIA_DEAD_TIMEOUT_SECONDS` | `30` | no inbound audio at all |
+| `STT_FLUSH_AFTER_MS` | `400` | ask Sarvam to finalize once the VAD heard this much quiet after the caller (0 = off); replies ~0.2-0.3s sooner |
+| `STT_SPEECH_ONLY` `STT_PREROLL_MS` `STT_HANGOVER_MS` `STT_GATE_RMS_FLOOR` | `0` `1000` `700` `400` | send the STT only the caller's speech (Sarvam bills audio sent; ~half the cost); hangover must exceed the flush wait |
 | `LLM_RETRIES` `LLM_RETRY_MAX_WAIT_MS` `LLM_MAX_FAILED_TURNS` `LLM_FALLBACK_TEXT` | `2` `2000` `3` `` | |
 | `SARVAM_STT_WS_URL` / `SARVAM_TTS_WS_URL` | Sarvam production | point at mocks for load runs |
 | `MINIO_ENDPOINT` `MINIO_ACCESS_KEY` `MINIO_SECRET_KEY` `MINIO_BUCKET` `MINIO_SECURE` | `` `` `` `voice-audio` `false` | Dograh's MinIO (host:port). Without an endpoint, recordings/transcripts aren't uploaded and recorded clips can't play |

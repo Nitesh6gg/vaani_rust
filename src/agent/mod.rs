@@ -4,6 +4,7 @@ pub mod extract;
 pub mod handler;
 pub mod recorder;
 pub mod recordings;
+pub mod sttgate;
 pub mod vad;
 pub mod workflow;
 

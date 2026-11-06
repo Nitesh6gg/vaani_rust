@@ -25,6 +25,15 @@ pub struct Config {
     pub ack_end_margin: Duration,
     /// Earshot's speech probability threshold (0..1).
     pub vad_threshold: f32,
+    /// Ask the STT to finalize once the VAD has heard this much quiet after the caller
+    /// spoke, instead of waiting for Sarvam's own end-of-speech (~0.6-0.7s). 0 = off.
+    pub stt_flush_after: Duration,
+    /// Send the STT only the caller's speech (Sarvam bills the audio sent).
+    pub stt_speech_only: bool,
+    pub stt_preroll: Duration,
+    pub stt_hangover: Duration,
+    /// A frame at least this loud also opens the gate (media::rms units). 0 = off.
+    pub stt_gate_rms_floor: f64,
     pub metrics_addr: String,
     /// Dograh's MinIO (its own MINIO_* settings, which live in its environment, not its database);
     /// without an endpoint recordings and transcripts aren't uploaded.
@@ -132,6 +141,11 @@ impl Config {
             stt_ws_url: get("SARVAM_STT_WS_URL", ""),
             tts_ws_url: get("SARVAM_TTS_WS_URL", ""),
             vad_threshold: get_num("VAD_THRESHOLD", 0.5)?,
+            stt_flush_after: ms("STT_FLUSH_AFTER_MS", 400)?,
+            stt_speech_only: get("STT_SPEECH_ONLY", "0") == "1",
+            stt_preroll: ms("STT_PREROLL_MS", 1000)?,
+            stt_hangover: ms("STT_HANGOVER_MS", 700)?,
+            stt_gate_rms_floor: get_num("STT_GATE_RMS_FLOOR", 400.0)?,
             max_call_duration: secs("MAX_CALL_DURATION_SECONDS", 0)?,
             media_dead_timeout: secs("MEDIA_DEAD_TIMEOUT_SECONDS", 30)?,
             llm_retries: get_num("LLM_RETRIES", 2)?,
@@ -152,6 +166,14 @@ impl Config {
         }
         if u32::from(self.media_port_base) + u32::from(self.media_port_count) > 65535 {
             bail!("config: MEDIA_PORT_BASE + MEDIA_PORT_COUNT must be <= 65535");
+        }
+        // A hangover shorter than the flush wait would close the gate before the flush's reply.
+        if self.stt_speech_only && !self.stt_flush_after.is_zero() && self.stt_hangover <= self.stt_flush_after {
+            bail!(
+                "config: STT_HANGOVER_MS ({}) must exceed STT_FLUSH_AFTER_MS ({}), or the gate closes before the flush's reply",
+                self.stt_hangover.as_millis(),
+                self.stt_flush_after.as_millis()
+            );
         }
         if self.dograh_db_url.is_empty() {
             bail!("config: DOGRAH_DB_URL is required (agent config is read from Dograh's Postgres)");
@@ -193,6 +215,11 @@ impl Config {
             stt_ws_url: String::new(),
             tts_ws_url: String::new(),
             vad_threshold: 0.5,
+            stt_flush_after: Duration::ZERO,
+            stt_speech_only: false,
+            stt_preroll: Duration::from_millis(1000),
+            stt_hangover: Duration::from_millis(700),
+            stt_gate_rms_floor: 400.0,
             max_call_duration: Duration::ZERO,
             media_dead_timeout: Duration::from_secs(5),
             llm_retries: 0,

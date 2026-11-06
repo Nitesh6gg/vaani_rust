@@ -33,6 +33,7 @@ struct Rig {
     outbound: mpsc::Receiver<Frame>,
     stt_tx: mpsc::UnboundedSender<String>,
     stt_audio: Arc<AtomicUsize>,
+    stt_flushes: Arc<AtomicUsize>,
     tts: Arc<TtsLog>,
     llm_reqs: Arc<Mutex<Vec<serde_json::Value>>>,
     cancel: CancellationToken,
@@ -49,14 +50,23 @@ async fn rig(tts_frames: usize, allow_interrupt: bool, llm_text: &'static str) -
 }
 
 async fn rig_wf(wf: Workflow, tts_frames: usize, llm_reply: impl Fn(&serde_json::Value) -> String + Send + Sync + 'static) -> Rig {
+    rig_tuned(wf, tts_frames, llm_reply, |_| {}).await
+}
+
+async fn rig_tuned(
+    wf: Workflow,
+    tts_frames: usize,
+    llm_reply: impl Fn(&serde_json::Value) -> String + Send + Sync + 'static,
+    tune: impl FnOnce(&mut AgentConfig),
+) -> Rig {
     let (tts_url, tts) = mock_tts(tts_frames).await;
-    let (stt_url, stt_tx, stt_audio) = mock_stt().await;
+    let (stt_url, stt_tx, stt_audio, stt_flushes) = mock_stt().await;
     let (llm_url, llm_reqs) = mock_llm(llm_reply).await;
     let cancel = CancellationToken::new();
 
     let (stt, stt_events) = SttClient::connect(
         "t",
-        SttConfig { ws_url: stt_url, api_key: "k".into(), model: "m".into(), language: "hi-IN".into() },
+        SttConfig { ws_url: stt_url, api_key: "k".into(), model: "m".into(), language: "hi-IN".into(), flush_signal: false },
         cancel.clone(),
     )
     .await
@@ -68,7 +78,7 @@ async fn rig_wf(wf: Workflow, tts_frames: usize, llm_reply: impl Fn(&serde_json:
     let hangups = Arc::new(AtomicUsize::new(0));
     let h = hangups.clone();
 
-    let cfg = AgentConfig {
+    let mut cfg = AgentConfig {
         call_id: "t".into(),
         workflow: Arc::new(wf),
         llm: LlmClient::new(&llm_url, "k", "m"),
@@ -79,6 +89,8 @@ async fn rig_wf(wf: Workflow, tts_frames: usize, llm_reply: impl Fn(&serde_json:
         barge_in_min_speech: Duration::ZERO,
         barge_in_guard: Duration::ZERO,
         post_cut_silence: Duration::from_millis(100),
+        stt_flush_after: Duration::ZERO,
+        stt_gate: None,
         ack_filter: true,
         ack_end_margin: Duration::from_millis(300),
         idle_timeout: Duration::ZERO,
@@ -89,8 +101,9 @@ async fn rig_wf(wf: Workflow, tts_frames: usize, llm_reply: impl Fn(&serde_json:
             h.fetch_add(1, SeqCst);
         }),
     };
+    tune(&mut cfg);
     let done = tokio::spawn(run(cfg, AgentIo { media, stt, stt_events }, cancel.clone()));
-    Rig { inbound: in_tx, outbound: out_rx, stt_tx, stt_audio, tts, llm_reqs, cancel, hangups, done }
+    Rig { inbound: in_tx, outbound: out_rx, stt_tx, stt_audio, stt_flushes, tts, llm_reqs, cancel, hangups, done }
 }
 
 fn is_tone(f: &Frame) -> bool {
@@ -247,7 +260,7 @@ async fn bench_concurrent_agents() {
     for i in 0..n {
         let (stt, stt_events) = SttClient::connect(
             "b",
-            SttConfig { ws_url: stt_url.clone(), api_key: "k".into(), model: "m".into(), language: "hi-IN".into() },
+            SttConfig { ws_url: stt_url.clone(), api_key: "k".into(), model: "m".into(), language: "hi-IN".into(), flush_signal: false },
             cancel.clone(),
         )
         .await
@@ -275,6 +288,8 @@ async fn bench_concurrent_agents() {
             barge_in_min_speech: Duration::from_millis(200),
             barge_in_guard: Duration::from_millis(300),
             post_cut_silence: Duration::from_millis(1200),
+            stt_flush_after: Duration::ZERO,
+            stt_gate: None,
             ack_filter: true,
             ack_end_margin: Duration::from_millis(300),
             idle_timeout: Duration::ZERO,
@@ -522,4 +537,65 @@ async fn variables_are_extracted_when_leaving_a_node_and_when_the_call_ends() {
     // Later extractions win a conflict (the end-of-call one overwrote "party"); keys keep arrival order.
     assert_eq!(serde_json::Value::Object(ex), serde_json::json!({"party": "NOTA", "zeta": 1, "vote": "yes"}));
     assert_eq!(s.extracted_keys, ["party", "zeta", "vote"]);
+}
+
+// ------------------------------------------------- STT gate and flush ---
+
+use super::sttgate::GateConfig;
+
+async fn feed_frames(r: &Rig, f: Frame, n: usize) {
+    for _ in 0..n {
+        r.inbound.send(f).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn the_gate_sends_the_stt_only_speech_with_its_preroll() {
+    let wf = Workflow { start: 0, nodes: vec![Node { greeting: "Hi.".into(), ..start_node() }] };
+    let mut r = rig_tuned(
+        wf,
+        2,
+        |_| sse("ok."),
+        |c| {
+            c.stt_gate = Some(GateConfig { preroll: Duration::from_millis(200), hangover: Duration::from_millis(200), rms_floor: 0.0 });
+        },
+    )
+    .await;
+    // Let the greeting play out, then 1s of quiet: the gate is closed, the STT is sent nothing.
+    let _ = heard(&mut r, 0, 2, Duration::from_secs(3)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let before = r.stt_audio.load(SeqCst);
+    feed_frames(&r, SILENCE, 50).await;
+    assert!(r.stt_audio.load(SeqCst) - before <= 2, "quiet frames are not sent ({} were)", r.stt_audio.load(SeqCst) - before);
+
+    // Speech opens it: the 200ms pre-roll (10 frames) goes first, then the live frames.
+    let before = r.stt_audio.load(SeqCst);
+    feed_frames(&r, loud(), 10).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let sent = r.stt_audio.load(SeqCst) - before;
+    assert!((18..=26).contains(&sent), "expected ~10 pre-roll + ~10 live frames, got {sent}");
+
+    r.cancel.cancel();
+    let (s, _) = r.done.await.unwrap();
+    assert!(s.stt_gated);
+    assert!(s.stt_seconds < 2.0, "billed audio is far below the call's length: {}s", s.stt_seconds);
+}
+
+#[tokio::test]
+async fn the_stt_is_asked_to_finalize_once_the_vad_hears_quiet_after_speech() {
+    let wf = Workflow { start: 0, nodes: vec![Node { greeting: "Hi.".into(), ..start_node() }] };
+    let mut r = rig_tuned(wf, 2, |_| sse("ok."), |c| c.stt_flush_after = Duration::from_millis(200)).await;
+    let _ = heard(&mut r, 0, 2, Duration::from_secs(3)).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // The STT reports speech starting; the (fake) VAD hears it; then the caller goes quiet.
+    r.stt_tx.send(r#"{"type":"events","data":{"signal_type":"START_SPEECH"}}"#.into()).unwrap();
+    feed_frames(&r, loud(), 10).await;
+    assert_eq!(r.stt_flushes.load(SeqCst), 0, "no flush while they are still talking");
+    feed_frames(&r, SILENCE, 20).await; // 400ms of quiet > 200ms
+    assert_eq!(r.stt_flushes.load(SeqCst), 1, "one flush, sent once the quiet was long enough");
+    feed_frames(&r, SILENCE, 20).await;
+    assert_eq!(r.stt_flushes.load(SeqCst), 1, "at most once per utterance");
+    r.cancel.cancel();
 }

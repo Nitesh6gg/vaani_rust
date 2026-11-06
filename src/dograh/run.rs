@@ -240,6 +240,9 @@ impl Store {
 /// Dograh bills streaming STT.
 fn usage_info(m: &RunMeta, sum: &Summary, duration: Duration) -> Value {
     let seconds = duration.as_secs_f64().round() as i64;
+    // STT is billed as the whole call -- unless only the speech was sent: then the
+    // seconds actually sent, rounded up as Sarvam bills them.
+    let stt_seconds = if sum.stt_gated { sum.stt_seconds.ceil() as i64 } else { seconds };
     let llm: Map<String, Value> = sum
         .llm_usage
         .iter()
@@ -255,7 +258,7 @@ fn usage_info(m: &RunMeta, sum: &Summary, duration: Duration) -> Value {
     json!({
         "llm": llm,
         "tts": tts,
-        "stt": {format!("{USAGE_KEY_STT}{}", m.stt_model): seconds as f64},
+        "stt": {format!("{USAGE_KEY_STT}{}", m.stt_model): stt_seconds as f64},
         "call_duration_seconds": seconds,
     })
 }

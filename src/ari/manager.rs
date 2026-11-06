@@ -511,7 +511,7 @@ mod tests {
         let _ = rustls::crypto::ring::default_provider().install_default();
 
         let (tts_url, _tts) = mock_tts(10).await;
-        let (stt_url, _stt_tx, stt_audio) = mock_stt().await;
+        let (stt_url, _stt_tx, stt_audio, _) = mock_stt().await;
         let (llm_url, llm_reqs) = mock_llm(|_| sse("Namaste, how can I help?")).await;
         let (ari_url, ari_log, mut ext_req) = mock_ari().await;
         let (minio_addr, minio_puts) = mock_minio().await;

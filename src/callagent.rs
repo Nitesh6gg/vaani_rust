@@ -5,6 +5,7 @@
 use crate::{
     agent::{
         handler::{AgentConfig, AgentIo},
+        sttgate::GateConfig,
         vad::VoteDetector,
     },
     ai::{
@@ -59,6 +60,7 @@ pub async fn prepare(cfg: &Config, store: &Store, info: &CallInfo, cancel: &Canc
             api_key: wf.services.stt.api_key.clone(),
             model: wf.services.stt.model.clone(),
             language: wf.services.stt.language.clone(),
+            flush_signal: !cfg.stt_flush_after.is_zero(),
         },
         cancel.clone(),
     )
@@ -96,6 +98,12 @@ impl Prepared {
             barge_in_min_speech: cfg.barge_in_min_speech,
             barge_in_guard: cfg.barge_in_guard,
             post_cut_silence: cfg.post_cut_silence,
+            stt_flush_after: cfg.stt_flush_after,
+            stt_gate: cfg.stt_speech_only.then_some(GateConfig {
+                preroll: cfg.stt_preroll,
+                hangover: cfg.stt_hangover,
+                rms_floor: cfg.stt_gate_rms_floor,
+            }),
             ack_filter: cfg.ack_filter,
             ack_end_margin: cfg.ack_end_margin,
             idle_timeout: wf.idle_timeout,

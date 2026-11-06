@@ -83,6 +83,7 @@ pub struct CallLog {
     pub llm_usage: HashMap<String, Usage>,
     pub tts_chars: u64,
     pub stt_seconds: f64,
+    pub stt_gated: bool,
 }
 
 /// Everything a call recorded, for Dograh's run and the summary log line.
@@ -105,6 +106,8 @@ pub struct Summary {
     pub llm_usage: HashMap<String, Usage>,
     pub tts_chars: u64,
     pub stt_seconds: f64,
+    /// Only the caller's speech was sent to the STT (`STT_SPEECH_ONLY`), not every frame of the call.
+    pub stt_gated: bool,
     /// Every variable extraction's result merged, later ones winning (`None`: none
     /// returned); `extracted_keys` its keys in arrival order.
     pub extracted: Option<Map<String, Value>>,
@@ -236,6 +239,7 @@ impl CallLog {
             llm_usage: self.llm_usage,
             tts_chars: self.tts_chars,
             stt_seconds: self.stt_seconds,
+            stt_gated: self.stt_gated,
             ..Default::default()
         }
     }
