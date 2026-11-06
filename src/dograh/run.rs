@@ -116,7 +116,9 @@ impl Store {
         let (g, mapped) = {
             let org = m.org_id;
             let mapping = self.disposition_mapping(org).await;
-            gathered_context(sum, None, &[], &|v| mapping.as_ref().and_then(|m| m.get(v)).and_then(Value::as_str).unwrap_or(v).to_string())
+            gathered_context(sum, sum.extracted.as_ref(), &sum.extracted_keys, &|v| {
+                mapping.as_ref().and_then(|m| m.get(v)).and_then(Value::as_str).unwrap_or(v).to_string()
+            })
         };
 
         // The call's own usage now, so it's there even if pricing never runs.

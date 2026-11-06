@@ -105,9 +105,36 @@ pub struct Summary {
     pub llm_usage: HashMap<String, Usage>,
     pub tts_chars: u64,
     pub stt_seconds: f64,
+    /// Every variable extraction's result merged, later ones winning (`None`: none
+    /// returned); `extracted_keys` its keys in arrival order.
+    pub extracted: Option<Map<String, Value>>,
+    pub extracted_keys: Vec<String>,
     /// 16kHz mono PCM16 of the whole call (caller and agent mixed); empty when nothing was recorded.
     pub recording_pcm: Vec<u8>,
     pub recording_truncated: bool,
+}
+
+impl Summary {
+    /// Merges one extraction's variables (keys in the order the LLM wrote them),
+    /// as Dograh updates gathered_context with it.
+    pub fn merge_extracted(&mut self, vars: Map<String, Value>) {
+        let all = self.extracted.get_or_insert_with(Map::new);
+        for (k, v) in vars {
+            if !all.contains_key(&k) {
+                self.extracted_keys.push(k.clone());
+            }
+            all.insert(k, v);
+        }
+    }
+
+    /// Adds tokens under Dograh's usage_info key (`<processor>|||<model>`).
+    pub fn add_llm_usage(&mut self, processor: &str, model: &str, u: Usage) {
+        let t = self.llm_usage.entry(format!("{processor}{model}")).or_default();
+        t.prompt += u.prompt;
+        t.completion += u.completion;
+        t.total += u.total;
+        t.cached += u.cached;
+    }
 }
 
 impl CallLog {

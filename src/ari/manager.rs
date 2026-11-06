@@ -18,7 +18,7 @@
 
 use super::{Ari, Event, uuid_v4};
 use crate::{
-    agent::{calllog, handler, recorder},
+    agent::{calllog, extract, handler, recorder},
     callagent::{self, CallInfo},
     config::Config,
     dograh::{
@@ -61,6 +61,7 @@ struct CallEnd {
     meta: RunMeta,
     run: tokio::task::JoinHandle<anyhow::Result<i64>>,
     summary: calllog::Summary,
+    finisher: extract::Finisher,
     duration: Duration,
 }
 
@@ -328,17 +329,19 @@ impl Manager {
         });
         let (agent_cfg, io) = prepared.into_agent(&self.cfg, &id, media, hangup);
         let started = std::time::Instant::now();
-        let summary = handler::run(agent_cfg, io, call.cancel.clone()).await;
+        let (summary, finisher) = handler::run(agent_cfg, io, call.cancel.clone()).await;
         let duration = started.elapsed();
 
         log_summary(&id, duration, &summary, &stats);
-        Some(CallEnd { meta, run, summary, duration })
+        Some(CallEnd { meta, run, summary, finisher, duration })
     }
 
     /// Completes the call's run in Dograh: conversation, usage, disposition, and
     /// the recording and transcript uploaded to MinIO. Failures are logged; the
     /// call itself is never affected. Runs AFTER teardown, so a slow upload never holds the call's port.
-    async fn record_run(&self, id: &str, end: CallEnd) {
+    async fn record_run(&self, id: &str, mut end: CallEnd) {
+        // Dograh's end-of-call extraction, now that the call is torn down.
+        end.finisher.finish(&mut end.summary).await;
         let run_id = match end.run.await {
             Ok(Ok(run_id)) => run_id,
             Ok(Err(e)) => {

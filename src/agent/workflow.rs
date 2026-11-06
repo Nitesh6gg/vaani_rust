@@ -8,6 +8,21 @@ use futures_util::future::BoxFuture;
 use serde_json::Value;
 use std::sync::Arc;
 
+/// A node's extraction_prompt and extraction_variables, with {{variables}} already filled in.
+#[derive(Debug, Clone, Default)]
+pub struct Extraction {
+    pub prompt: String,
+    pub vars: Vec<ExtractionVar>,
+}
+
+/// One variable to extract. `kind` is Dograh's string, number or boolean; `prompt` is `None` when it has none.
+#[derive(Debug, Clone)]
+pub struct ExtractionVar {
+    pub name: String,
+    pub kind: String,
+    pub prompt: Option<String>,
+}
+
 /// A pre-recorded audio clip (one of Dograh's workflow recordings), played in
 /// place of synthesizing its transcript: 16kHz mono s16le PCM.
 #[derive(Debug)]
@@ -65,6 +80,9 @@ pub struct Node {
     /// When set, this node's LLM may play these recordings instead of speaking:
     /// its prompt asks for "● <recording_id>" or "▸ <text>" replies (the `ClipRouter`).
     pub clips: Option<Arc<std::collections::HashMap<String, Arc<Clip>>>>,
+    /// Dograh's variable extraction for this node: run when the conversation
+    /// leaves the node and, for the node the call ends at, when the call ends.
+    pub extraction: Option<Arc<Extraction>>,
     /// Reaching it, the LLM says its closing line and the call hangs up.
     pub end: bool,
     /// May the caller cut in while the agent speaks here? (Dograh's allow_interrupt.)
@@ -145,7 +163,7 @@ pub fn plain_history(msgs: &[Message]) -> Vec<Message> {
 /// Dograh's _format_tool_response: a JSON object's "data" if present, else the
 /// object without status/status_code; anything else as-is; cut at 2000 chars.
 /// `None` for an edge transition's `{"status":"done"}`.
-fn tool_response_text(raw: &str) -> Option<String> {
+pub(crate) fn tool_response_text(raw: &str) -> Option<String> {
     let mut text = raw.to_string();
     if let Ok(Value::Object(mut obj)) = serde_json::from_str::<Value>(raw) {
         if obj.len() == 1 && obj.get("status") == Some(&Value::String("done".into())) {

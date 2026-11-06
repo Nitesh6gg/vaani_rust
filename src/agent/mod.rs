@@ -1,5 +1,6 @@
 pub mod backchannel;
 pub mod calllog;
+pub mod extract;
 pub mod handler;
 pub mod recorder;
 pub mod recordings;

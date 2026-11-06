@@ -37,7 +37,7 @@ struct Rig {
     llm_reqs: Arc<Mutex<Vec<serde_json::Value>>>,
     cancel: CancellationToken,
     hangups: Arc<AtomicUsize>,
-    done: tokio::task::JoinHandle<super::calllog::Summary>,
+    done: tokio::task::JoinHandle<(super::calllog::Summary, super::extract::Finisher)>,
 }
 
 async fn rig(tts_frames: usize, allow_interrupt: bool, llm_text: &'static str) -> Rig {
@@ -145,7 +145,8 @@ async fn llm_opening_is_spoken_in_full_then_agent_listens() {
     assert_eq!(r.hangups.load(SeqCst), 0);
 
     r.cancel.cancel();
-    let s = r.done.await.unwrap();
+    let (mut s, fin) = r.done.await.unwrap();
+    fin.finish(&mut s).await;
     assert_eq!(s.user_turns, 1);
 }
 
@@ -190,7 +191,8 @@ async fn confirmed_barge_in_pauses_then_cuts_all_five() {
     assert_eq!(r.tts.connections.load(SeqCst), 2, "a fresh connection for the next turn");
 
     r.cancel.cancel();
-    let s = r.done.await.unwrap();
+    let (mut s, fin) = r.done.await.unwrap();
+    fin.finish(&mut s).await;
     assert_eq!(s.barge_ins, 1);
 }
 
@@ -209,7 +211,8 @@ async fn backchannel_over_a_paused_reply_resumes_it() {
     assert_eq!(r.tts.closed.load(SeqCst), 0);
     assert_eq!(r.llm_reqs.lock().unwrap().len(), 1, "no new turn: it was only an acknowledgement");
     r.cancel.cancel();
-    let s = r.done.await.unwrap();
+    let (mut s, fin) = r.done.await.unwrap();
+    fin.finish(&mut s).await;
     assert_eq!((s.barge_ins, s.false_interruptions), (0, 1));
 }
 
@@ -379,7 +382,8 @@ async fn a_recorded_greeting_plays_without_tts_and_is_remembered_as_its_transcri
     let msgs = r.llm_reqs.lock().unwrap()[0]["messages"].clone();
     assert_eq!(msgs[1]["content"], "Namaste!");
     r.cancel.cancel();
-    let s = r.done.await.unwrap();
+    let (mut s, fin) = r.done.await.unwrap();
+    fin.finish(&mut s).await;
     assert_eq!(s.tts_chars, 3, "only the LLM turn's \"ok.\" is billed; the recorded greeting costs no TTS characters");
 }
 
@@ -407,7 +411,8 @@ async fn the_llm_can_answer_with_a_recording_or_with_speech() {
     let assistant = reqs[1]["messages"].as_array().unwrap().iter().find(|m| m["role"] == "assistant").unwrap();
     assert_eq!(assistant["content"], "● offer_01 Our offer is great.");
     r.cancel.cancel();
-    let s = r.done.await.unwrap();
+    let (mut s, fin) = r.done.await.unwrap();
+    fin.finish(&mut s).await;
     let said: Vec<_> =
         s.events.iter().filter(|e| e.kind == "rtf-bot-text").map(|e| e.payload["text"].as_str().unwrap().to_string()).collect();
     assert_eq!(said, ["Our offer is great.", "Sure, here you go."]);
@@ -449,6 +454,72 @@ async fn a_transition_clip_plays_before_the_next_nodes_reply() {
     assert_eq!(heard(&mut r, 6, 10, Duration::from_secs(6)).await, "ct", "the clip first, then the LLM's reply");
     assert_eq!(*r.tts.texts.lock().unwrap(), ["First question?"]);
     r.cancel.cancel();
-    let s = r.done.await.unwrap();
+    let (mut s, fin) = r.done.await.unwrap();
+    fin.finish(&mut s).await;
     assert_eq!(s.nodes_visited, ["start", "main"]);
+}
+
+// ---------------------------------------------------------- extraction ---
+
+use super::workflow::{Extraction, ExtractionVar};
+
+fn extraction(var: &str) -> Option<Arc<Extraction>> {
+    Some(Arc::new(Extraction {
+        prompt: String::new(),
+        vars: vec![ExtractionVar { name: var.into(), kind: "string".into(), prompt: Some(format!("the {var}")) }],
+    }))
+}
+
+#[tokio::test]
+async fn variables_are_extracted_when_leaving_a_node_and_when_the_call_ends() {
+    let edge = Edge {
+        def: FunctionDef { name: "go_next".into(), description: "when ready".into(), parameters: None },
+        speech: String::new(),
+        speech_clip: None,
+        to: 1,
+    };
+    let wf = Workflow {
+        start: 0,
+        nodes: vec![
+            Node { edges: vec![edge], extraction: extraction("party"), ..start_node() },
+            Node {
+                name: "main".into(),
+                prompt: "Ask the questions.".into(),
+                allow_interrupt: true,
+                extraction: extraction("vote"),
+                ..Default::default()
+            },
+        ],
+    };
+    let mut r = rig_wf(wf, 10, |req| {
+        let first = req["messages"][0]["content"].as_str().unwrap_or("");
+        let user = req["messages"][1]["content"].as_str().unwrap_or("");
+        if first.contains("extracting structured data") {
+            // Leaving node 1 extracts the party; the call's end extracts the vote.
+            let body = if user.contains("- party") {
+                r#"{"party": "BJP", "zeta": 1}"#
+            } else {
+                "```json\n{\"vote\": \"yes\", \"party\": \"NOTA\"}\n```"
+            };
+            return sse(body);
+        }
+        if first == "Ask the questions." {
+            return sse("First question?");
+        }
+        format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"go_next","arguments":""}}]}}]})
+        )
+    })
+    .await;
+    assert_eq!(heard(&mut r, 0, 10, Duration::from_secs(6)).await, "t");
+    r.cancel.cancel();
+    let (mut s, fin) = r.done.await.unwrap();
+    assert!(s.extracted.is_none(), "nothing is extracted until the finisher runs (after teardown)");
+    fin.finish(&mut s).await;
+
+    let ex = s.extracted.expect("variables were extracted");
+    // Later extractions win a conflict (the end-of-call one overwrote "party"); keys keep arrival order.
+    assert_eq!(serde_json::Value::Object(ex), serde_json::json!({"party": "NOTA", "zeta": 1, "vote": "yes"}));
+    assert_eq!(s.extracted_keys, ["party", "zeta", "vote"]);
 }

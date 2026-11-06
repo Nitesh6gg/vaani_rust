@@ -14,7 +14,7 @@ use super::{
     tools::{self, ToolRow},
 };
 use crate::{
-    agent::workflow::{Edge, Node, Tool, Workflow},
+    agent::workflow::{Edge, Extraction, ExtractionVar, Node, Tool, Workflow},
     ai::llm::FunctionDef,
 };
 use anyhow::{Result, anyhow, bail};
@@ -63,9 +63,25 @@ struct NodeData {
     greeting_type: String,
     #[serde(default)]
     tool_uuids: Vec<String>,
+    /// Variable extraction (dto.py: extraction_enabled defaults to false).
+    #[serde(default)]
+    extraction_enabled: bool,
+    #[serde(default)]
+    extraction_prompt: String,
+    #[serde(default)]
+    extraction_variables: Vec<ExtractionVarJson>,
     /// greeting_type "audio": this recording is played instead of `greeting`.
     #[serde(default, deserialize_with = "recording_ref")]
     greeting_recording_id: i64,
+}
+
+#[derive(Deserialize)]
+struct ExtractionVarJson {
+    name: String,
+    #[serde(default, rename = "type")]
+    kind: String,
+    #[serde(default)]
+    prompt: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -186,6 +202,22 @@ pub fn build(
             clips: uses_recordings.then(|| clips.by_id.clone()),
             ..Default::default()
         };
+        // Dograh extracts only when enabled and there's something to extract;
+        // prompts get the call's {{variables}} (a missing one stays missing).
+        if d.extraction_enabled && !d.extraction_variables.is_empty() {
+            node.extraction = Some(std::sync::Arc::new(Extraction {
+                prompt: render(&d.extraction_prompt),
+                vars: d
+                    .extraction_variables
+                    .iter()
+                    .map(|v| ExtractionVar {
+                        name: v.name.clone(),
+                        kind: v.kind.clone(),
+                        prompt: v.prompt.as_deref().map(|p| if p.is_empty() { String::new() } else { render(p) }),
+                    })
+                    .collect(),
+            }));
+        }
         for u in &d.tool_uuids {
             if let Some(t) = by_uuid.get(u.as_str()) {
                 node.tools.push(t.clone());
@@ -256,7 +288,9 @@ mod tests {
         {"id": "1", "type": "startCall", "data": {"name": "Start Call", "prompt": "Greet. Caller {{caller_number}}.",
             "is_start": true, "add_global_prompt": true, "greeting_type": "text", "allow_interrupt": false}},
         {"id": "2", "type": "agentNode", "data": {"name": "Main Agenda and Questions", "prompt": "Ask the questions.",
-            "add_global_prompt": true, "tool_uuids": ["ec-1", "gone-2"]}},
+            "add_global_prompt": true, "tool_uuids": ["ec-1", "gone-2"],
+            "extraction_enabled": true, "extraction_prompt": "For {{caller_number}}",
+            "extraction_variables": [{"name": "party", "type": "string", "prompt": "Party for {{caller_number}}"}, {"name": "age", "type": "number"}]}},
         {"id": "0", "type": "globalNode", "data": {"name": "Global Node", "prompt": "You are Riya."}},
         {"id": "4", "type": "endCall", "data": {"name": "End Call", "prompt": "Say goodbye.", "add_global_prompt": false, "is_end": true, "allow_interrupt": true}}
     ], "edges": [
@@ -296,6 +330,11 @@ mod tests {
         assert_eq!(main.tools.len(), 1);
         assert!(matches!(main.tools[0].kind, ToolKind::EndCall));
         assert_eq!(main.edges[0].speech, "Thanks ji");
+        let x = main.extraction.as_ref().expect("extraction enabled with variables");
+        assert_eq!(x.prompt, "For 08448805135");
+        assert_eq!((x.vars[0].name.as_str(), x.vars[0].prompt.as_deref()), ("party", Some("Party for 08448805135")));
+        assert_eq!((x.vars[1].kind.as_str(), x.vars[1].prompt.clone()), ("number", None));
+        assert!(start.extraction.is_none(), "extraction is off unless enabled");
 
         let end = &w.nodes[main.edges[0].to];
         assert!(end.end && end.allow_interrupt);

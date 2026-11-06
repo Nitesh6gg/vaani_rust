@@ -23,6 +23,7 @@
 use super::{
     backchannel::backchannel,
     calllog::{self, CallLog, Summary},
+    extract::{self, Finisher},
     recorder::MixRecorder,
     recordings::{ClipRouter, RECORDING_MARKER, strip_recording_refs},
     vad::BargeInDetector,
@@ -131,6 +132,11 @@ enum Event {
         generation: u64,
         reason: &'static str,
     },
+    /// The conversation is leaving node `node`, which has an extraction: run it in the background.
+    StartExtraction {
+        node: usize,
+        history: Vec<Message>,
+    },
     /// The LLM called a tool or took an edge (`result` set when it finished).
     Function {
         name: String,
@@ -190,6 +196,8 @@ struct Agent {
     stt_frames: u64,
     llm_usage_key: String,
     turn_speech_end: Option<Instant>,
+    /// Extractions running in the background, in the order they started.
+    extracting: Vec<extract::Pending>,
 
     state: State,
     node: usize,
@@ -255,7 +263,7 @@ struct Agent {
 }
 
 /// Runs the agent for one call until the call ends (`cancel`, far-end hangup).
-pub async fn run(cfg: AgentConfig, io: AgentIo, cancel: CancellationToken) -> Summary {
+pub async fn run(cfg: AgentConfig, io: AgentIo, cancel: CancellationToken) -> (Summary, Finisher) {
     let (ev_tx, mut events) = mpsc::unbounded_channel();
     let AgentIo { mut media, stt, mut stt_events } = io;
     let now = Instant::now();
@@ -272,6 +280,7 @@ pub async fn run(cfg: AgentConfig, io: AgentIo, cancel: CancellationToken) -> Su
         stt_frames: 0,
         llm_usage_key,
         turn_speech_end: None,
+        extracting: vec![],
         state: State::Listening,
         node,
         history: vec![],
@@ -363,11 +372,15 @@ pub async fn run(cfg: AgentConfig, io: AgentIo, cancel: CancellationToken) -> Su
     }
     a.cancel_turn();
     a.stt_frames_to_log();
+    // Dograh extracts the last node's variables as the call ends, after any still
+    // running from earlier nodes: handed back, to run after teardown.
+    let last = a.node().extraction.clone().map(|x| (a.node().name.clone(), (*x).clone(), std::mem::take(&mut a.history)));
+    let finisher = Finisher { call_id: a.id.clone(), llm: a.cfg.llm.clone(), pending: std::mem::take(&mut a.extracting), last };
     let truncated = a.recorder.truncated;
     let mut summary = a.log.into_summary();
     summary.recording_truncated = truncated;
     summary.recording_pcm = a.recorder.into_pcm();
-    summary
+    (summary, finisher)
 }
 
 impl Agent {
@@ -566,6 +579,12 @@ impl Agent {
                 self.log.ending(reason);
                 if generation == self.generation {
                     self.closing = true; // no interrupting the goodbye, as in Dograh
+                }
+            }
+            Event::StartExtraction { node, history } => {
+                if let Some(x) = self.cfg.workflow.nodes[node].extraction.clone() {
+                    let (id, llm, name) = (self.id.clone(), self.cfg.llm.clone(), self.cfg.workflow.nodes[node].name.clone());
+                    self.extracting.push(tokio::spawn(async move { extract::extract(&id, &name, &llm, &x, &history).await }));
                 }
             }
             Event::Function { name, call_id, result } => match result {
@@ -1428,6 +1447,10 @@ async fn run_llm_turn(c: &TurnCtx, tts: &Arc<TtsClient>) {
         for call in &calls {
             let _ = c.ev.send(Event::Function { name: call.function.name.clone(), call_id: call.id.clone(), result: None });
             let (result, action) = if let Some(e) = wf.nodes[node].edge(&call.function.name) {
+                // Dograh extracts the node's variables as the conversation leaves it.
+                if wf.nodes[node].extraction.is_some() {
+                    let _ = c.ev.send(Event::StartExtraction { node, history: history.clone() });
+                }
                 let r = take_edge(c, tts, node, e);
                 node = e.to;
                 (r, Action::None)
