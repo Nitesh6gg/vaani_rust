@@ -662,7 +662,8 @@ async fn heard_kinds(r: &mut Rig, max: Duration) -> String {
 #[tokio::test]
 async fn a_transfer_rings_with_hold_audio_beeps_and_hands_the_call_over() {
     let connected = Arc::new(AtomicUsize::new(0));
-    let (dialed, cancel_slot): (Arc<Mutex<Vec<(String, Duration)>>>, Arc<Mutex<Option<CancellationToken>>>) = Default::default();
+    type Dialed = Arc<Mutex<Vec<(String, Duration)>>>;
+    let (dialed, cancel_slot): (Dialed, Arc<Mutex<Option<CancellationToken>>>) = Default::default();
     let transfer: TransferFn = {
         let (connected, dialed, cancel_slot) = (connected.clone(), dialed.clone(), cancel_slot.clone());
         Arc::new(move |dest, timeout| {

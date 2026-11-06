@@ -8,7 +8,7 @@ self-hosted **Dograh**'s Postgres, exactly as in the Go server — no model sett
 
 ## Status
 
-Milestones 1 and 2 are done and tested: a Rust call is now a complete call, recorded in Dograh like one of its own. Ported from Go:
+Milestones 1-3 are done except QA analysis and outbound campaigns (below): a Rust call is a complete call, recorded and priced in Dograh like one of its own, with transfers, extraction and the STT gate. Ported from Go:
 
 | Area | State |
 |---|---|
