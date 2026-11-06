@@ -43,6 +43,9 @@ pub enum ToolKind {
     Function(ToolRun),
     /// Hangs up once everything said so far has played; the LLM is not asked again.
     EndCall,
+    /// Dials `destination` (an Asterisk dial string, e.g. "PJSIP/100@pbx") and, if it answers,
+    /// hands the caller over to it; the agent leaves the call. On failure the LLM is told why and carries on.
+    Transfer { destination: String, timeout: std::time::Duration },
 }
 
 #[derive(Clone)]

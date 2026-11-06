@@ -5,6 +5,7 @@
 mod agent;
 mod ai;
 mod ari;
+mod assets;
 mod callagent;
 mod config;
 mod dograh;

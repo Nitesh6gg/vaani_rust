@@ -15,6 +15,7 @@ pub const END_NODE: &str = "user_qualified"; // the End node's closing line play
 pub const END_CALL_TOOL: &str = "end_call_tool"; // the LLM called end_call
 pub const CALLER_SILENT: &str = "user_idle_max_duration_exceeded"; // caller silent twice
 pub const MAX_DURATION: &str = "call_duration_exceeded"; // max_call_duration reached
+pub const TRANSFER: &str = "transfer_call"; // handed over to a transfer destination
 pub const LLM_DOWN: &str = "llm_unavailable"; // the LLM failed several turns in a row
 pub const USER_HANGUP: &str = "user_hangup"; // none of the above: the caller hung up
 

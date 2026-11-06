@@ -48,8 +48,10 @@ impl Channel {
 
 #[derive(Debug, Clone)]
 pub enum Event {
+    /// `args` are the Stasis arguments: a transfer destination's first one is "transfer".
     StasisStart {
         channel: Channel,
+        args: Vec<String>,
     },
     StasisEnd {
         channel: Channel,
@@ -69,6 +71,8 @@ struct RawEvent {
     #[serde(rename = "type")]
     kind: String,
     #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
     channel: Option<Channel>,
     #[serde(default)]
     cause: i64,
@@ -79,7 +83,7 @@ struct RawEvent {
 pub fn parse_event(text: &str) -> Option<Event> {
     let e: RawEvent = serde_json::from_str(text).ok()?;
     Some(match (e.kind.as_str(), e.channel) {
-        ("StasisStart", Some(channel)) => Event::StasisStart { channel },
+        ("StasisStart", Some(channel)) => Event::StasisStart { channel, args: e.args },
         ("StasisEnd", Some(channel)) => Event::StasisEnd { channel },
         ("ChannelDestroyed", Some(channel)) => Event::ChannelDestroyed { channel, cause: e.cause, cause_txt: e.cause_txt },
         _ => return None,
@@ -144,6 +148,26 @@ impl Ari {
     pub async fn add_to_bridge(&self, bridge: &str, channels: &[&str]) -> Result<()> {
         self.send(http().post(format!("{}/bridges/{bridge}/addChannel?channel={}", self.base, urlenc(&channels.join(",")))), "add channel")
             .await
+    }
+
+    pub async fn remove_from_bridge(&self, bridge: &str, channel: &str) -> Result<()> {
+        self.send(http().post(format!("{}/bridges/{bridge}/removeChannel?channel={}", self.base, urlenc(channel))), "remove channel").await
+    }
+
+    /// Dials `endpoint` into this Stasis app with `app_args` (a transfer destination:
+    /// "transfer,<call id>"); it enters Stasis once answered. Asterisk hangs it up
+    /// after `timeout_secs` of ringing.
+    pub async fn originate(&self, endpoint: &str, app_args: &str, timeout_secs: u64, channel_id: &str, caller_id: &str) -> Result<()> {
+        let url = format!(
+            "{}/channels?endpoint={}&app={}&appArgs={}&timeout={timeout_secs}&channelId={}&callerId={}",
+            self.base,
+            urlenc(endpoint),
+            urlenc(&self.app),
+            urlenc(app_args),
+            urlenc(channel_id),
+            urlenc(caller_id)
+        );
+        self.send(http().post(url), "originate").await
     }
 
     pub async fn delete_bridge(&self, id: &str) -> Result<()> {
@@ -236,8 +260,9 @@ mod tests {
 
     #[test]
     fn parses_stasis_events() {
-        let start = r#"{"type":"StasisStart","args":["x"],"channel":{"id":"c1","caller":{"name":"","number":"1001"},"dialplan":{"context":"c","exten":"2000","priority":1}}}"#;
-        let Some(Event::StasisStart { channel }) = parse_event(start) else { panic!() };
+        let start = r#"{"type":"StasisStart","args":["transfer","c0"],"channel":{"id":"c1","caller":{"name":"","number":"1001"},"dialplan":{"context":"c","exten":"2000","priority":1}}}"#;
+        let Some(Event::StasisStart { channel, args }) = parse_event(start) else { panic!() };
+        assert_eq!(args, ["transfer", "c0"]);
         assert_eq!((channel.id.as_str(), channel.caller_number().as_str(), channel.called_number().as_str()), ("c1", "1001", "2000"));
         assert!(matches!(parse_event(r#"{"type":"StasisEnd","channel":{"id":"c1"}}"#), Some(Event::StasisEnd { .. })));
         let Some(Event::ChannelDestroyed { cause, cause_txt, .. }) =

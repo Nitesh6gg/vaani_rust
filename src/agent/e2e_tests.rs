@@ -100,6 +100,9 @@ async fn rig_tuned(
         hangup: Arc::new(move || {
             h.fetch_add(1, SeqCst);
         }),
+        transfer: None,
+        hold_audio: tone_pcm(HOLD_TONE, 10),
+        beep_audio: tone_pcm(BEEP_TONE, 3),
     };
     tune(&mut cfg);
     let done = tokio::spawn(run(cfg, AgentIo { media, stt, stt_events }, cancel.clone()));
@@ -297,6 +300,9 @@ async fn bench_concurrent_agents() {
             llm_max_failed_turns: 3,
             llm_fallback_text: String::new(),
             hangup: Arc::new(|| {}),
+            transfer: None,
+            hold_audio: tone_pcm(HOLD_TONE, 10),
+            beep_audio: tone_pcm(BEEP_TONE, 3),
         };
         let c = cancel.clone();
         tokio::spawn(async move {
@@ -598,4 +604,121 @@ async fn the_stt_is_asked_to_finalize_once_the_vad_hears_quiet_after_speech() {
     feed_frames(&r, SILENCE, 20).await;
     assert_eq!(r.stt_flushes.load(SeqCst), 1, "at most once per utterance");
     r.cancel.cancel();
+}
+
+// ------------------------------------------------------------ transfer ---
+
+use super::{
+    handler::{ConnectFn, TransferFn},
+    workflow::{Tool, ToolKind},
+};
+
+const HOLD_TONE: i16 = 3000;
+const BEEP_TONE: i16 = 4000;
+
+fn tone_pcm(v: i16, frames: usize) -> Arc<Vec<u8>> {
+    Arc::new((0..frames * FRAME_SIZE / 2).flat_map(|_| v.to_le_bytes()).collect())
+}
+
+/// A workflow whose start node has a transfer tool (with a spoken message).
+fn transfer_workflow() -> Workflow {
+    let tool = Tool {
+        def: FunctionDef { name: "transfer_to_support".into(), description: "hand over".into(), parameters: None },
+        kind: ToolKind::Transfer { destination: "PJSIP/100@pbx".into(), timeout: Duration::from_secs(5) },
+        message: "Please hold.".into(),
+        message_clip: None,
+    };
+    Workflow { start: 0, nodes: vec![Node { tools: vec![tool], ..start_node() }] }
+}
+
+fn transfer_call_sse() -> String {
+    format!(
+        "data: {}\n\ndata: [DONE]\n\n",
+        serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"t1","function":{"name":"transfer_to_support","arguments":""}}]}}]})
+    )
+}
+
+/// Collects the audio kinds heard until `max` elapses: 'm' TTS message, 'h' hold loop, 'b' beep.
+async fn heard_kinds(r: &mut Rig, max: Duration) -> String {
+    let mut order = String::new();
+    let _ = tokio::time::timeout(max, async {
+        while let Some(f) = r.outbound.recv().await {
+            let first = [f[0], f[1]];
+            let kind = match first {
+                x if x == TONE.to_le_bytes() => 'm',
+                x if x == HOLD_TONE.to_le_bytes() => 'h',
+                x if x == BEEP_TONE.to_le_bytes() => 'b',
+                _ => continue,
+            };
+            if !order.ends_with(kind) {
+                order.push(kind);
+            }
+        }
+    })
+    .await;
+    order
+}
+
+#[tokio::test]
+async fn a_transfer_rings_with_hold_audio_beeps_and_hands_the_call_over() {
+    let connected = Arc::new(AtomicUsize::new(0));
+    let (dialed, cancel_slot): (Arc<Mutex<Vec<(String, Duration)>>>, Arc<Mutex<Option<CancellationToken>>>) = Default::default();
+    let transfer: TransferFn = {
+        let (connected, dialed, cancel_slot) = (connected.clone(), dialed.clone(), cancel_slot.clone());
+        Arc::new(move |dest, timeout| {
+            let (connected, dialed, cancel_slot) = (connected.clone(), dialed.clone(), cancel_slot.clone());
+            Box::pin(async move {
+                dialed.lock().unwrap().push((dest, timeout));
+                tokio::time::sleep(Duration::from_millis(400)).await; // ringing
+                let connect: ConnectFn = Box::new(move || {
+                    Box::pin(async move {
+                        connected.fetch_add(1, SeqCst);
+                        // Like the manager: the media token is cancelled, which ends the agent.
+                        cancel_slot.lock().unwrap().take().unwrap().cancel();
+                        Ok(())
+                    })
+                });
+                Ok(connect)
+            })
+        })
+    };
+    let mut r = rig_tuned(transfer_workflow(), 6, |_| transfer_call_sse(), move |c| c.transfer = Some(transfer)).await;
+    *cancel_slot.lock().unwrap() = Some(r.cancel.clone());
+
+    let order = heard_kinds(&mut r, Duration::from_secs(3)).await;
+    assert_eq!(order, "mhb", "the message first, then the hold loop while ringing, then the beep");
+    assert_eq!(*dialed.lock().unwrap(), [("PJSIP/100@pbx".to_string(), Duration::from_secs(5))]);
+    assert_eq!(connected.load(SeqCst), 1);
+    assert_eq!(r.llm_reqs.lock().unwrap().len(), 1, "after a transfer the LLM isn't asked again");
+    assert_eq!(r.hangups.load(SeqCst), 0, "the agent doesn't hang up: the caller is with the destination");
+
+    let (s, _) = r.done.await.unwrap();
+    assert_eq!(s.end_reason, Some("transfer_call"));
+}
+
+#[tokio::test]
+async fn a_failed_transfer_tells_the_llm_and_the_call_carries_on() {
+    let transfer: TransferFn =
+        Arc::new(|_, _| Box::pin(async { Err(anyhow::anyhow!("transfer destination did not answer (Busy, cause 17)")) }));
+    let mut r = rig_tuned(
+        transfer_workflow(),
+        6,
+        |req| {
+            let failed = req["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["role"] == "tool" && m["content"].as_str().is_some_and(|c| c.contains("Busy")));
+            if failed { sse("Sorry, nobody is available.") } else { transfer_call_sse() }
+        },
+        |c| c.transfer = Some(transfer),
+    )
+    .await;
+    let order = heard_kinds(&mut r, Duration::from_secs(3)).await;
+    assert!(order.starts_with('m') && order.ends_with('m'), "message, then the apology: {order}");
+    assert!(!order.ends_with('h'), "no hold loop remains");
+    assert_eq!(*r.tts.texts.lock().unwrap(), ["Please hold. ", "Sorry, nobody is available."]);
+    r.cancel.cancel();
+    let (s, _) = r.done.await.unwrap();
+    assert_eq!(s.end_reason, None, "a failed transfer doesn't end the call");
 }

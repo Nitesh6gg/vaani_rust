@@ -18,7 +18,11 @@
 
 use super::{Ari, Event, uuid_v4};
 use crate::{
-    agent::{calllog, extract, handler, recorder},
+    agent::{
+        calllog, extract,
+        handler::{self, ConnectFn, TransferFn},
+        recorder,
+    },
     callagent::{self, CallInfo},
     config::Config,
     dograh::{
@@ -36,6 +40,13 @@ use std::{
 use tokio::{net::TcpListener, sync::mpsc};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
+/// The first Stasis argument on a transfer destination's channel, so `on_event` can tell it
+/// apart from a new inbound call. (Dograh tags its ARI transfer legs the same way.)
+const TRANSFER_APP_ARG: &str = "transfer";
+/// Added to the ring timeout for our own wait, so Asterisk's timeout (which hangs the
+/// ringing channel up and yields a clear ChannelDestroyed cause) normally fires first.
+const TRANSFER_ANSWER_SLACK: Duration = Duration::from_secs(5);
+
 /// How long to wait for Asterisk to open the AudioSocket TCP connection after the bridge is up.
 const ACCEPT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -47,12 +58,18 @@ struct Res {
     external_requested: bool,
     counted_active: bool,
     ended: bool,
+    /// The transfer destination's channel once a transfer has connected: from then
+    /// on the call is caller <-> destination, and teardown hangs that channel up too.
+    transferred: Option<String>,
 }
 
 struct Call {
     info: CallInfo,
     external_id: String,
     cancel: CancellationToken,
+    /// Scopes the media plane and the agent (a child of `cancel`). A transfer
+    /// cancels it to take the agent out of a call that carries on without it.
+    media_cancel: CancellationToken,
     res: Mutex<Res>,
 }
 
@@ -97,13 +114,30 @@ pub struct Manager {
     store: Store,
     /// Keyed by BOTH channel ids, so a hangup of either leg finds the call.
     calls: Mutex<HashMap<String, Arc<Call>>>,
+    /// Transfer destinations that are ringing, by channel id.
+    transfers: Mutex<HashMap<String, mpsc::Sender<TransferSignal>>>,
     tracker: TaskTracker,
+}
+
+/// What happened to a ringing transfer destination.
+enum TransferSignal {
+    Answered,
+    /// Destroyed without answering: busy, rejected, no answer (the hangup cause).
+    Failed(String),
 }
 
 impl Manager {
     pub fn new(ari: Ari, cfg: Arc<Config>, store: Store) -> Arc<Self> {
         let ports = PortAllocator::new(cfg.media_port_base, cfg.media_port_count);
-        Arc::new(Self { ari, cfg, ports, store, calls: Mutex::new(HashMap::new()), tracker: TaskTracker::new() })
+        Arc::new(Self {
+            ari,
+            cfg,
+            ports,
+            store,
+            calls: Mutex::new(HashMap::new()),
+            transfers: Mutex::new(HashMap::new()),
+            tracker: TaskTracker::new(),
+        })
     }
 
     /// Dispatches events until `cancel`, then tears every call down and waits
@@ -127,7 +161,12 @@ impl Manager {
 
     fn on_event(self: &Arc<Self>, ev: Event) {
         match ev {
-            Event::StasisStart { channel } => {
+            Event::StasisStart { channel, args } => {
+                // A transfer destination we dialed has answered; it enters this same Stasis
+                // app, so it must not be mistaken for a new inbound call.
+                if args.first().is_some_and(|a| a == TRANSFER_APP_ARG) {
+                    return self.on_transfer_answered(&channel.id);
+                }
                 let found = self.calls.lock().unwrap().get(&channel.id).cloned();
                 match found {
                     // The externalMedia leg arriving: complete the bridge.
@@ -152,6 +191,10 @@ impl Manager {
             Event::ChannelDestroyed { channel, cause, cause_txt } => {
                 let call_id = self.calls.lock().unwrap().get(&channel.id).map(|c| c.info.id.clone()).unwrap_or_else(|| channel.id.clone());
                 tracing::info!(call_id = %call_id, event = "channel.destroyed", channel_id = %channel.id, cause, cause_txt, "channel destroyed");
+                // A ringing transfer destination that went away without answering.
+                if let Some(tx) = self.transfers.lock().unwrap().get(&channel.id) {
+                    let _ = tx.try_send(TransferSignal::Failed(format!("{cause_txt}, cause {cause}")));
+                }
             }
             // Events during the gap, StasisEnd above all, are unrecoverable: any
             // call spanning it may be over without us knowing -- a billable
@@ -168,10 +211,12 @@ impl Manager {
 
     fn start_call(self: &Arc<Self>, channel: super::Channel) {
         let external_id = format!("vaani-ext-{}", &uuid_v4()[..13]);
+        let cancel = CancellationToken::new();
         let call = Arc::new(Call {
             info: CallInfo { id: channel.id.clone(), caller_number: channel.caller_number(), called_number: channel.called_number() },
             external_id: external_id.clone(),
-            cancel: CancellationToken::new(),
+            media_cancel: cancel.child_token(),
+            cancel,
             res: Mutex::new(Res::default()),
         });
         {
@@ -259,13 +304,17 @@ impl Manager {
         tracing::info!(call_id = %id, event = "call.bridged", external_id = %call.external_id, bridge = %bridge, "call bridged");
 
         let ended = self.run_media(&call).await;
-        self.teardown(&call);
+        // After a transfer the call carries on without the agent: caller <-> destination,
+        // ended by either hanging up (StasisEnd). Anything else ends the call with the agent.
+        if call.res.lock().unwrap().transferred.is_none() {
+            self.teardown(&call);
+        }
         if let Some(end) = ended {
             self.record_run(id, end).await;
         }
     }
 
-    async fn run_media(&self, call: &Arc<Call>) -> Option<CallEnd> {
+    async fn run_media(self: &Arc<Self>, call: &Arc<Call>) -> Option<CallEnd> {
         let id = call.info.id.clone();
         let listener = call.res.lock().unwrap().listener.take()?;
 
@@ -314,7 +363,7 @@ impl Manager {
             tokio::spawn(async move { store.start_run(&meta, &rc).await })
         };
 
-        let media = media_call::spawn(id.clone(), stream, self.cfg.media_dead_timeout, call.cancel.child_token());
+        let media = media_call::spawn(id.clone(), stream, self.cfg.media_dead_timeout, call.media_cancel.child_token());
         tracing::info!(call_id = %id, component = "media", event = "media.started", "audiosocket connected, media plane running");
         let stats = media.stats.clone();
 
@@ -327,9 +376,16 @@ impl Manager {
                 }
             });
         });
-        let (agent_cfg, io) = prepared.into_agent(&self.cfg, &id, media, hangup);
+        let transfer: TransferFn = {
+            let (m, c) = (self.clone(), call.clone());
+            Arc::new(move |destination, timeout| {
+                let (m, c) = (m.clone(), c.clone());
+                Box::pin(async move { m.transfer(&c, &destination, timeout).await })
+            })
+        };
+        let (agent_cfg, io) = prepared.into_agent(&self.cfg, &id, media, hangup, Some(transfer));
         let started = std::time::Instant::now();
-        let (summary, finisher) = handler::run(agent_cfg, io, call.cancel.clone()).await;
+        let (summary, finisher) = handler::run(agent_cfg, io, call.media_cancel.clone()).await;
         let duration = started.elapsed();
 
         log_summary(&id, duration, &summary, &stats);
@@ -377,17 +433,27 @@ impl Manager {
     /// setup can't double-free a port or delete a bridge twice.
     fn teardown(self: &Arc<Self>, call: &Arc<Call>) {
         call.cancel.cancel();
-        let (port, bridge, ext, active, first) = {
+        let (port, bridge, ext, active, first, transferred) = {
             let mut r = call.res.lock().unwrap();
             let first = !r.ended;
             r.ended = true;
             r.listener = None; // closes the socket if the media plane never took it
-            (r.port.take(), r.bridge.take(), std::mem::take(&mut r.external_requested), std::mem::take(&mut r.counted_active), first)
+            (
+                r.port.take(),
+                r.bridge.take(),
+                std::mem::take(&mut r.external_requested),
+                std::mem::take(&mut r.counted_active),
+                first,
+                r.transferred.take(),
+            )
         };
         {
             let mut calls = self.calls.lock().unwrap();
             calls.remove(&call.info.id);
             calls.remove(&call.external_id);
+            if let Some(t) = &transferred {
+                calls.remove(t);
+            }
         }
         if let Some(p) = port {
             self.ports.free(p);
@@ -399,7 +465,7 @@ impl Manager {
         if first {
             tracing::debug!(call_id = %call.info.id, event = "call.teardown", "tearing down call");
         }
-        if bridge.is_none() && !ext && !first {
+        if bridge.is_none() && !ext && !first && transferred.is_none() {
             return;
         }
         let (m, call) = (self.clone(), call.clone());
@@ -418,7 +484,119 @@ impl Manager {
             if ext && let Err(e) = m.ari.hangup(&call.external_id).await {
                 tracing::debug!(call_id = %call.info.id, error = %e, "hangup of externalMedia channel failed");
             }
+            if let Some(t) = transferred
+                && let Err(e) = m.ari.hangup(&t).await
+            {
+                tracing::debug!(call_id = %call.info.id, error = %e, "hangup of the transfer destination failed");
+            }
         });
+    }
+
+    /// Dials `destination` for `call` and waits until it answers, fails, or times
+    /// out. On answer it returns the function that swaps the destination into the
+    /// bridge in place of the agent's media leg and stops the agent. Mirrors
+    /// Dograh's ARI transfer: originate into the same Stasis app with
+    /// "transfer,<id>" args, then swap the bridge on answer.
+    async fn transfer(self: &Arc<Self>, call: &Arc<Call>, destination: &str, timeout: Duration) -> anyhow::Result<ConnectFn> {
+        use anyhow::Context;
+        let dest_id = format!("vaani-xfer-{}", &uuid_v4()[..13]);
+        let (tx, mut rx) = mpsc::channel(2);
+        self.transfers.lock().unwrap().insert(dest_id.clone(), tx);
+        let forget = |m: &Self| {
+            m.transfers.lock().unwrap().remove(&dest_id);
+        };
+
+        let app_args = format!("{TRANSFER_APP_ARG},{}", call.info.id);
+        if let Err(e) = self.ari.originate(destination, &app_args, timeout.as_secs(), &dest_id, &call.info.caller_number).await {
+            forget(self);
+            return Err(e).with_context(|| format!("could not dial {destination}"));
+        }
+        tracing::info!(call_id = %call.info.id, transfer_channel = %dest_id, destination, "transfer leg dialing");
+
+        let outcome = tokio::select! {
+            s = rx.recv() => s,
+            _ = tokio::time::sleep(timeout + TRANSFER_ANSWER_SLACK) => None,
+            _ = call.cancel.cancelled() => None,
+        };
+        forget(self);
+        match outcome {
+            Some(TransferSignal::Answered) => {
+                let (m, c) = (self.clone(), call.clone());
+                Ok(Box::new(move || Box::pin(async move { m.connect_transfer(&c, &dest_id).await })))
+            }
+            Some(TransferSignal::Failed(cause)) => anyhow::bail!("transfer destination did not answer ({cause})"),
+            None => {
+                let _ = self.ari.hangup(&dest_id).await; // gave up, or the caller hung up while it rang
+                if call.cancel.is_cancelled() {
+                    anyhow::bail!("the call ended while the transfer rang")
+                } else {
+                    anyhow::bail!("transfer destination did not answer in time")
+                }
+            }
+        }
+    }
+
+    /// Puts the answered destination into the call's bridge, takes the agent's
+    /// externalMedia leg out, and stops the agent. From here the call is caller <->
+    /// destination; teardown ends both together.
+    async fn connect_transfer(self: &Arc<Self>, call: &Arc<Call>, dest_id: &str) -> anyhow::Result<()> {
+        let bridge = {
+            let r = call.res.lock().unwrap();
+            if r.ended { None } else { r.bridge.clone() }
+        };
+        let Some(bridge) = bridge else {
+            let _ = self.ari.hangup(dest_id).await;
+            anyhow::bail!("call ended before the transfer could connect");
+        };
+        // Add the destination before removing the agent, so the caller never sits in a bridge alone.
+        if let Err(e) = self.ari.add_to_bridge(&bridge, &[dest_id]).await {
+            let _ = self.ari.hangup(dest_id).await;
+            return Err(e.context("could not connect the transfer"));
+        }
+        // The caller can hang up during add_to_bridge's round trip: re-check under the
+        // lock teardown reads `transferred` with, so either this sees the teardown and
+        // hangs the destination up itself, or teardown's cleanup sees it and does.
+        let ended = {
+            let mut r = call.res.lock().unwrap();
+            if !r.ended {
+                r.transferred = Some(dest_id.to_string());
+                r.external_requested = false; // hung up on purpose below
+                let mut calls = self.calls.lock().unwrap();
+                calls.insert(dest_id.to_string(), call.clone());
+                // The agent's leg is about to be hung up on purpose; its StasisEnd must not tear the call down.
+                calls.remove(&call.external_id);
+            }
+            r.ended
+        };
+        if ended {
+            let _ = self.ari.hangup(dest_id).await;
+            anyhow::bail!("call ended while the transfer was connecting");
+        }
+        if let Err(e) = self.ari.remove_from_bridge(&bridge, &call.external_id).await {
+            tracing::debug!(call_id = %call.info.id, error = %e, "removing the agent leg from the bridge failed");
+        }
+        call.media_cancel.cancel(); // stops the media plane and the agent (STT/TTS connections close)
+        let _ = self.ari.hangup(&call.external_id).await;
+        Ok(())
+    }
+
+    /// A transfer destination answered (it only enters Stasis once answered).
+    fn on_transfer_answered(&self, channel_id: &str) {
+        let tx = self.transfers.lock().unwrap().get(channel_id).cloned();
+        match tx {
+            Some(tx) => {
+                let _ = tx.try_send(TransferSignal::Answered);
+            }
+            // Answered after we gave up (timeout, caller hung up): nobody is waiting
+            // for it, so don't leave it connected to nothing.
+            None => {
+                tracing::warn!(channel_id, "transfer leg answered but no transfer is waiting; hanging it up");
+                let (ari, id) = (self.ari.clone(), channel_id.to_string());
+                self.tracker.spawn(async move {
+                    let _ = ari.hangup(&id).await;
+                });
+            }
+        }
     }
 
     fn teardown_all(self: &Arc<Self>) {
@@ -566,7 +744,7 @@ mod tests {
         // 1. The caller arrives: answered, and a media port is bound and listening.
         let mut caller = channel("caller-1");
         caller.caller = Some(crate::ari::Number { number: "98765".into() });
-        ev_tx.send(Event::StasisStart { channel: caller }).unwrap();
+        ev_tx.send(Event::StasisStart { channel: caller, args: vec![] }).unwrap();
         let ext = tokio::time::timeout(Duration::from_secs(5), ext_req.recv()).await.unwrap().unwrap();
         assert_eq!(
             (ext["encapsulation"].as_str(), ext["transport"].as_str(), ext["connection_type"].as_str()),
@@ -583,7 +761,7 @@ mod tests {
         audiosocket::write_frame(&mut asterisk, &mut scratch, 0x01, ext["data"].as_str().unwrap().as_bytes()).await.unwrap();
 
         // 3. The externalMedia leg enters Stasis: the bridge is built, the agent starts.
-        ev_tx.send(Event::StasisStart { channel: channel(ext["channelId"].as_str().unwrap()) }).unwrap();
+        ev_tx.send(Event::StasisStart { channel: channel(ext["channelId"].as_str().unwrap()), args: vec![] }).unwrap();
         let (mut rd, mut wr) = asterisk.into_split();
         tokio::spawn(async move {
             let mut scratch = [0u8; audiosocket::HEADER_SIZE + FRAME_SIZE];
@@ -701,5 +879,96 @@ mod tests {
 
         cancel.cancel();
         run.await.unwrap();
+    }
+
+    fn bare_call(id: &str, ext: &str) -> Arc<Call> {
+        let cancel = CancellationToken::new();
+        Arc::new(Call {
+            info: CallInfo { id: id.into(), caller_number: "98765".into(), called_number: "1000".into() },
+            external_id: ext.into(),
+            media_cancel: cancel.child_token(),
+            cancel,
+            res: Mutex::new(Res { bridge: Some("br1".into()), external_requested: true, ..Default::default() }),
+        })
+    }
+
+    /// The `channelId=` the originate request carried.
+    async fn originated_channel(log: &Arc<Mutex<Vec<String>>>, endpoint: &str) -> String {
+        for _ in 0..200 {
+            let line = log.lock().unwrap().iter().find(|l| l.starts_with("POST /ari/channels?endpoint=") && l.contains(endpoint)).cloned();
+            if let Some(l) = line {
+                return l.split("channelId=").nth(1).unwrap().split('&').next().unwrap().to_string();
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("no originate for {endpoint}");
+    }
+
+    #[tokio::test]
+    async fn a_transfer_swaps_the_destination_into_the_bridge_and_failures_are_reported() {
+        let (ari_url, log, _ext) = mock_ari().await;
+        let Some((store, _)) = Store::for_test("t_transfer", "SELECT 1").await else {
+            eprintln!("skipped: DOGRAH_TEST_DB_URL not set");
+            return;
+        };
+        let mgr = Manager::new(Ari::new(&ari_url, "u", "p", "vaani"), Arc::new(Config::for_test("")), store);
+
+        // The destination answers: it enters Stasis with the "transfer" argument.
+        let call = bare_call("caller-1", "ext-1");
+        mgr.calls.lock().unwrap().extend([("caller-1".to_string(), call.clone()), ("ext-1".to_string(), call.clone())]);
+        let (m, c) = (mgr.clone(), call.clone());
+        let dialing = tokio::spawn(async move { m.transfer(&c, "PJSIP/100@pbx", Duration::from_secs(5)).await });
+        let dest = originated_channel(&log, "PJSIP%2F100%40pbx").await;
+        assert!(
+            log.lock().unwrap().iter().any(|l| l.contains("appArgs=transfer%2Ccaller-1") && l.contains("timeout=5")),
+            "{:?}",
+            log.lock().unwrap()
+        );
+        mgr.on_event(Event::StasisStart { channel: channel(&dest), args: vec!["transfer".into(), "caller-1".into()] });
+        let connect = dialing.await.unwrap().expect("answered");
+        assert!(!call.media_cancel.is_cancelled(), "the agent keeps the call until the handover");
+
+        connect().await.unwrap();
+        let l = log.lock().unwrap().clone();
+        let pos = |needle: &str| l.iter().position(|x| x.contains(needle)).unwrap_or_else(|| panic!("{needle} missing from {l:?}"));
+        assert!(
+            pos(&format!("/bridges/br1/addChannel?channel={dest}")) < pos("/bridges/br1/removeChannel?channel=ext-1"),
+            "destination added BEFORE the agent leaves: {l:?}"
+        );
+        assert!(l.contains(&"DELETE /ari/channels/ext-1".to_string()));
+        assert!(call.media_cancel.is_cancelled() && !call.cancel.is_cancelled(), "the agent stops; the call goes on");
+        {
+            let calls = mgr.calls.lock().unwrap();
+            assert!(calls.contains_key(&dest) && !calls.contains_key("ext-1"), "the agent leg's StasisEnd no longer ends the call");
+        }
+        // Either side hanging up now ends everything.
+        mgr.on_event(Event::StasisEnd { channel: channel(&dest) });
+        wait_for("teardown", || {
+            let l = log.lock().unwrap();
+            l.contains(&"DELETE /ari/bridges/br1".to_string())
+                && l.contains(&"DELETE /ari/channels/caller-1".to_string())
+                && l.iter().filter(|x| x.ends_with(&format!("/channels/{dest}"))).count() >= 1
+        })
+        .await;
+        assert!(call.cancel.is_cancelled() && mgr.calls.lock().unwrap().is_empty());
+
+        // The destination is busy: reported with Asterisk's cause, and nothing was swapped.
+        let call2 = bare_call("caller-2", "ext-2");
+        let (m, c) = (mgr.clone(), call2.clone());
+        let dialing = tokio::spawn(async move { m.transfer(&c, "PJSIP/200@pbx", Duration::from_secs(5)).await });
+        let dest2 = originated_channel(&log, "PJSIP%2F200%40pbx").await;
+        mgr.on_event(Event::ChannelDestroyed { channel: channel(&dest2), cause: 17, cause_txt: "User busy".into() });
+        let err = dialing.await.unwrap().err().expect("busy").to_string();
+        assert_eq!(err, "transfer destination did not answer (User busy, cause 17)");
+        assert!(!call2.media_cancel.is_cancelled() && mgr.transfers.lock().unwrap().is_empty());
+
+        // The caller hangs up while it rings: the destination is hung up, not left ringing.
+        let call3 = bare_call("caller-3", "ext-3");
+        let (m, c) = (mgr.clone(), call3.clone());
+        let dialing = tokio::spawn(async move { m.transfer(&c, "PJSIP/300@pbx", Duration::from_secs(5)).await });
+        let dest3 = originated_channel(&log, "PJSIP%2F300%40pbx").await;
+        call3.cancel.cancel();
+        assert!(dialing.await.unwrap().is_err());
+        wait_for("the ringing destination hung up", || log.lock().unwrap().contains(&format!("DELETE /ari/channels/{dest3}"))).await;
     }
 }

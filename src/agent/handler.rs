@@ -28,7 +28,7 @@ use super::{
     recordings::{ClipRouter, RECORDING_MARKER, strip_recording_refs},
     sttgate::{GateConfig, SttGate},
     vad::BargeInDetector,
-    workflow::{Clip, Edge, Node, ToolKind, Workflow, plain_history, request_messages},
+    workflow::{Clip, Edge, Node, Tool, ToolKind, Workflow, plain_history, request_messages},
 };
 use crate::{
     ai::{
@@ -81,6 +81,16 @@ pub enum State {
     Speaking,
 }
 
+/// Hands the caller over to the transfer destination (called once it answered).
+pub type ConnectFn = Box<dyn FnOnce() -> futures_util::future::BoxFuture<'static, anyhow::Result<()>> + Send>;
+/// Dials `destination` and waits (up to `timeout`) for it to answer; on success returns the
+/// function that completes the handover.
+pub type TransferFn = Arc<dyn Fn(String, Duration) -> futures_util::future::BoxFuture<'static, anyhow::Result<ConnectFn>> + Send + Sync>;
+
+/// How long hold music waits for the transfer's spoken message to start arriving from TTS before
+/// starting anyway -- so the ring doesn't start and then get interrupted by the message.
+const HOLD_MESSAGE_WAIT_TICKS: u32 = 150;
+
 pub struct AgentConfig {
     pub call_id: String,
     pub workflow: Arc<Workflow>,
@@ -105,6 +115,11 @@ pub struct AgentConfig {
     pub llm_fallback_text: String,
     /// Hangs the caller up (fire-and-forget: it's an ARI REST call).
     pub hangup: Arc<dyn Fn() + Send + Sync>,
+    /// `None`: the switch can't transfer, and a transfer tool reports so to the LLM.
+    pub transfer: Option<TransferFn>,
+    /// Loops to the caller while a transfer rings; the beep plays when it answers.
+    pub hold_audio: Arc<Vec<u8>>,
+    pub beep_audio: Arc<Vec<u8>>,
 }
 
 pub struct AgentIo {
@@ -148,6 +163,8 @@ enum Event {
         call_id: String,
         result: Option<String>,
     },
+    /// A transfer is ringing or has answered: what the caller hears meanwhile.
+    Hold(HoldCmd),
     LlmUsage(Usage),
     TtsChars(u64),
     LlmDone(LlmDone),
@@ -156,6 +173,48 @@ enum Event {
     MaxDuration,
     /// end_call ran in a turn that an interruption then cancelled: the call must still end.
     EndCallTool,
+}
+
+enum HoldCmd {
+    /// Loop the hold audio (after the tool's spoken message, if `wait_for_message`).
+    Ring {
+        wait_for_message: bool,
+    },
+    /// Play the beep once; `done` fires when it finished.
+    Beep {
+        done: tokio::sync::oneshot::Sender<()>,
+    },
+    Off,
+}
+
+/// Canned audio (hold loop or beep) fed to the caller frame by frame during a transfer.
+struct Hold {
+    pcm: Arc<Vec<u8>>,
+    looped: bool,
+    wait_for_message: bool,
+    pos: usize,
+    waited: u32,
+    saw_message: bool,
+    done: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl Hold {
+    /// The next 20ms frame, or `None` once a one-shot player has finished (or there's nothing to play).
+    fn next(&mut self) -> Option<Frame> {
+        if self.pos + FRAME_SIZE > self.pcm.len() {
+            if !self.looped || self.pcm.len() < FRAME_SIZE {
+                if let Some(d) = self.done.take() {
+                    let _ = d.send(());
+                }
+                return None;
+            }
+            self.pos = 0;
+        }
+        let mut f = [0u8; FRAME_SIZE];
+        f.copy_from_slice(&self.pcm[self.pos..self.pos + FRAME_SIZE]);
+        self.pos += FRAME_SIZE;
+        Some(f)
+    }
 }
 
 struct LlmDone {
@@ -205,6 +264,7 @@ struct Agent {
     turn_speech_end: Option<Instant>,
     /// Extractions running in the background, in the order they started.
     extracting: Vec<extract::Pending>,
+    hold: Option<Hold>,
 
     state: State,
     node: usize,
@@ -214,6 +274,7 @@ struct Agent {
     turn_cancel: Option<CancellationToken>,
     llm_failures: Arc<AtomicU32>,
     tool_running: Arc<AtomicBool>,
+    transferred: Arc<AtomicBool>,
 
     tts: Option<TtsHandle>,
     next_conn: u64,
@@ -291,6 +352,7 @@ pub async fn run(cfg: AgentConfig, io: AgentIo, cancel: CancellationToken) -> (S
         llm_usage_key,
         turn_speech_end: None,
         extracting: vec![],
+        hold: None,
         state: State::Listening,
         node,
         history: vec![],
@@ -299,6 +361,7 @@ pub async fn run(cfg: AgentConfig, io: AgentIo, cancel: CancellationToken) -> (S
         turn_cancel: None,
         llm_failures: Arc::new(AtomicU32::new(0)),
         tool_running: Arc::new(AtomicBool::new(false)),
+        transferred: Arc::new(AtomicBool::new(false)),
         tts: None,
         next_conn: 0,
         tts_buf: vec![],
@@ -381,6 +444,9 @@ pub async fn run(cfg: AgentConfig, io: AgentIo, cancel: CancellationToken) -> (S
         t.client.cancel();
     }
     a.cancel_turn();
+    if a.transferred.load(Relaxed) {
+        a.log.ending(calllog::TRANSFER);
+    }
     a.stt_frames_to_log();
     // Dograh extracts the last node's variables as the call ends, after any still
     // running from earlier nodes: handed back, to run after teardown.
@@ -494,6 +560,12 @@ impl Agent {
         // doing: feeding only while listening clipped the first syllable of
         // answers given over the agent. What to do with each transcript is
         // decided when it arrives.
+        // During a transfer the caller is waiting: already-queued agent speech (the
+        // "please stay on the line" message) plays first, then the hold audio.
+        // Nothing reaches the STT and barge-in is off.
+        if self.hold.is_some() {
+            return self.process_hold_frame();
+        }
         self.feed_stt(pcm);
         if !self.cfg.stt_flush_after.is_zero() {
             self.maybe_flush_stt();
@@ -507,6 +579,20 @@ impl Agent {
                 None
             }
         }
+    }
+
+    fn process_hold_frame(&mut self) -> Option<Frame> {
+        if let Some(f) = self.out_q.pop_front() {
+            self.playing_req = f.req;
+            self.hold.as_mut()?.saw_message = true;
+            return Some(f.pcm);
+        }
+        let h = self.hold.as_mut()?;
+        if h.wait_for_message && !h.saw_message && h.waited < HOLD_MESSAGE_WAIT_TICKS {
+            h.waited += 1;
+            return None;
+        }
+        h.next()
     }
 
     fn process_speaking_frame(&mut self, pcm: &Frame) -> Option<Frame> {
@@ -647,6 +733,22 @@ impl Agent {
                 None => self.log.function_started(&name, &call_id),
                 Some(r) => self.log.function_ended(&name, &call_id, &r),
             },
+            Event::Hold(cmd) => {
+                let hold = |pcm: &Arc<Vec<u8>>, looped, wait_for_message, done| Hold {
+                    pcm: pcm.clone(),
+                    looped,
+                    wait_for_message,
+                    pos: 0,
+                    waited: 0,
+                    saw_message: false,
+                    done,
+                };
+                self.hold = match cmd {
+                    HoldCmd::Ring { wait_for_message } => Some(hold(&self.cfg.hold_audio, true, wait_for_message, None)),
+                    HoldCmd::Beep { done } => Some(hold(&self.cfg.beep_audio, false, false, Some(done))),
+                    HoldCmd::Off => None,
+                };
+            }
             Event::LlmUsage(u) => {
                 let key = self.llm_usage_key.clone();
                 self.log.llm_used(&key, u);
@@ -908,9 +1010,11 @@ impl Agent {
             call_id: self.id.clone(),
             failures: self.llm_failures.clone(),
             tool_running: self.tool_running.clone(),
+            transferred: self.transferred.clone(),
             fallback: FailurePolicy { max_failed: self.cfg.llm_max_failed_turns, text: self.cfg.llm_fallback_text.clone() },
             started: self.turn_started,
             greeting,
+            transfer: self.cfg.transfer.clone(),
         }
     }
 
@@ -1264,9 +1368,12 @@ struct TurnCtx {
     call_id: String,
     failures: Arc<AtomicU32>,
     tool_running: Arc<AtomicBool>,
+    /// Set just before the handover: connecting cancels the agent, so the end reason can't wait for an event.
+    transferred: Arc<AtomicBool>,
     fallback: FailurePolicy,
     started: Instant,
     greeting: Option<Greeting>,
+    transfer: Option<TransferFn>,
 }
 
 /// The start node's opening, spoken before the caller says anything.
@@ -1398,6 +1505,8 @@ async fn turn_task(c: TurnCtx) {
 enum Action {
     None,
     EndCall,
+    /// The caller is now with the transfer destination.
+    Transferred,
 }
 
 /// Streams the LLM's reply for one turn, speaking it sentence by sentence as it
@@ -1409,7 +1518,7 @@ async fn run_llm_turn(c: &TurnCtx, tts: &Arc<TtsClient>) {
     let wf = &c.wf;
     let mut node = c.node;
     let mut history = c.history.clone();
-    let (mut tool_msgs, mut end_call, mut spoke) = (vec![], false, false);
+    let (mut tool_msgs, mut end_call, mut spoke, mut transferred) = (vec![], false, false, false);
     let mut err: Option<LlmError> = None;
     let mut ttft: Option<Duration> = None;
     let mut chunker = SentenceChunker::default();
@@ -1519,6 +1628,7 @@ async fn run_llm_turn(c: &TurnCtx, tts: &Arc<TtsClient>) {
             history.push(m.clone());
             tool_msgs.push(m);
             end_call |= action == Action::EndCall;
+            transferred |= action == Action::Transferred;
         }
 
         if c.cancel.is_cancelled() {
@@ -1530,8 +1640,10 @@ async fn run_llm_turn(c: &TurnCtx, tts: &Arc<TtsClient>) {
             }
             return;
         }
-        if end_call {
-            break; // the goodbye has been said; the LLM isn't asked again
+        // Neither needs another LLM round: end_call's goodbye has been said, and
+        // after a transfer the caller is talking to a person.
+        if end_call || transferred {
+            break;
         }
     }
 
@@ -1616,6 +1728,7 @@ async fn run_tool(c: &TurnCtx, tts: &TtsClient, node: usize, call: &ToolCall) ->
             let _ = c.ev.send(Event::Closing { generation: c.generation, reason: calllog::END_CALL_TOOL }); // no interrupting the goodbye
             (r#"{"status":"success","action":"ending_call"}"#.to_string(), Action::EndCall)
         }
+        ToolKind::Transfer { destination, timeout } => transfer(c, t, destination, *timeout).await,
         ToolKind::Function(run) => {
             c.tool_running.store(true, Relaxed);
             let args = serde_json::from_str(&call.function.arguments).unwrap_or(serde_json::Value::Null);
@@ -1636,6 +1749,47 @@ async fn run_tool(c: &TurnCtx, tts: &TtsClient, node: usize, call: &ToolCall) ->
             }
         }
     }
+}
+
+fn transfer_failed(reason: &str) -> String {
+    serde_json::json!({"status": "failed", "reason": reason}).to_string()
+}
+
+/// Runs a Transfer tool: ring the destination with hold music playing to the
+/// caller; on answer play the beep, then hand over (Dograh's transfer flow: hold
+/// loop while waiting, beep, then bridge swap).
+async fn transfer(c: &TurnCtx, t: &Tool, destination: &str, timeout: Duration) -> (String, Action) {
+    let Some(dial) = &c.transfer else { return (transfer_failed("call transfer is not available"), Action::None) };
+    tracing::info!(call_id = %c.call_id, event = "transfer.dialing", generation = c.generation, destination, timeout_s = timeout.as_secs(), "transfer dialing");
+    let _ = c.ev.send(Event::Hold(HoldCmd::Ring { wait_for_message: !t.message.is_empty() || t.message_clip.is_some() }));
+    let started = Instant::now();
+    let after_ms = || started.elapsed().as_millis() as u64;
+
+    let connect = match dial(destination.to_string(), timeout).await {
+        Ok(connect) => connect,
+        Err(e) => {
+            let _ = c.ev.send(Event::Hold(HoldCmd::Off));
+            tracing::warn!(call_id = %c.call_id, event = "transfer.failed", generation = c.generation, destination, after_ms = after_ms(), error = %format!("{e:#}"), "transfer failed");
+            return (transfer_failed(&format!("{e:#}")), Action::None);
+        }
+    };
+    tracing::info!(call_id = %c.call_id, event = "transfer.answered", generation = c.generation, destination, after_ms = after_ms(), "transfer answered");
+
+    // Beep, and let it finish playing before the handover cuts this leg off.
+    let (done, finished) = tokio::sync::oneshot::channel();
+    let _ = c.ev.send(Event::Hold(HoldCmd::Beep { done }));
+    let _ = tokio::time::timeout(Duration::from_secs(2), finished).await;
+
+    c.transferred.store(true, Relaxed);
+    if let Err(e) = connect().await {
+        c.transferred.store(false, Relaxed);
+        let _ = c.ev.send(Event::Hold(HoldCmd::Off));
+        tracing::warn!(call_id = %c.call_id, event = "transfer.failed", generation = c.generation, error = %format!("{e:#}"), "transfer handover failed");
+        return (transfer_failed(&format!("{e:#}")), Action::None);
+    }
+    tracing::info!(call_id = %c.call_id, event = "transfer.connected", generation = c.generation, destination, "call transferred");
+    let _ = c.ev.send(Event::Closing { generation: c.generation, reason: calllog::TRANSFER });
+    (r#"{"status":"success","action":"transferred"}"#.to_string(), Action::Transferred)
 }
 
 fn truncate(s: &str, max: usize) -> String {

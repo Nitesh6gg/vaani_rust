@@ -4,7 +4,7 @@
 
 use crate::{
     agent::{
-        handler::{AgentConfig, AgentIo},
+        handler::{AgentConfig, AgentIo, TransferFn},
         sttgate::GateConfig,
         vad::VoteDetector,
     },
@@ -76,7 +76,14 @@ impl Prepared {
 
     /// Assembles the agent once the media connection is up. `hangup` hangs the
     /// caller's channel up (which fires StasisEnd and the normal teardown).
-    pub fn into_agent(self, cfg: &Config, call_id: &str, media: MediaIo, hangup: Arc<dyn Fn() + Send + Sync>) -> (AgentConfig, AgentIo) {
+    pub fn into_agent(
+        self,
+        cfg: &Config,
+        call_id: &str,
+        media: MediaIo,
+        hangup: Arc<dyn Fn() + Send + Sync>,
+        transfer: Option<TransferFn>,
+    ) -> (AgentConfig, AgentIo) {
         let Prepared { wf, stt, stt_events } = self;
         let s = &wf.services;
         let mut llm = LlmClient::new(&s.llm.base_url, &s.llm.api_key, &s.llm.model);
@@ -111,6 +118,9 @@ impl Prepared {
             llm_max_failed_turns: cfg.llm_max_failed_turns,
             llm_fallback_text: cfg.llm_fallback_text.clone(),
             hangup,
+            transfer,
+            hold_audio: crate::assets::transfer_hold_ring(),
+            beep_audio: crate::assets::beep(),
         };
         (agent, AgentIo { media, stt, stt_events })
     }

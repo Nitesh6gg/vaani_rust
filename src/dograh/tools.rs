@@ -18,6 +18,8 @@ pub const CATEGORY_END_CALL: &str = "end_call";
 pub const CATEGORY_TRANSFER: &str = "transfer_call";
 pub const CATEGORY_HTTP: &str = "http_api";
 
+/// How long a transfer rings before giving up when the tool sets no timeout.
+const DEFAULT_TRANSFER_TIMEOUT: Duration = Duration::from_secs(30);
 /// Dograh's timeout_ms default.
 const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(5);
 /// ponytail: Dograh reads whole replies; 1 MiB is far more than an LLM turn can use.
@@ -58,6 +60,11 @@ struct ToolConfig {
     #[serde(default, rename = "endCallReasonDescription")]
     end_call_reason_description: String,
     // http_api. Its message is customMessage; unlike the other tools it doesn't use messageType.
+    #[serde(default)]
+    destination: String,
+    /// transfer_call: seconds to ring; Dograh's default is 30.
+    #[serde(default)]
+    timeout: Option<f64>,
     #[serde(default)]
     method: String,
     #[serde(default)]
@@ -151,7 +158,13 @@ pub fn build_tool(r: &ToolRow, clips: &ClipSet) -> Result<(Tool, Option<String>)
             Ok((Tool { def, kind: ToolKind::EndCall, message, message_clip }, warning))
         }
         CATEGORY_HTTP => build_http_tool(r, cfg, def, clips),
-        CATEGORY_TRANSFER => bail!("tool {:?} ({}): transfer_call isn't supported yet", r.name, r.uuid),
+        CATEGORY_TRANSFER => {
+            if cfg.destination.trim().is_empty() {
+                bail!("transfer tool {:?} ({}) has no destination", r.name, r.uuid);
+            }
+            let timeout = cfg.timeout.filter(|t| *t > 0.0).map(Duration::from_secs_f64).unwrap_or(DEFAULT_TRANSFER_TIMEOUT);
+            Ok((Tool { def, kind: ToolKind::Transfer { destination: cfg.destination.clone(), timeout }, message, message_clip }, warning))
+        }
         other => bail!("tool {:?} (category {other}): tool category not supported yet", r.name),
     }
 }
@@ -387,7 +400,15 @@ mod tests {
         let (_, w) = build_tool(&r, &ClipSet::default()).unwrap();
         assert!(w.unwrap().contains("not found or not active"));
         assert!(build_tool(&row("http_api", "X", json!({"config": {}})), &ClipSet::default()).is_err(), "no url");
-        assert!(build_tool(&row("transfer_call", "T", json!({})), &ClipSet::default()).is_err());
+        assert!(build_tool(&row("transfer_call", "T", json!({})), &ClipSet::default()).is_err(), "no destination");
+        let (t, _) = build_tool(&row("transfer_call", "Transfer to Support", json!({"config": {"destination": "PJSIP/100@pbx", "timeout": 12.5, "messageType": "custom", "customMessage": "Please hold."}})), &ClipSet::default()).unwrap();
+        assert_eq!(t.def.name, "transfer_to_support");
+        assert_eq!(t.message, "Please hold.");
+        assert!(
+            matches!(&t.kind, ToolKind::Transfer { destination, timeout } if destination == "PJSIP/100@pbx" && *timeout == Duration::from_millis(12_500))
+        );
+        let (t, _) = build_tool(&row("transfer_call", "T", json!({"config": {"destination": "SIP/1"}})), &ClipSet::default()).unwrap();
+        assert!(matches!(t.kind, ToolKind::Transfer { timeout, .. } if timeout == Duration::from_secs(30)));
     }
 
     #[test]
