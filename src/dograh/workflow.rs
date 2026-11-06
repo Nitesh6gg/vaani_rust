@@ -138,6 +138,7 @@ pub fn build(wf: &WorkflowJson, vars: &Map<String, Value>, tool_rows: &[ToolRow]
             parts.push(p);
         }
         let mut node = Node {
+            id: n.id.clone(),
             name: d.name.clone(),
             prompt: parts.join("\n\n"),
             end: d.is_end,

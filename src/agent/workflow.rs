@@ -38,6 +38,8 @@ pub struct Edge {
 
 #[derive(Clone, Default)]
 pub struct Node {
+    /// Dograh's node id, for the call log.
+    pub id: String,
     pub name: String,
     /// Complete system prompt at this node (global prompt + own, variables filled).
     pub prompt: String,

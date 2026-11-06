@@ -13,7 +13,7 @@ use crate::{
         tts::TtsConfig,
     },
     config::Config,
-    dograh::{LoadedWorkflow, Store},
+    dograh::{LoadedWorkflow, Store, run::RunMeta},
     media::call::MediaIo,
 };
 use anyhow::{Context, Result};
@@ -67,6 +67,11 @@ pub async fn prepare(cfg: &Config, store: &Store, info: &CallInfo, cancel: &Canc
 }
 
 impl Prepared {
+    /// What the call's Dograh run needs to remember about its workflow.
+    pub fn run_meta(&self) -> RunMeta {
+        self.wf.run_meta()
+    }
+
     /// Assembles the agent once the media connection is up. `hangup` hangs the
     /// caller's channel up (which fires StasisEnd and the normal teardown).
     pub fn into_agent(self, cfg: &Config, call_id: &str, media: MediaIo, hangup: Arc<dyn Fn() + Send + Sync>) -> (AgentConfig, AgentIo) {

@@ -22,13 +22,15 @@
 
 use super::{
     backchannel::backchannel,
+    calllog::{self, CallLog, Summary},
+    recorder::MixRecorder,
     vad::BargeInDetector,
     workflow::{Node, ToolKind, Workflow, plain_history, request_messages},
 };
 use crate::{
     ai::{
         chunker::{SentenceChunker, is_digit, is_letter, is_mark},
-        llm::{LlmClient, LlmError, Message, ToolCall},
+        llm::{LlmClient, LlmError, Message, ToolCall, Usage},
         stt::{SttClient, SttEvent},
         tts::{TtsClient, TtsConfig, TtsEvent},
     },
@@ -38,7 +40,7 @@ use crate::{
     },
 };
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU32, Ordering::Relaxed},
@@ -104,15 +106,6 @@ pub struct AgentIo {
     pub stt_events: UnboundedReceiver<SttEvent>,
 }
 
-#[derive(Debug, Default)]
-pub struct Summary {
-    pub turns: u32,
-    pub interruptions: u32,
-    pub false_interruptions: u32,
-    pub errors: HashMap<String, u32>,
-    pub end_reason: String,
-}
-
 // ---------------------------------------------------------------- events ---
 
 enum Event {
@@ -135,7 +128,16 @@ enum Event {
     /// The call is ending (end_call tool, or an end node was reached): no more interruptions.
     Closing {
         generation: u64,
+        reason: &'static str,
     },
+    /// The LLM called a tool or took an edge (`result` set when it finished).
+    Function {
+        name: String,
+        call_id: String,
+        result: Option<String>,
+    },
+    LlmUsage(Usage),
+    TtsChars(u64),
     LlmDone(LlmDone),
     Resume(u64),
     Idle(u64),
@@ -182,7 +184,11 @@ struct Agent {
     ev_tx: UnboundedSender<Event>,
     stt: SttClient,
     cancel: CancellationToken,
-    summary: Summary,
+    log: CallLog,
+    recorder: MixRecorder,
+    stt_frames: u64,
+    llm_usage_key: String,
+    turn_speech_end: Option<Instant>,
 
     state: State,
     node: usize,
@@ -243,6 +249,8 @@ struct Agent {
     ending: bool,
     closing: bool,
     hung_up: bool,
+    /// Why the agent hung up, for its log line (the Dograh disposition is in `log`).
+    end_label: String,
 }
 
 /// Runs the agent for one call until the call ends (`cancel`, far-end hangup).
@@ -251,13 +259,18 @@ pub async fn run(cfg: AgentConfig, io: AgentIo, cancel: CancellationToken) -> Su
     let AgentIo { mut media, stt, mut stt_events } = io;
     let now = Instant::now();
     let node = cfg.workflow.start;
+    let llm_usage_key = format!("LLM|||{}", cfg.llm.model);
     let mut a = Agent {
         id: cfg.call_id.clone(),
         cfg,
         ev_tx,
         stt,
         cancel: cancel.clone(),
-        summary: Summary::default(),
+        log: CallLog::default(),
+        recorder: MixRecorder::default(),
+        stt_frames: 0,
+        llm_usage_key,
+        turn_speech_end: None,
         state: State::Listening,
         node,
         history: vec![],
@@ -307,6 +320,7 @@ pub async fn run(cfg: AgentConfig, io: AgentIo, cancel: CancellationToken) -> Su
         ending: false,
         closing: false,
         hung_up: false,
+        end_label: String::new(),
     };
 
     if a.cfg.max_duration > Duration::ZERO {
@@ -326,8 +340,10 @@ pub async fn run(cfg: AgentConfig, io: AgentIo, cancel: CancellationToken) -> Su
             _ = media.closed.cancelled() => break,
             _ = tick.tick() => {
                 let pcm = media.inbound.try_recv().unwrap_or(SILENCE);
-                if let Some(out) = a.process_frame(&pcm) && media.outbound.try_send(out).is_err() {
-                    media.stats.inbound_dropped.fetch_add(0, Relaxed); // queue full: dropped, never blocks the tick
+                let out = a.process_frame(&pcm);
+                a.recorder.frame(&pcm, out.as_ref());
+                if let Some(out) = out {
+                    let _ = media.outbound.try_send(out); // queue full: dropped, never blocks the tick
                 }
             }
             Some(ev) = stt_events.recv() => a.on_stt(ev),
@@ -345,7 +361,12 @@ pub async fn run(cfg: AgentConfig, io: AgentIo, cancel: CancellationToken) -> Su
         t.client.cancel();
     }
     a.cancel_turn();
-    a.summary
+    a.stt_frames_to_log();
+    let truncated = a.recorder.truncated;
+    let mut summary = a.log.into_summary();
+    summary.recording_truncated = truncated;
+    summary.recording_pcm = a.recorder.into_pcm();
+    summary
 }
 
 impl Agent {
@@ -354,7 +375,12 @@ impl Agent {
     }
 
     fn agent_error(&mut self, stage: &str) {
-        *self.summary.errors.entry(stage.to_string()).or_default() += 1;
+        self.log.error(stage);
+    }
+
+    /// The caller audio handed to the STT is what Sarvam bills: every frame of the call.
+    fn stt_frames_to_log(&mut self) {
+        self.log.stt_seconds = self.stt_frames as f64 * crate::media::FRAME_INTERVAL.as_secs_f64();
     }
 
     fn interruptible(&self) -> bool {
@@ -371,6 +397,9 @@ impl Agent {
     // ------------------------------------------------------------- start ---
 
     fn start(&mut self) {
+        let n = self.node();
+        let (id, name, allow) = (n.id.clone(), n.name.clone(), n.allow_interrupt);
+        self.log.node_entered(&id, &name, allow);
         if self.node().greeting.is_empty() {
             tracing::debug!(call_id = %self.id, event = "agent.opening", "llm speaks first");
             self.start_turn();
@@ -388,6 +417,7 @@ impl Agent {
         // doing: feeding only while listening clipped the first syllable of
         // answers given over the agent. What to do with each transcript is
         // decided when it arrives.
+        self.stt_frames += 1;
         if !self.stt.feed(pcm) {
             self.agent_error("stt");
         }
@@ -423,6 +453,7 @@ impl Agent {
         if detected && run >= self.cfg.barge_in_min_speech && now - self.speaking_since >= self.cfg.barge_in_guard && self.interruptible() {
             // Pause, don't cut: whether this is the caller or noise isn't known yet.
             self.paused = true;
+            self.log.pauses += 1;
             self.paused_at = now;
             self.cfg.vad.reset();
             self.speech_run_start = None;
@@ -518,18 +549,32 @@ impl Agent {
             Event::NodeEntered { generation, idx } => {
                 if generation == self.generation {
                     self.node = idx;
+                    let n = self.node();
+                    let (id, name, allow) = (n.id.clone(), n.name.clone(), n.allow_interrupt);
+                    self.log.node_entered(&id, &name, allow);
                 }
             }
-            Event::Closing { generation } => {
+            Event::Closing { generation, reason } => {
+                self.log.ending(reason);
                 if generation == self.generation {
                     self.closing = true; // no interrupting the goodbye, as in Dograh
                 }
             }
+            Event::Function { name, call_id, result } => match result {
+                None => self.log.function_started(&name, &call_id),
+                Some(r) => self.log.function_ended(&name, &call_id, &r),
+            },
+            Event::LlmUsage(u) => {
+                let key = self.llm_usage_key.clone();
+                self.log.llm_used(&key, u);
+            }
+            Event::TtsChars(n) => self.log.tts_chars += n,
             Event::LlmDone(e) => self.on_llm_done(e),
             Event::Resume(seq) => self.on_resume_check(seq),
             Event::Idle(seq) => self.on_idle(seq),
             Event::MaxDuration => {
                 tracing::info!(call_id = %self.id, event = "call.max_duration", "max call duration reached; ending the call");
+                self.log.ending(calllog::MAX_DURATION);
                 self.end_call("max_call_duration");
             }
             Event::EndCallTool => self.end_call("end_call"),
@@ -618,11 +663,16 @@ impl Agent {
         self.utt_start.filter(|t| t.elapsed() < MAX_UTTERANCE_AGE)
     }
 
-    fn accept_user_turn(&mut self, text: String, _started: Option<Instant>, speech_end: Option<Instant>) {
+    fn accept_user_turn(&mut self, text: String, started: Option<Instant>, speech_end: Option<Instant>) {
         self.history.push(Message::new("user", text.clone()));
         self.turn += 1;
-        self.summary.turns = self.turn;
+        self.log.user_said(&text, started);
+        self.turn_speech_end = speech_end;
         let endpoint_ms = speech_end.map(|t| t.elapsed().as_millis() as u64);
+        if let Some(t) = speech_end {
+            // Sarvam's end-of-speech -> its transcript: Dograh's STT TTFB.
+            self.log.ttfb("stt", t.elapsed());
+        }
         tracing::info!(call_id = %self.id, event = "turn.user", turn = self.turn, node = %self.node().name,
             generation = self.generation + 1, text = %text, endpoint_ms, "caller turn");
         self.idle_count = 0;
@@ -637,6 +687,7 @@ impl Agent {
     fn hold_speech(&mut self, text: String, why: &str) {
         let at = self.utterance_start().unwrap_or_else(Instant::now);
         tracing::info!(call_id = %self.id, event = "agent.speech.held", why, text = %text, generation = self.generation, "caller speech held until the reply ends");
+        self.log.held_speech += 1;
         self.held.push(Held { text, generation: self.generation, at });
     }
 
@@ -676,6 +727,7 @@ impl Agent {
             return false;
         }
         let text = answer.join(" ");
+        self.log.held_delivered += 1;
         tracing::info!(call_id = %self.id, event = "agent.speech.delivered", text = %text, "held caller speech delivered as their turn");
         self.accept_user_turn(text, at, None);
         true
@@ -715,7 +767,7 @@ impl Agent {
         if self.idle_count >= 2 {
             prompt = IDLE_FINAL;
             self.ending = true;
-            self.summary.end_reason = "caller_silent".into();
+            self.log.ending(calllog::CALLER_SILENT);
             self.closing = true;
         }
         tracing::info!(call_id = %self.id, event = "caller.silent", times = self.idle_count, ending_call = self.ending, "caller silent");
@@ -729,7 +781,7 @@ impl Agent {
     /// otherwise once the current one has played (`finish_turn`).
     fn end_call(&mut self, reason: &str) {
         self.ending = true;
-        self.summary.end_reason = reason.into();
+        self.end_label = reason.into();
         self.closing = true;
         self.stop_idle_timer();
         if matches!(self.state, State::Listening | State::Transcribing) {
@@ -742,7 +794,7 @@ impl Agent {
             return;
         }
         self.hung_up = true;
-        let reason = if self.summary.end_reason.is_empty() { "end_call" } else { &self.summary.end_reason };
+        let reason = if self.end_label.is_empty() { "end_call" } else { &self.end_label };
         tracing::info!(call_id = %self.id, event = "call.ended_by_agent", reason, node = %self.node().name, "agent ending call");
         (self.cfg.hangup)();
     }
@@ -793,6 +845,7 @@ impl Agent {
     /// One LLM turn over the current history: after the caller spoke, at call
     /// start when the LLM opens, or when the caller has gone silent.
     fn start_turn(&mut self) {
+        self.log.agent_replies += 1;
         self.stop_idle_timer();
         self.state = State::Thinking;
         let ctx = self.turn_ctx(None);
@@ -842,6 +895,10 @@ impl Agent {
             let ttfa = self.turn_started.elapsed();
             self.turn_ttfa = Some(ttfa);
             tracing::debug!(call_id = %self.id, event = "tts.first_audio", generation, latency_ms = ttfa.as_millis() as u64, "tts first audio");
+            if let Some(t) = self.turn_speech_end.take() {
+                // The caller's wait, from the STT's end-of-speech to the reply's first audio.
+                self.log.reply_latency(t.elapsed());
+            }
             // Start draining to the caller only once real audio has arrived,
             // not when text is merely sent: flipping earlier left a silence gap
             // as long as Sarvam's synthesis + network round trip.
@@ -971,6 +1028,13 @@ impl Agent {
             return;
         }
         self.history.push(Message::new("assistant", text.clone()));
+        if let Some(d) = self.turn_ttft {
+            self.log.ttfb("llm", d);
+        }
+        if let Some(d) = self.turn_ttfa {
+            self.log.ttfb("tts", d);
+        }
+        self.log.agent_said(&text, Some(self.turn_started));
         tracing::info!(call_id = %self.id, event = "turn.agent", turn = self.turn, node = %self.node().name,
             generation = self.generation, cut, text = %text,
             llm_ttft_ms = self.turn_ttft.map(|d| d.as_millis() as u64),
@@ -1016,7 +1080,7 @@ impl Agent {
         self.replay_pending = true;
         self.paused = false;
         let msg = if matches!(reason, "no transcript" | "backchannel") {
-            self.summary.false_interruptions += 1;
+            self.log.false_interruptions += 1;
             "false interruption; resuming the reply"
         } else {
             "resuming the reply"
@@ -1032,7 +1096,7 @@ impl Agent {
         // frame of the reply being cut would play.
         self.state = State::Transcribing;
         self.paused = false;
-        self.summary.interruptions += 1;
+        self.log.barge_ins += 1;
         self.drop_held("a real interruption followed"); // its words carry the meaning
         tracing::info!(call_id = %self.id, event = "agent.barge_in.confirmed", generation = self.generation,
             paused_ms = self.paused_at.elapsed().as_millis() as u64, "agent barge-in confirmed; reply cut");
@@ -1123,10 +1187,15 @@ impl TurnCtx {
         if self.cancel.is_cancelled() {
             return; // turn already cancelled
         }
-        if let Err(e) = tts.speak(text, self.generation)
-            && !self.cancel.is_cancelled()
-        {
-            tracing::warn!(call_id = %self.call_id, event = "tts.error", generation = self.generation, error = %e, "tts speak failed");
+        match tts.speak(text, self.generation) {
+            // Dograh bills TTS per character.
+            Ok(()) => {
+                let _ = self.ev.send(Event::TtsChars(text.chars().count() as u64));
+            }
+            Err(e) if !self.cancel.is_cancelled() => {
+                tracing::warn!(call_id = %self.call_id, event = "tts.error", generation = self.generation, error = %e, "tts speak failed");
+            }
+            Err(_) => {}
         }
     }
 }
@@ -1227,7 +1296,12 @@ async fn run_llm_turn(c: &TurnCtx, tts: &Arc<TtsClient>) {
             return;
         }
         let calls = match res {
-            Ok(calls) => calls,
+            Ok(out) => {
+                if let Some(u) = out.usage {
+                    let _ = c.ev.send(Event::LlmUsage(u));
+                }
+                out.calls
+            }
             Err(e) => {
                 err = Some(e);
                 break;
@@ -1257,6 +1331,7 @@ async fn run_llm_turn(c: &TurnCtx, tts: &Arc<TtsClient>) {
         tool_msgs.push(tm);
 
         for call in &calls {
+            let _ = c.ev.send(Event::Function { name: call.function.name.clone(), call_id: call.id.clone(), result: None });
             let (result, action) = if let Some(e) = wf.nodes[node].edge(&call.function.name) {
                 let r = take_edge(c, tts, node, e.to, &e.speech, &e.def.name);
                 node = e.to;
@@ -1264,6 +1339,7 @@ async fn run_llm_turn(c: &TurnCtx, tts: &Arc<TtsClient>) {
             } else {
                 run_tool(c, tts, node, call).await
             };
+            let _ = c.ev.send(Event::Function { name: call.function.name.clone(), call_id: call.id.clone(), result: Some(result.clone()) });
             let mut m = Message::new("tool", result);
             m.tool_call_id = call.id.clone();
             history.push(m.clone());
@@ -1293,6 +1369,9 @@ async fn run_llm_turn(c: &TurnCtx, tts: &Arc<TtsClient>) {
         let (text, hangup) = c.fallback.line(n);
         c.speak(tts, &format!("{text} "));
         tracing::warn!(call_id = %c.call_id, event = "llm.fallback", consecutive_failures = n, "llm failed; spoke fallback");
+        if hangup {
+            let _ = c.ev.send(Event::Closing { generation: c.generation, reason: calllog::LLM_DOWN });
+        }
         end_call |= hangup;
     } else if err.is_none() {
         c.failures.store(0, Relaxed);
@@ -1327,7 +1406,7 @@ fn take_edge(c: &TurnCtx, tts: &TtsClient, from: usize, to: usize, speech: &str,
         from = %f.name, to = %t.name, via, allow_interrupt = t.allow_interrupt, "node transition");
     let _ = c.ev.send(Event::NodeEntered { generation: c.generation, idx: to });
     if t.end {
-        let _ = c.ev.send(Event::Closing { generation: c.generation }); // Dograh mutes the caller at the end node
+        let _ = c.ev.send(Event::Closing { generation: c.generation, reason: calllog::END_NODE }); // Dograh mutes the caller at the end node
     }
     r#"{"status":"done"}"#.to_string()
 }
@@ -1355,7 +1434,7 @@ async fn run_tool(c: &TurnCtx, tts: &TtsClient, node: usize, call: &ToolCall) ->
                 .and_then(|v| v.get("reason")?.as_str().map(String::from))
                 .unwrap_or_default();
             tracing::info!(call_id = %c.call_id, event = "tool.end_call", reason, "end call requested");
-            let _ = c.ev.send(Event::Closing { generation: c.generation }); // no interrupting the goodbye
+            let _ = c.ev.send(Event::Closing { generation: c.generation, reason: calllog::END_CALL_TOOL }); // no interrupting the goodbye
             (r#"{"status":"success","action":"ending_call"}"#.to_string(), Action::EndCall)
         }
         ToolKind::Function(run) => {

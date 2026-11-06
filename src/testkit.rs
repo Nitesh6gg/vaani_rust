@@ -169,3 +169,43 @@ pub(crate) async fn mock_stt_multi() -> (String, Arc<AtomicUsize>) {
     });
     (url, audio)
 }
+
+/// Mock MinIO: records every PUT as (path, body) and answers 200.
+pub(crate) async fn mock_minio() -> (String, Arc<Mutex<Vec<(String, Vec<u8>)>>>) {
+    let lis = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = lis.local_addr().unwrap().to_string();
+    let puts = Arc::new(Mutex::new(vec![]));
+    let p = puts.clone();
+    tokio::spawn(async move {
+        loop {
+            let (mut s, _) = lis.accept().await.unwrap();
+            let p = p.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![];
+                loop {
+                    let mut c = [0u8; 65536];
+                    let n = s.read(&mut c).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&c[..n]);
+                    let Some(split) = buf.windows(4).position(|w| w == b"\r\n\r\n") else { continue };
+                    let head = String::from_utf8_lossy(&buf[..split]).to_lowercase();
+                    let len = head
+                        .split("content-length: ")
+                        .nth(1)
+                        .and_then(|v| v.split("\r\n").next()?.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if buf.len() < split + 4 + len {
+                        continue;
+                    }
+                    let path = head.lines().next().unwrap().split_whitespace().nth(1).unwrap().to_string();
+                    p.lock().unwrap().push((path, buf[split + 4..split + 4 + len].to_vec()));
+                    let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                    return;
+                }
+            });
+        }
+    });
+    (addr, puts)
+}

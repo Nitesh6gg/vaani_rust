@@ -42,6 +42,10 @@ pub struct Store {
 }
 
 impl Store {
+    pub(crate) async fn db(&self) -> Result<deadpool_postgres::Object> {
+        self.pool.get().await.context("dograh: get connection")
+    }
+
     /// Connects and verifies the connection. ponytail: no TLS to Postgres
     /// (Dograh's DB is on the private network); add tokio-postgres-rustls if not.
     pub async fn open(url: &str, max_conns: usize) -> Result<Self> {

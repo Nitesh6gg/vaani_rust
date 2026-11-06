@@ -18,10 +18,13 @@
 
 use super::{Ari, Event, uuid_v4};
 use crate::{
-    agent::handler,
+    agent::{calllog, handler, recorder},
     callagent::{self, CallInfo},
     config::Config,
-    dograh::Store,
+    dograh::{
+        Store,
+        run::{RunCall, RunEnd, RunMeta},
+    },
     media::{call as media_call, ports::PortAllocator},
     metrics,
 };
@@ -51,6 +54,39 @@ struct Call {
     external_id: String,
     cancel: CancellationToken,
     res: Mutex<Res>,
+}
+
+/// What a finished call hands to `record_run`.
+struct CallEnd {
+    meta: RunMeta,
+    run: tokio::task::JoinHandle<anyhow::Result<i64>>,
+    summary: calllog::Summary,
+    duration: Duration,
+}
+
+/// The call's one summary line: what to chart and alert on (duration, turns,
+/// reply latency, interruptions, errors, outcome).
+fn log_summary(id: &str, duration: Duration, s: &calllog::Summary, stats: &media_call::MediaStats) {
+    let (p50, p95) = percentiles(&s.reply_latencies_ms);
+    tracing::info!(call_id = %id, component = "agent", event = "call.summary", duration_s = duration.as_secs_f64().round() as u64,
+        disposition = s.end_reason.unwrap_or(calllog::USER_HANGUP), user_turns = s.user_turns, agent_replies = s.agent_replies,
+        bargeins = s.barge_ins, pauses = s.pauses, false_interruptions = s.false_interruptions,
+        held_speech = s.held_speech, held_delivered = s.held_delivered, nodes = ?s.nodes_visited,
+        recording_bytes = s.recording_pcm.len(), stt_audio_s = (s.stt_seconds * 10.0).round() / 10.0,
+        reply_latency_p50_ms = p50, reply_latency_p95_ms = p95, errors = ?s.errors,
+        packets_in = stats.packets_in.load(Relaxed), packets_out = stats.packets_out.load(Relaxed),
+        silence_out = stats.silence_out.load(Relaxed), inbound_dropped = stats.inbound_dropped.load(Relaxed), "call summary");
+}
+
+/// 50th and 95th percentile (nearest rank) of `v`, `None` when empty.
+fn percentiles(v: &[u64]) -> (Option<u64>, Option<u64>) {
+    if v.is_empty() {
+        return (None, None);
+    }
+    let mut s = v.to_vec();
+    s.sort_unstable();
+    let rank = |p: f64| s[((p * s.len() as f64).ceil() as usize).saturating_sub(1).min(s.len() - 1)];
+    (Some(rank(0.50)), Some(rank(0.95)))
 }
 
 pub struct Manager {
@@ -221,13 +257,16 @@ impl Manager {
         metrics::CALLS_ACTIVE.fetch_add(1, Relaxed);
         tracing::info!(call_id = %id, event = "call.bridged", external_id = %call.external_id, bridge = %bridge, "call bridged");
 
-        self.run_media(&call).await;
+        let ended = self.run_media(&call).await;
         self.teardown(&call);
+        if let Some(end) = ended {
+            self.record_run(id, end).await;
+        }
     }
 
-    async fn run_media(&self, call: &Arc<Call>) {
+    async fn run_media(&self, call: &Arc<Call>) -> Option<CallEnd> {
         let id = call.info.id.clone();
-        let Some(listener) = call.res.lock().unwrap().listener.take() else { return };
+        let listener = call.res.lock().unwrap().listener.take()?;
 
         // Accept Asterisk's connection WHILE loading the workflow and opening the
         // STT: the database read and the Sarvam handshake overlap with it.
@@ -244,7 +283,7 @@ impl Manager {
                     _ => "timed out".into(),
                 };
                 tracing::warn!(call_id = %id, component = "media", event = "media.no_connection", error = %why, "audiosocket connection never arrived");
-                return;
+                return None;
             }
         };
         let prepared = match prepared {
@@ -252,12 +291,27 @@ impl Manager {
             // Without its workflow the agent has no prompt and nothing to say.
             Err(e) => {
                 tracing::error!(call_id = %id, component = "dograh", event = "workflow.load_failed", error = %format!("{e:#}"), "agent: loading the dograh workflow failed; hanging up");
-                return;
+                return None;
             }
         };
         if call.cancel.is_cancelled() {
-            return;
+            return None;
         }
+
+        // The call's place in Dograh's history, created while the agent runs.
+        let meta = prepared.run_meta();
+        let run = {
+            let (store, meta, rc) = (
+                self.store.clone(),
+                meta.clone(),
+                RunCall {
+                    call_id: id.clone(),
+                    caller_number: call.info.caller_number.clone(),
+                    called_number: call.info.called_number.clone(),
+                },
+            );
+            tokio::spawn(async move { store.start_run(&meta, &rc).await })
+        };
 
         let media = media_call::spawn(id.clone(), stream, self.cfg.media_dead_timeout, call.cancel.child_token());
         tracing::info!(call_id = %id, component = "media", event = "media.started", "audiosocket connected, media plane running");
@@ -275,12 +329,41 @@ impl Manager {
         let (agent_cfg, io) = prepared.into_agent(&self.cfg, &id, media, hangup);
         let started = std::time::Instant::now();
         let summary = handler::run(agent_cfg, io, call.cancel.clone()).await;
+        let duration = started.elapsed();
 
-        tracing::info!(call_id = %id, event = "call.summary", duration_s = started.elapsed().as_secs(), turns = summary.turns,
-            interruptions = summary.interruptions, false_interruptions = summary.false_interruptions,
-            errors = ?summary.errors, end_reason = %summary.end_reason,
-            packets_in = stats.packets_in.load(Relaxed), packets_out = stats.packets_out.load(Relaxed),
-            silence_out = stats.silence_out.load(Relaxed), inbound_dropped = stats.inbound_dropped.load(Relaxed), "call summary");
+        log_summary(&id, duration, &summary, &stats);
+        Some(CallEnd { meta, run, summary, duration })
+    }
+
+    /// Completes the call's run in Dograh: conversation, usage, disposition, and
+    /// the recording and transcript uploaded to MinIO. Failures are logged; the
+    /// call itself is never affected. Runs AFTER teardown, so a slow upload never holds the call's port.
+    async fn record_run(&self, id: &str, end: CallEnd) {
+        let run_id = match end.run.await {
+            Ok(Ok(run_id)) => run_id,
+            Ok(Err(e)) => {
+                tracing::error!(call_id = %id, component = "dograh", event = "run.create_failed", error = %format!("{e:#}"), "dograh run: not created; this call won't appear in Dograh");
+                return;
+            }
+            Err(_) => return,
+        };
+        tracing::info!(call_id = %id, component = "dograh", event = "run.created", run_id, workflow_id = end.meta.workflow_id, "dograh run created");
+
+        if end.summary.recording_truncated {
+            tracing::warn!(call_id = %id, component = "media", event = "recording.truncated", "call recording hit its size cap; the end of the call is missing from it");
+        }
+        let recording = if end.summary.recording_pcm.is_empty() { vec![] } else { recorder::wav(&end.summary.recording_pcm) };
+        let recording_bytes = recording.len();
+        let storage = self.cfg.storage();
+        let run_end = RunEnd { summary: &end.summary, duration: end.duration, recording };
+        match self.store.finish_run(&end.meta, run_id, run_end, storage.as_ref()).await {
+            Ok(()) => tracing::info!(call_id = %id, component = "dograh", event = "run.completed", run_id,
+                disposition = end.summary.end_reason.unwrap_or(calllog::USER_HANGUP), events = end.summary.events.len(),
+                recording_bytes, minio = storage.is_some(), "dograh run completed"),
+            Err(e) => {
+                tracing::error!(call_id = %id, component = "dograh", event = "run.complete_failed", run_id, error = %format!("{e:#}"), "dograh run: completing it failed")
+            }
+        }
     }
 
     /// Idempotent: cancels the call and releases what it holds, each resource
@@ -428,10 +511,16 @@ mod tests {
         let (stt_url, _stt_tx, stt_audio) = mock_stt().await;
         let (llm_url, llm_reqs) = mock_llm(|_| sse("Namaste, how can I help?")).await;
         let (ari_url, ari_log, mut ext_req) = mock_ari().await;
+        let (minio_addr, minio_puts) = mock_minio().await;
 
         let Some((store, db_url)) = Store::for_test("t_manager", &format!(
             r#"
-                CREATE TABLE workflows (id serial PRIMARY KEY, user_id int, organization_id int, released_definition_id int, template_context_variables jsonb);
+                CREATE TABLE workflows (id serial PRIMARY KEY, user_id int, organization_id int, released_definition_id int, template_context_variables jsonb, call_disposition_codes json);
+                CREATE TABLE workflow_runs (id bigserial PRIMARY KEY, name text, workflow_id int, definition_id bigint, mode text, call_type text, state text,
+                    is_completed bool, usage_info json, cost_info json, initial_context json, gathered_context json, logs json, annotations json,
+                    created_at timestamptz, recording_url text, transcript_url text, storage_backend text);
+                CREATE TABLE organization_configurations (id serial PRIMARY KEY, organization_id bigint, key text, value jsonb);
+                INSERT INTO organization_configurations (organization_id, key, value) VALUES (3, 'DISPOSITION_CODE_MAPPING', '{{"user_hangup": "HU"}}');
                 CREATE TABLE workflow_definitions (id serial PRIMARY KEY, workflow_id int, workflow_json jsonb, template_context_variables jsonb, workflow_configurations jsonb, is_current bool);
                 CREATE TABLE user_configurations (id serial PRIMARY KEY, user_id int, configuration jsonb);
                 CREATE TABLE tools (tool_uuid uuid, organization_id int, name text, description text, category text, status text, definition jsonb);
@@ -451,6 +540,10 @@ mod tests {
         cfg.ari_url = ari_url.clone();
         cfg.stt_ws_url = stt_url;
         cfg.tts_ws_url = tts_url;
+        cfg.minio_endpoint = minio_addr;
+        cfg.minio_access_key = "a".into();
+        cfg.minio_secret_key = "b".into();
+        let check_store = store.clone();
         let mgr = Manager::new(Ari::new(&ari_url, "u", "p", "vaani"), Arc::new(cfg), store);
         let (ev_tx, ev_rx) = mpsc::unbounded_channel();
         let cancel = CancellationToken::new();
@@ -522,6 +615,49 @@ mod tests {
         assert!(l.contains(&"POST /ari/channels/caller-1/answer".to_string()), "{l:?}");
         assert_eq!(l.iter().filter(|x| x.starts_with("DELETE /ari/bridges/")).count(), 1, "bridge deleted once: {l:?}");
         assert!(mgr.calls.lock().unwrap().is_empty());
+
+        // 6. The call is in Dograh's history: completed, with its conversation,
+        //    disposition, usage, and the recording and transcript uploaded.
+        let db = check_store.db().await.unwrap();
+        let mut row = None;
+        for _ in 0..200 {
+            row = db.query_opt("SELECT id, is_completed, state, recording_url, transcript_url, gathered_context::text, logs::text, usage_info::text, cost_info::text FROM workflow_runs", &[]).await.unwrap();
+            if row.as_ref().is_some_and(|r| r.get::<_, Option<String>>(4).is_some()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let row = row.expect("a workflow_runs row");
+        let run_id: i64 = row.get(0);
+        assert_eq!((row.get::<_, bool>(1), row.get::<_, String>(2).as_str()), (true, "completed"));
+        assert_eq!(row.get::<_, String>(3), format!("recordings/{run_id}.wav"));
+        let gathered: serde_json::Value = serde_json::from_str(&row.get::<_, String>(5)).unwrap();
+        assert_eq!(gathered["call_id"], "caller-1");
+        assert_eq!(
+            (gathered["call_disposition"].as_str(), gathered["mapped_call_disposition"].as_str()),
+            (Some("user_hangup"), Some("HU"))
+        );
+        assert_eq!(gathered["nodes_visited"], serde_json::json!(["Start"]));
+        let logs: serde_json::Value = serde_json::from_str(&row.get::<_, String>(6)).unwrap();
+        let kinds: Vec<_> =
+            logs["realtime_feedback_events"].as_array().unwrap().iter().map(|e| e["type"].as_str().unwrap().to_string()).collect();
+        assert!(kinds.contains(&"rtf-node-transition".to_string()) && kinds.contains(&"rtf-bot-text".to_string()), "{kinds:?}");
+        let usage: serde_json::Value = serde_json::from_str(&row.get::<_, String>(7)).unwrap();
+        assert!(
+            usage["tts"].as_object().unwrap().values().next().unwrap().as_u64().unwrap() >= 24,
+            "TTS characters of the greeting: {usage}"
+        );
+        assert!(usage["call_duration_seconds"].as_i64().unwrap() >= 0);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&row.get::<_, String>(8)).unwrap()["call_duration_seconds"],
+            usage["call_duration_seconds"]
+        );
+        let puts = minio_puts.lock().unwrap().clone();
+        let wav = puts.iter().find(|(p, _)| p == &format!("/voice-audio/recordings/{run_id}.wav")).expect("the recording upload");
+        assert_eq!(&wav.1[..4], b"RIFF");
+        assert!(wav.1.len() > 44 + FRAME_SIZE * 10, "the recording holds the call's audio");
+        let transcript = puts.iter().find(|(p, _)| p == &format!("/voice-audio/transcripts/{run_id}.txt")).expect("the transcript upload");
+        assert!(String::from_utf8_lossy(&transcript.1).contains("Agent: Namaste, how can I help?"));
 
         cancel.cancel();
         run.await.unwrap();

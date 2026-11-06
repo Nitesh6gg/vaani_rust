@@ -26,6 +26,13 @@ pub struct Config {
     /// Earshot's speech probability threshold (0..1).
     pub vad_threshold: f32,
     pub metrics_addr: String,
+    /// Dograh's MinIO (its own MINIO_* settings, which live in its environment, not its database);
+    /// without an endpoint recordings and transcripts aren't uploaded.
+    pub minio_endpoint: String,
+    pub minio_access_key: String,
+    pub minio_secret_key: String,
+    pub minio_bucket: String,
+    pub minio_secure: bool,
     /// Override Sarvam's WebSocket endpoints (mock servers in tests and load runs).
     pub stt_ws_url: String,
     pub tts_ws_url: String,
@@ -87,6 +94,17 @@ pub fn load_dotenv() {
 }
 
 impl Config {
+    /// Dograh's MinIO, if configured.
+    pub fn storage(&self) -> Option<crate::dograh::storage::Storage> {
+        (!self.minio_endpoint.is_empty()).then(|| crate::dograh::storage::Storage {
+            endpoint: self.minio_endpoint.clone(),
+            access_key: self.minio_access_key.clone(),
+            secret_key: self.minio_secret_key.clone(),
+            bucket: self.minio_bucket.clone(),
+            secure: self.minio_secure,
+        })
+    }
+
     pub fn load() -> Result<Self> {
         let c = Config {
             ari_url: get("ARI_URL", "http://localhost:8088/ari"),
@@ -106,6 +124,11 @@ impl Config {
             ack_filter: get("BARGE_IN_ACK_FILTER", "1") == "1",
             ack_end_margin: ms("ACK_END_MARGIN_MS", 300)?,
             metrics_addr: get("METRICS_ADDR", "0.0.0.0:9091"),
+            minio_endpoint: get("MINIO_ENDPOINT", ""),
+            minio_access_key: get("MINIO_ACCESS_KEY", ""),
+            minio_secret_key: get("MINIO_SECRET_KEY", ""),
+            minio_bucket: get("MINIO_BUCKET", "voice-audio"),
+            minio_secure: get("MINIO_SECURE", "false").eq_ignore_ascii_case("true"),
             stt_ws_url: get("SARVAM_STT_WS_URL", ""),
             tts_ws_url: get("SARVAM_TTS_WS_URL", ""),
             vad_threshold: get_num("VAD_THRESHOLD", 0.5)?,
@@ -162,6 +185,11 @@ impl Config {
             ack_filter: true,
             ack_end_margin: Duration::from_millis(300),
             metrics_addr: String::new(),
+            minio_endpoint: String::new(),
+            minio_access_key: String::new(),
+            minio_secret_key: String::new(),
+            minio_bucket: "voice-audio".into(),
+            minio_secure: false,
             stt_ws_url: String::new(),
             tts_ws_url: String::new(),
             vad_threshold: 0.5,

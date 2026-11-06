@@ -37,7 +37,7 @@ struct Rig {
     llm_reqs: Arc<Mutex<Vec<serde_json::Value>>>,
     cancel: CancellationToken,
     hangups: Arc<AtomicUsize>,
-    done: tokio::task::JoinHandle<super::handler::Summary>,
+    done: tokio::task::JoinHandle<super::calllog::Summary>,
 }
 
 async fn rig(tts_frames: usize, allow_interrupt: bool, llm_text: &'static str) -> Rig {
@@ -142,7 +142,7 @@ async fn llm_opening_is_spoken_in_full_then_agent_listens() {
 
     r.cancel.cancel();
     let s = r.done.await.unwrap();
-    assert_eq!(s.turns, 1);
+    assert_eq!(s.user_turns, 1);
 }
 
 #[tokio::test]
@@ -187,7 +187,7 @@ async fn confirmed_barge_in_pauses_then_cuts_all_five() {
 
     r.cancel.cancel();
     let s = r.done.await.unwrap();
-    assert_eq!(s.interruptions, 1);
+    assert_eq!(s.barge_ins, 1);
 }
 
 #[tokio::test]
@@ -206,7 +206,7 @@ async fn backchannel_over_a_paused_reply_resumes_it() {
     assert_eq!(r.llm_reqs.lock().unwrap().len(), 1, "no new turn: it was only an acknowledgement");
     r.cancel.cancel();
     let s = r.done.await.unwrap();
-    assert_eq!((s.interruptions, s.false_interruptions), (0, 1));
+    assert_eq!((s.barge_ins, s.false_interruptions), (0, 1));
 }
 
 /// Rough capacity probe, not a unit test: `BENCH_CALLS=500 cargo test --release bench_concurrent_agents -- --ignored --nocapture`.

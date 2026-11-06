@@ -67,6 +67,22 @@ pub struct FunctionDef {
     pub parameters: Option<Value>,
 }
 
+/// One request's token counts (cached tokens are part of `prompt`, as in OpenAI's format).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Usage {
+    pub prompt: u64,
+    pub completion: u64,
+    pub total: u64,
+    pub cached: u64,
+}
+
+/// A finished stream: the tool calls the model made and its token usage, when the provider reported it.
+#[derive(Debug, Default)]
+pub struct StreamOut {
+    pub calls: Vec<ToolCall>,
+    pub usage: Option<Usage>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum LlmError {
     #[error("llm: non-2xx response: {code}: {body}")]
@@ -121,7 +137,7 @@ impl LlmClient {
         messages: &[Message],
         tools: &[FunctionDef],
         on_token: &mut (dyn FnMut(&str) + Send),
-    ) -> Result<Vec<ToolCall>, LlmError> {
+    ) -> Result<StreamOut, LlmError> {
         let mut res = self.stream_once(cancel, messages, tools, on_token).await;
         let mut attempt = 1;
         while let Err(e) = &res {
@@ -154,7 +170,7 @@ impl LlmClient {
         messages: &[Message],
         tools: &[FunctionDef],
         on_token: &mut (dyn FnMut(&str) + Send),
-    ) -> Result<Vec<ToolCall>, LlmError> {
+    ) -> Result<StreamOut, LlmError> {
         let mut body = json!({
             "model": self.model,
             "messages": messages,
@@ -202,7 +218,7 @@ impl LlmClient {
         }
 
         let mut stream = resp.bytes_stream();
-        let (mut buf, mut calls, mut got) = (Vec::<u8>::new(), ToolCallAssembler::default(), false);
+        let (mut buf, mut calls, mut got, mut usage) = (Vec::<u8>::new(), ToolCallAssembler::default(), false, None::<Usage>);
 
         loop {
             let next = tokio::select! {
@@ -219,7 +235,7 @@ impl LlmClient {
                 let Some(data) = line.trim_end().strip_prefix("data:") else { continue };
                 let data = data.strip_prefix(' ').unwrap_or(data);
                 if data == "[DONE]" {
-                    return Ok(calls.done());
+                    return Ok(StreamOut { calls: calls.done(), usage });
                 }
                 // A malformed line is skipped: providers interleave keepalives.
                 let Ok(c) = serde_json::from_str::<Chunk>(data) else { continue };
@@ -227,6 +243,15 @@ impl LlmClient {
                     let mut s = err.to_string();
                     s.truncate(floor_boundary(&s, 500));
                     return Err(LlmError::Other(format!("provider error in stream: {s}")));
+                }
+                // Some providers repeat usage on several chunks; the last one is final.
+                if let Some(u) = c.usage {
+                    usage = Some(Usage {
+                        prompt: u.prompt_tokens,
+                        completion: u.completion_tokens,
+                        total: u.total_tokens,
+                        cached: u.prompt_tokens_details.map(|d| d.cached_tokens).unwrap_or(0),
+                    });
                 }
                 for ch in c.choices {
                     if let Some(t) = ch.delta.content.filter(|t| !t.is_empty()) {
@@ -245,7 +270,7 @@ impl LlmClient {
         if !got {
             return Err(LlmError::Other("stream ended without any reply".into()));
         }
-        Ok(calls.done())
+        Ok(StreamOut { calls: calls.done(), usage })
     }
 }
 
@@ -259,9 +284,28 @@ fn floor_boundary(s: &str, max: usize) -> usize {
 }
 
 #[derive(Deserialize)]
+struct ChunkUsage {
+    #[serde(default)]
+    prompt_tokens: u64,
+    #[serde(default)]
+    completion_tokens: u64,
+    #[serde(default)]
+    total_tokens: u64,
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptDetails>,
+}
+#[derive(Deserialize)]
+struct PromptDetails {
+    #[serde(default)]
+    cached_tokens: u64,
+}
+
+#[derive(Deserialize)]
 struct Chunk {
     #[serde(default)]
     error: Option<Value>,
+    #[serde(default)]
+    usage: Option<ChunkUsage>,
     #[serde(default)]
     choices: Vec<ChunkChoice>,
 }
@@ -426,13 +470,16 @@ mod tests {
                    data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n\
                    : keepalive\n\ndata: not json\n\n\
                    data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"end_call\",\"arguments\":\"\"}}]}}]}\n\n\
+                   data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":3,\"total_tokens\":13,\"prompt_tokens_details\":{\"cached_tokens\":4}}}\n\n\
                    data: [DONE]\n\n";
         let url = serve(vec![(429, "slow down".into()), (200, sse.into())]).await;
         let mut c = LlmClient::new(&url, "k", "m");
         c.retry_max_wait = Duration::from_millis(50);
         let mut text = String::new();
-        let calls = c.stream(&CancellationToken::new(), &[Message::new("user", "hi")], &[], &mut |t| text.push_str(t)).await.unwrap();
+        let out = c.stream(&CancellationToken::new(), &[Message::new("user", "hi")], &[], &mut |t| text.push_str(t)).await.unwrap();
+        let calls = out.calls;
         assert_eq!(text, "Hello");
+        assert_eq!(out.usage, Some(Usage { prompt: 10, completion: 3, total: 13, cached: 4 }));
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "end_call");
     }
