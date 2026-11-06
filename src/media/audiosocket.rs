@@ -10,10 +10,7 @@ use std::io;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const KIND_HANGUP: u8 = 0x00;
-pub const KIND_UUID: u8 = 0x01;
-pub const KIND_DTMF: u8 = 0x03;
 pub const KIND_SLIN16: u8 = 0x12;
-pub const KIND_ERROR: u8 = 0xff;
 
 pub const HEADER_SIZE: usize = 3;
 
@@ -71,6 +68,7 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, buf: &mut [u8], kind:
 #[cfg(test)]
 mod tests {
     use super::*;
+    const KIND_UUID: u8 = 0x01;
 
     #[tokio::test]
     async fn roundtrip_audio_and_control() {

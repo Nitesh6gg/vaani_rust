@@ -67,14 +67,6 @@ pub struct FunctionDef {
     pub parameters: Option<Value>,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Usage {
-    pub prompt: u64,
-    pub completion: u64,
-    pub total: u64,
-    pub cached: u64,
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum LlmError {
     #[error("llm: non-2xx response: {code}: {body}")]

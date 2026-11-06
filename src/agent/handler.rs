@@ -23,7 +23,7 @@
 use super::{
     backchannel::backchannel,
     vad::BargeInDetector,
-    workflow::{Node, ToolKind, Workflow, interrupt_mode, plain_history, request_messages},
+    workflow::{Node, ToolKind, Workflow, plain_history, request_messages},
 };
 use crate::{
     ai::{

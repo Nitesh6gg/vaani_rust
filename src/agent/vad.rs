@@ -73,20 +73,6 @@ impl BargeInDetector for VoteDetector {
     }
 }
 
-/// Never reports speech: BARGE_IN_ENABLED=0 keeps the agent talking over any
-/// inbound audio until its turn finishes.
-pub struct NoBargeIn;
-
-impl BargeInDetector for NoBargeIn {
-    fn detect(&mut self, _: &Frame) -> bool {
-        false
-    }
-    fn reset(&mut self) {}
-    fn last_speech_at(&self) -> Option<Instant> {
-        None
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

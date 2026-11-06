@@ -45,7 +45,6 @@ pub enum SttEvent {
 
 enum Cmd {
     Audio(Frame),
-    Flush,
 }
 
 #[derive(Clone)]
@@ -70,11 +69,6 @@ impl SttClient {
     /// Never blocks: a full queue (provider slow or down) drops the frame.
     pub fn feed(&self, frame: &Frame) -> bool {
         self.tx.try_send(Cmd::Audio(*frame)).is_ok()
-    }
-
-    /// Asks Sarvam to finalize the current utterance now.
-    pub fn flush(&self) {
-        let _ = self.tx.try_send(Cmd::Flush);
     }
 }
 
@@ -176,11 +170,9 @@ async fn run(
                         }
                     }
                 }
-                let payload = match cmd {
-                    Cmd::Audio(f) => serde_json::json!({"audio": {
-                        "data": STANDARD.encode(f), "sample_rate": SAMPLE_RATE, "encoding": "audio/wav"}}),
-                    Cmd::Flush => serde_json::json!({"type": "flush"}),
-                };
+                let Cmd::Audio(f) = cmd;
+                let payload = serde_json::json!({"audio": {
+                    "data": STANDARD.encode(f), "sample_rate": SAMPLE_RATE, "encoding": "audio/wav"}});
                 if let Some(s) = sink.as_mut() && s.send(Ws::text(payload.to_string())).await.is_err() {
                     (sink, rd) = (None, None); // drop this frame; the next one redials
                 }

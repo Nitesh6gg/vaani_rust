@@ -38,7 +38,6 @@ pub struct Edge {
 
 #[derive(Clone, Default)]
 pub struct Node {
-    pub id: String,
     pub name: String,
     /// Complete system prompt at this node (global prompt + own, variables filled).
     pub prompt: String,
@@ -70,12 +69,6 @@ impl Node {
     pub fn tool(&self, name: &str) -> Option<&Tool> {
         self.tools.iter().find(|t| t.def.name == name)
     }
-}
-
-/// Caller can cut in only with barge-in enabled, the node allowing it, and not
-/// at an end node (once the call is ending the caller is muted, as in Dograh).
-pub fn interrupt_mode(barge_in_enabled: bool, n: &Node) -> &'static str {
-    if barge_in_enabled && n.allow_interrupt && !n.end { "on" } else { "off" }
 }
 
 /// What the LLM is sent at `node`: its system prompt, then the conversation.
@@ -181,14 +174,5 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(out[1].role, "assistant");
         assert_eq!(out[1].content, "one sec\n\n[Tool Response: lookup]\n{\"city\":\"Pune\"}");
-    }
-
-    #[test]
-    fn interrupt_needs_all_three() {
-        let mut n = Node { allow_interrupt: true, ..Default::default() };
-        assert_eq!(interrupt_mode(true, &n), "on");
-        assert_eq!(interrupt_mode(false, &n), "off");
-        n.end = true;
-        assert_eq!(interrupt_mode(true, &n), "off");
     }
 }
