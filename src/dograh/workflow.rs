@@ -9,6 +9,7 @@
 //! of the call).
 
 use super::{
+    recordings::{ClipSet, PROMPT_RECORDING_REF, RECORDING_INSTRUCTIONS, recording_ref},
     template,
     tools::{self, ToolRow},
 };
@@ -62,6 +63,9 @@ struct NodeData {
     greeting_type: String,
     #[serde(default)]
     tool_uuids: Vec<String>,
+    /// greeting_type "audio": this recording is played instead of `greeting`.
+    #[serde(default, deserialize_with = "recording_ref")]
+    greeting_recording_id: i64,
 }
 
 #[derive(Deserialize)]
@@ -82,6 +86,9 @@ struct EdgeData {
     transition_speech: String,
     #[serde(default)]
     transition_speech_type: String,
+    /// transition_speech_type "audio": this recording is played instead.
+    #[serde(default, deserialize_with = "recording_ref")]
+    transition_speech_recording_id: i64,
 }
 
 const GLOBAL_NODE: &str = "globalNode";
@@ -92,6 +99,27 @@ impl WorkflowJson {
     }
 
     /// The distinct tools attached to any node.
+    /// Which recordings a call of this workflow may play: the primary keys its
+    /// greeting, transitions and tools reference, and whether any node prompt
+    /// names recordings by recording_id (then all of them are needed).
+    pub fn recording_needs(&self, tools: &[ToolRow]) -> (std::collections::HashSet<i64>, bool) {
+        let mut pks = std::collections::HashSet::new();
+        let mut by_id = false;
+        for n in &self.nodes {
+            if n.data.is_start && n.data.greeting_type == "audio" && n.data.greeting_recording_id > 0 {
+                pks.insert(n.data.greeting_recording_id);
+            }
+            by_id |= n.data.prompt.contains(PROMPT_RECORDING_REF);
+        }
+        for e in &self.edges {
+            if e.data.transition_speech_type == "audio" && e.data.transition_speech_recording_id > 0 {
+                pks.insert(e.data.transition_speech_recording_id);
+            }
+        }
+        pks.extend(tools.iter().map(tools::tool_clip_ref).filter(|pk| *pk > 0));
+        (pks, by_id)
+    }
+
     pub fn tool_uuids(&self) -> Vec<String> {
         let mut seen = std::collections::HashSet::new();
         self.nodes.iter().flat_map(|n| n.data.tool_uuids.iter()).filter(|u| seen.insert((*u).clone())).cloned().collect()
@@ -109,13 +137,19 @@ pub fn edge_function_name(label: &str) -> String {
 
 /// Problems that shouldn't stop a call (a tool that's missing, archived, of an
 /// unsupported category, or misconfigured) come back as warnings.
-pub fn build(wf: &WorkflowJson, vars: &Map<String, Value>, tool_rows: &[ToolRow], now: DateTime<Utc>) -> Result<(Workflow, Vec<String>)> {
+pub fn build(
+    wf: &WorkflowJson,
+    vars: &Map<String, Value>,
+    tool_rows: &[ToolRow],
+    clips: &ClipSet,
+    now: DateTime<Utc>,
+) -> Result<(Workflow, Vec<String>)> {
     let render = |s: &str| template::render(s, vars, now);
     let mut warnings = vec![];
 
     let mut by_uuid: HashMap<&str, Tool> = HashMap::new();
     for r in tool_rows {
-        match tools::build_tool(r) {
+        match tools::build_tool(r, clips) {
             Ok((t, w)) => {
                 warnings.extend(w);
                 by_uuid.insert(&r.uuid, t);
@@ -134,8 +168,14 @@ pub fn build(wf: &WorkflowJson, vars: &Map<String, Value>, tool_rows: &[ToolRow]
             parts.push(global_prompt.clone());
         }
         let p = render(&d.prompt);
+        // Dograh's recording response mode: only for a node whose own prompt
+        // names recordings, and only if the organization has any.
+        let uses_recordings = clips.has_any && p.contains(PROMPT_RECORDING_REF);
         if !p.is_empty() {
             parts.push(p);
+        }
+        if uses_recordings {
+            parts.push(RECORDING_INSTRUCTIONS.to_string());
         }
         let mut node = Node {
             id: n.id.clone(),
@@ -143,6 +183,7 @@ pub fn build(wf: &WorkflowJson, vars: &Map<String, Value>, tool_rows: &[ToolRow]
             prompt: parts.join("\n\n"),
             end: d.is_end,
             allow_interrupt: d.allow_interrupt,
+            clips: uses_recordings.then(|| clips.by_id.clone()),
             ..Default::default()
         };
         for u in &d.tool_uuids {
@@ -158,7 +199,11 @@ pub fn build(wf: &WorkflowJson, vars: &Map<String, Value>, tool_rows: &[ToolRow]
             }
             start = Some(nodes.len());
             if d.greeting_type == "audio" {
-                warnings.push("audio greetings aren't supported yet; the LLM opens the call instead".into());
+                // Without its recording, Dograh falls back to an LLM opening.
+                match clips.by_pk.get(&d.greeting_recording_id) {
+                    Some(clip) => node.greeting_clip = Some(clip.clone()),
+                    None => warnings.push("audio greeting's recording unavailable; the LLM opens the call instead".into()),
+                }
             } else if !d.greeting.is_empty() {
                 node.greeting = render(&d.greeting);
             }
@@ -179,13 +224,23 @@ pub fn build(wf: &WorkflowJson, vars: &Map<String, Value>, tool_rows: &[ToolRow]
                 nodes[from].name, e.data.label
             ));
         }
-        let speech = if e.data.transition_speech_type == "audio" {
-            warnings.push(format!("edge {:?}: audio transitions aren't supported yet; nothing is said", e.data.label));
-            String::new()
+        // "audio" plays its recording, or nothing if it's unavailable (Dograh
+        // doesn't fall back to the text either).
+        let (mut speech, mut speech_clip) = (String::new(), None);
+        if e.data.transition_speech_type == "audio" {
+            speech_clip = clips.by_pk.get(&e.data.transition_speech_recording_id).cloned();
+            if speech_clip.is_none() {
+                warnings.push(format!("edge {:?}: transition recording unavailable; nothing is said", e.data.label));
+            }
         } else {
-            render(&e.data.transition_speech)
-        };
-        nodes[from].edges.push(Edge { def: FunctionDef { name, description: e.data.condition.clone(), parameters: None }, speech, to });
+            speech = render(&e.data.transition_speech);
+        }
+        nodes[from].edges.push(Edge {
+            def: FunctionDef { name, description: e.data.condition.clone(), parameters: None },
+            speech,
+            speech_clip,
+            to,
+        });
     }
     Ok((Workflow { nodes, start }, warnings))
 }
@@ -223,7 +278,7 @@ mod tests {
             credential: None,
         }];
         let vars = json!({"caller_number": "08448805135"});
-        let (w, warnings) = build(&wf, vars.as_object().unwrap(), &rows, Utc::now()).unwrap();
+        let (w, warnings) = build(&wf, vars.as_object().unwrap(), &rows, &ClipSet::default(), Utc::now()).unwrap();
 
         let start = &w.nodes[w.start];
         assert_eq!(start.name, "Start Call");
@@ -252,18 +307,18 @@ mod tests {
     #[test]
     fn greeting_and_structural_errors() {
         let wf = WorkflowJson::parse(r#"{"nodes":[{"id":"1","type":"startCall","data":{"name":"S","is_start":true,"greeting":"Namaste {{name | ji}}"}}],"edges":[]}"#).unwrap();
-        let (w, _) = build(&wf, &Map::new(), &[], Utc::now()).unwrap();
+        let (w, _) = build(&wf, &Map::new(), &[], &ClipSet::default(), Utc::now()).unwrap();
         assert_eq!(w.nodes[0].greeting, "Namaste ji");
 
         let no_start = WorkflowJson::parse(r#"{"nodes":[{"id":"1","type":"agentNode","data":{}}]}"#).unwrap();
-        assert!(build(&no_start, &Map::new(), &[], Utc::now()).is_err());
+        assert!(build(&no_start, &Map::new(), &[], &ClipSet::default(), Utc::now()).is_err());
         let bad_edge = WorkflowJson::parse(
             r#"{"nodes":[{"id":"1","data":{"is_start":true}}],"edges":[{"source":"1","target":"9","data":{"label":"x"}}]}"#,
         )
         .unwrap();
-        assert!(build(&bad_edge, &Map::new(), &[], Utc::now()).is_err());
+        assert!(build(&bad_edge, &Map::new(), &[], &ClipSet::default(), Utc::now()).is_err());
         let two = WorkflowJson::parse(r#"{"nodes":[{"id":"1","data":{"is_start":true}},{"id":"2","data":{"is_start":true}}]}"#).unwrap();
-        assert!(build(&two, &Map::new(), &[], Utc::now()).is_err());
+        assert!(build(&two, &Map::new(), &[], &ClipSet::default(), Utc::now()).is_err());
     }
 
     #[test]

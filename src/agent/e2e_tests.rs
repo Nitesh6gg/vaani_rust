@@ -13,7 +13,7 @@ use crate::{
         tts::TtsConfig,
     },
     media::{
-        Frame, SILENCE,
+        FRAME_SIZE, Frame, SILENCE,
         call::{MediaIo, MediaStats},
     },
     testkit::*,
@@ -41,9 +41,17 @@ struct Rig {
 }
 
 async fn rig(tts_frames: usize, allow_interrupt: bool, llm_text: &'static str) -> Rig {
+    let wf = Workflow {
+        start: 0,
+        nodes: vec![Node { name: "start".into(), prompt: "You are an agent.".into(), allow_interrupt, ..Default::default() }],
+    };
+    rig_wf(wf, tts_frames, move |_| sse(llm_text)).await
+}
+
+async fn rig_wf(wf: Workflow, tts_frames: usize, llm_reply: impl Fn(&serde_json::Value) -> String + Send + Sync + 'static) -> Rig {
     let (tts_url, tts) = mock_tts(tts_frames).await;
     let (stt_url, stt_tx, stt_audio) = mock_stt().await;
-    let (llm_url, llm_reqs) = mock_llm(move |_| sse(llm_text)).await;
+    let (llm_url, llm_reqs) = mock_llm(llm_reply).await;
     let cancel = CancellationToken::new();
 
     let (stt, stt_events) = SttClient::connect(
@@ -60,10 +68,6 @@ async fn rig(tts_frames: usize, allow_interrupt: bool, llm_text: &'static str) -
     let hangups = Arc::new(AtomicUsize::new(0));
     let h = hangups.clone();
 
-    let wf = Workflow {
-        start: 0,
-        nodes: vec![Node { name: "start".into(), prompt: "You are an agent.".into(), allow_interrupt, ..Default::default() }],
-    };
     let cfg = AgentConfig {
         call_id: "t".into(),
         workflow: Arc::new(wf),
@@ -311,4 +315,140 @@ async fn bench_concurrent_agents() {
         stt_audio.load(SeqCst),
     );
     cancel.cancel();
+}
+
+// ------------------------------------------------------ recorded clips ---
+
+use super::workflow::{Clip, Edge};
+use crate::ai::llm::FunctionDef;
+
+const CLIP_TONE: i16 = 2000;
+
+fn clip(id: &str, frames: usize, transcript: &str) -> Arc<Clip> {
+    let pcm: Vec<u8> = (0..frames * FRAME_SIZE / 2).flat_map(|_| CLIP_TONE.to_le_bytes()).collect();
+    Arc::new(Clip { id: id.into(), pcm: Arc::new(pcm), transcript: transcript.into() })
+}
+
+fn is_clip(f: &Frame) -> bool {
+    f[..2] == CLIP_TONE.to_le_bytes()
+}
+
+/// Drains outbound until `n` frames of the given kind were seen; returns the
+/// order the two kinds of audio were heard in ('c' clip, 't' tts tone).
+async fn heard(r: &mut Rig, clip_frames: usize, tts_frames: usize, max: Duration) -> String {
+    let (mut order, mut c, mut t) = (String::new(), 0, 0);
+    let _ = tokio::time::timeout(max, async {
+        while let Some(f) = r.outbound.recv().await {
+            let kind = if is_clip(&f) {
+                'c'
+            } else if is_tone(&f) {
+                't'
+            } else {
+                continue;
+            };
+            if !order.ends_with(kind) {
+                order.push(kind);
+            }
+            (c, t) = (c + usize::from(kind == 'c'), t + usize::from(kind == 't'));
+            if c >= clip_frames && t >= tts_frames {
+                break;
+            }
+        }
+    })
+    .await;
+    order
+}
+
+fn start_node() -> Node {
+    Node { name: "start".into(), prompt: "You are an agent.".into(), allow_interrupt: true, ..Default::default() }
+}
+
+#[tokio::test]
+async fn a_recorded_greeting_plays_without_tts_and_is_remembered_as_its_transcript() {
+    let wf = Workflow { start: 0, nodes: vec![Node { greeting_clip: Some(clip("hello", 6, "Namaste!")), ..start_node() }] };
+    let mut r = rig_wf(wf, 10, |_| sse("ok.")).await;
+    let order = heard(&mut r, 6, 0, Duration::from_secs(5)).await;
+    assert_eq!(order, "c", "only the recording plays");
+    assert!(r.tts.texts.lock().unwrap().is_empty(), "nothing was synthesized");
+    assert!(r.llm_reqs.lock().unwrap().is_empty(), "the LLM isn't asked to open the call");
+
+    // The greeting is in history as the agent's own turn: the caller's turn sees it.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    r.stt_tx.send(r#"{"type":"data","data":{"transcript":"hello"}}"#.into()).unwrap();
+    let _ = heard(&mut r, 0, 10, Duration::from_secs(5)).await;
+    let msgs = r.llm_reqs.lock().unwrap()[0]["messages"].clone();
+    assert_eq!(msgs[1]["content"], "Namaste!");
+    r.cancel.cancel();
+    let s = r.done.await.unwrap();
+    assert_eq!(s.tts_chars, 3, "only the LLM turn's \"ok.\" is billed; the recorded greeting costs no TTS characters");
+}
+
+#[tokio::test]
+async fn the_llm_can_answer_with_a_recording_or_with_speech() {
+    let mut clips = std::collections::HashMap::new();
+    clips.insert("offer_01".to_string(), clip("offer_01", 6, "Our offer is great."));
+    let wf = Workflow { start: 0, nodes: vec![Node { clips: Some(Arc::new(clips)), ..start_node() }] };
+    // First reply: a recording, then (a second marker is dropped). Second: speech.
+    let mut r = rig_wf(wf, 10, |req| {
+        let asked_before = req["messages"].as_array().unwrap().iter().any(|m| m["role"] == "user" && m["content"] != "You are an agent.");
+        if asked_before { sse("▸ Sure, here you go.") } else { sse("● offer_01 Our offer is great.") }
+    })
+    .await;
+    assert_eq!(heard(&mut r, 6, 0, Duration::from_secs(5)).await, "c");
+    assert!(r.tts.texts.lock().unwrap().is_empty(), "the clip's transcript is not synthesized");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    r.stt_tx.send(r#"{"type":"data","data":{"transcript":"tell me more"}}"#.into()).unwrap();
+    assert_eq!(heard(&mut r, 0, 10, Duration::from_secs(5)).await, "t");
+    assert_eq!(*r.tts.texts.lock().unwrap(), ["Sure, here you go."], "the marker is stripped before TTS");
+
+    // The LLM's history keeps "● id transcript" (the format it must follow); the log has only what was said.
+    let reqs = r.llm_reqs.lock().unwrap().clone();
+    let assistant = reqs[1]["messages"].as_array().unwrap().iter().find(|m| m["role"] == "assistant").unwrap();
+    assert_eq!(assistant["content"], "● offer_01 Our offer is great.");
+    r.cancel.cancel();
+    let s = r.done.await.unwrap();
+    let said: Vec<_> =
+        s.events.iter().filter(|e| e.kind == "rtf-bot-text").map(|e| e.payload["text"].as_str().unwrap().to_string()).collect();
+    assert_eq!(said, ["Our offer is great.", "Sure, here you go."]);
+}
+
+#[tokio::test]
+async fn a_missing_recording_is_spoken_instead_of_silence() {
+    let wf = Workflow { start: 0, nodes: vec![Node { clips: Some(Arc::new(Default::default())), ..start_node() }] };
+    let mut r = rig_wf(wf, 10, |_| sse("● gone_01 Please hold on.")).await;
+    assert_eq!(heard(&mut r, 0, 10, Duration::from_secs(5)).await, "t");
+    assert_eq!(*r.tts.texts.lock().unwrap(), ["Please hold on."]);
+    r.cancel.cancel();
+}
+
+#[tokio::test]
+async fn a_transition_clip_plays_before_the_next_nodes_reply() {
+    let edge = Edge {
+        def: FunctionDef { name: "go_next".into(), description: "when ready".into(), parameters: None },
+        speech: String::new(),
+        speech_clip: Some(clip("bridge", 6, "Let us begin.")),
+        to: 1,
+    };
+    let wf = Workflow {
+        start: 0,
+        nodes: vec![
+            Node { edges: vec![edge], ..start_node() },
+            Node { name: "main".into(), prompt: "Ask the questions.".into(), allow_interrupt: true, ..Default::default() },
+        ],
+    };
+    let mut r = rig_wf(wf, 10, |req| {
+        // The second round runs at the next node: its own system prompt.
+        if req["messages"][0]["content"] == "Ask the questions." {
+            sse("First question?")
+        } else {
+            format!("data: {}\n\ndata: [DONE]\n\n", serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"go_next","arguments":""}}]}}]}))
+        }
+    })
+    .await;
+    assert_eq!(heard(&mut r, 6, 10, Duration::from_secs(6)).await, "ct", "the clip first, then the LLM's reply");
+    assert_eq!(*r.tts.texts.lock().unwrap(), ["First question?"]);
+    r.cancel.cancel();
+    let s = r.done.await.unwrap();
+    assert_eq!(s.nodes_visited, ["start", "main"]);
 }

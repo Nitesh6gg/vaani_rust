@@ -39,7 +39,11 @@ async fn main() -> Result<()> {
     let cfg = Arc::new(config::Config::load()?);
     let cancel = CancellationToken::new();
 
-    let store = dograh::Store::open(&cfg.dograh_db_url, cfg.dograh_db_max_conns).await?;
+    let mut store = dograh::Store::open(&cfg.dograh_db_url, cfg.dograh_db_max_conns).await?;
+    match cfg.storage() {
+        Some(storage) => store.use_storage(storage),
+        None => tracing::warn!("MINIO_ENDPOINT not set: recordings and transcripts won't be uploaded and recorded clips can't be played"),
+    }
     tracing::info!(workflow_id = cfg.dograh_workflow_id, "connected to dograh's database");
 
     tokio::spawn(metrics::serve(cfg.metrics_addr.clone()));

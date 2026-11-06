@@ -8,6 +8,16 @@ use futures_util::future::BoxFuture;
 use serde_json::Value;
 use std::sync::Arc;
 
+/// A pre-recorded audio clip (one of Dograh's workflow recordings), played in
+/// place of synthesizing its transcript: 16kHz mono s16le PCM.
+#[derive(Debug)]
+pub struct Clip {
+    /// Dograh's recording_id.
+    pub id: String,
+    pub pcm: Arc<Vec<u8>>,
+    pub transcript: String,
+}
+
 /// Runs a function tool with the LLM's JSON arguments; the returned JSON text
 /// goes back to the LLM. An `Err` becomes a `{"status":"error"}` result.
 pub type ToolRun = Arc<dyn Fn(Value) -> BoxFuture<'static, anyhow::Result<String>> + Send + Sync>;
@@ -26,6 +36,8 @@ pub struct Tool {
     pub kind: ToolKind,
     /// Spoken before the tool acts (Dograh's customMessage). Empty = none.
     pub message: String,
+    /// Played instead of `message` (Dograh's "audio" message type).
+    pub message_clip: Option<Arc<Clip>>,
 }
 
 #[derive(Clone)]
@@ -33,6 +45,8 @@ pub struct Edge {
     pub def: FunctionDef,
     /// Spoken before moving on (Dograh's transition_speech). Empty = none.
     pub speech: String,
+    /// Played instead of `speech`.
+    pub speech_clip: Option<Arc<Clip>>,
     pub to: usize,
 }
 
@@ -46,6 +60,11 @@ pub struct Node {
     /// Start node only: spoken as-is before the caller says anything. Empty =
     /// the LLM generates the opening from `prompt`.
     pub greeting: String,
+    /// Start node only: played instead of `greeting` (Dograh's greeting_type "audio").
+    pub greeting_clip: Option<Arc<Clip>>,
+    /// When set, this node's LLM may play these recordings instead of speaking:
+    /// its prompt asks for "● <recording_id>" or "▸ <text>" replies (the `ClipRouter`).
+    pub clips: Option<Arc<std::collections::HashMap<String, Arc<Clip>>>>,
     /// Reaching it, the LLM says its closing line and the call hangs up.
     pub end: bool,
     /// May the caller cut in while the agent speaks here? (Dograh's allow_interrupt.)

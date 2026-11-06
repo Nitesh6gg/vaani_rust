@@ -209,3 +209,36 @@ pub(crate) async fn mock_minio() -> (String, Arc<Mutex<Vec<(String, Vec<u8>)>>>)
     });
     (addr, puts)
 }
+
+/// Mock MinIO serving GET for the given objects ("/bucket/key" -> bytes); 404 otherwise.
+pub(crate) async fn mock_minio_objects(objects: Vec<(String, Vec<u8>)>) -> String {
+    let lis = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = lis.local_addr().unwrap().to_string();
+    let objects = Arc::new(objects);
+    tokio::spawn(async move {
+        loop {
+            let (mut s, _) = lis.accept().await.unwrap();
+            let objects = objects.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 8192];
+                let n = s.read(&mut buf).await.unwrap_or(0);
+                let path = String::from_utf8_lossy(&buf[..n])
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1).map(String::from))
+                    .unwrap_or_default();
+                match objects.iter().find(|(p, _)| *p == path) {
+                    Some((_, body)) => {
+                        let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                        let _ = s.write_all(head.as_bytes()).await;
+                        let _ = s.write_all(body).await;
+                    }
+                    None => {
+                        let _ = s.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                    }
+                }
+            });
+        }
+    });
+    addr
+}

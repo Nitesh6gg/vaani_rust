@@ -58,6 +58,9 @@ struct Pending {
     generation: u64,
     req: u64,
     text: String,
+    /// A recorded clip (`play`): never sent to Sarvam, its audio goes out as soon
+    /// as every request before it has finished.
+    pcm: Option<Arc<Vec<u8>>>,
 }
 
 #[derive(Default)]
@@ -73,15 +76,39 @@ impl Book {
     fn has_pending(&self, generation: u64) -> bool {
         self.pending.iter().any(|p| p.generation == generation)
     }
-    /// Pops the oldest request (final or error); returns its text and, when
-    /// that finished its generation, the generation to emit Done for.
-    fn on_final(&mut self) -> (String, Option<u64>) {
+    /// Pops the oldest request (final or error). Returns its text and the events
+    /// that follow: Done if that finished its generation, then any recorded clips
+    /// queued behind it, which play now.
+    fn on_final(&mut self) -> (String, Vec<TtsEvent>) {
         if self.pending.is_empty() {
-            return (String::new(), None);
+            return (String::new(), vec![]);
         }
         let p = self.pending.remove(0);
-        let done = (self.ended.contains(&p.generation) && !self.has_pending(p.generation)).then_some(p.generation);
-        (p.text, done)
+        let mut evs = vec![];
+        if self.ended.contains(&p.generation) && !self.has_pending(p.generation) {
+            evs.push(TtsEvent::Done(p.generation));
+        }
+        evs.extend(self.drain_clips());
+        (p.text, evs)
+    }
+
+    /// Emits every recorded clip at the head of `pending`: once the requests
+    /// before one have finished, its audio is next in line.
+    fn drain_clips(&mut self) -> Vec<TtsEvent> {
+        let mut evs = vec![];
+        while self.pending.first().is_some_and(|p| p.pcm.is_some()) {
+            let p = self.pending.remove(0);
+            evs.push(TtsEvent::Audio {
+                pcm: p.pcm.as_deref().cloned().unwrap_or_default(),
+                generation: p.generation,
+                req: p.req,
+                text: p.text,
+            });
+            if self.ended.contains(&p.generation) && !self.has_pending(p.generation) {
+                evs.push(TtsEvent::Done(p.generation));
+            }
+        }
+        evs
     }
     fn attribute(&self) -> Option<Pending> {
         self.pending.first().or(self.last.as_ref()).cloned()
@@ -138,13 +165,37 @@ impl TtsClient {
                 anyhow::bail!("tts: client closed");
             }
             b.next_req += 1;
-            let p = Pending { generation, req: b.next_req, text: text.to_string() };
+            let p = Pending { generation, req: b.next_req, text: text.to_string(), pcm: None };
             b.last = Some(p.clone());
             b.pending.push(p);
         }
         let send = |v: serde_json::Value| self.out.send(v.to_string()).map_err(|_| anyhow::anyhow!("tts: connection closed"));
         send(serde_json::json!({"type": "text", "data": {"text": text}}))?;
         send(serde_json::json!({"type": "flush"}))
+    }
+
+    /// Queues a recorded clip (16kHz s16le PCM) in `speak`'s place: delivered as
+    /// audio tagged `generation` and `text`, in order after every earlier
+    /// speak/play call's audio, and counted toward the generation's Done.
+    /// Nothing is sent to Sarvam.
+    pub fn play(&self, pcm: Arc<Vec<u8>>, text: &str, generation: u64) -> Result<()> {
+        if pcm.is_empty() {
+            return Ok(());
+        }
+        let evs = {
+            let mut b = self.book.lock().unwrap();
+            if b.closed {
+                anyhow::bail!("tts: client closed");
+            }
+            b.next_req += 1;
+            let p = Pending { generation, req: b.next_req, text: text.to_string(), pcm: Some(pcm) };
+            b.pending.push(p);
+            b.drain_clips()
+        };
+        for e in evs {
+            let _ = self.events.send(e);
+        }
+        Ok(())
     }
 
     /// No more `speak(generation)` calls are coming. Done fires once their audio has
@@ -232,15 +283,16 @@ fn handle(call_id: &str, text: &str, book: &Mutex<Book>, events: &mpsc::Unbounde
         ("error", _) => {
             // Sarvam sends error INSTEAD of final: popping resolves the slot
             // and names exactly the sentence that was rejected.
-            let (rejected, done) = book.lock().unwrap().on_final();
+            let (rejected, evs) = book.lock().unwrap().on_final();
             tracing::warn!(call_id, message = %m.data.message, rejected_text = %truncate(&rejected, 80), "tts provider error");
-            if let Some(g) = done {
-                let _ = events.send(TtsEvent::Done(g));
+            for e in evs {
+                let _ = events.send(e);
             }
         }
         ("event", "final") => {
-            if let Some(g) = book.lock().unwrap().on_final().1 {
-                let _ = events.send(TtsEvent::Done(g));
+            let evs = book.lock().unwrap().on_final().1;
+            for e in evs {
+                let _ = events.send(e);
             }
         }
         ("audio", _) if !m.data.audio.is_empty() => {
@@ -269,7 +321,7 @@ mod tests {
     fn speak(book: &Mutex<Book>, generation: u64, text: &str) {
         let mut b = book.lock().unwrap();
         b.next_req += 1;
-        let p = Pending { generation, req: b.next_req, text: text.into() };
+        let p = Pending { generation, req: b.next_req, text: text.into(), pcm: None };
         b.last = Some(p.clone());
         b.pending.push(p);
     }
@@ -297,6 +349,30 @@ mod tests {
         assert!(matches!(&got[0], TtsEvent::Audio { generation: 7, req: 1, text, .. } if text == "one."));
         assert!(matches!(&got[1], TtsEvent::Audio { generation: 7, req: 2, text, .. } if text == "two."));
         assert!(matches!(got[2], TtsEvent::Done(7)));
+    }
+
+    #[test]
+    fn a_recorded_clip_plays_after_the_requests_before_it_and_counts_toward_done() {
+        let book = Mutex::new(Book::default());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        speak(&book, 4, "intro.");
+        {
+            // play(): a clip queued behind "intro." waits its turn.
+            let mut b = book.lock().unwrap();
+            b.next_req += 1;
+            let p = Pending { generation: 4, req: b.next_req, text: "● clip1 hello ".into(), pcm: Some(Arc::new(vec![9, 9])) };
+            b.pending.push(p);
+            b.ended.insert(4);
+            assert!(b.drain_clips().is_empty(), "the clip must wait for the request before it");
+        }
+        feed(&book, &tx, r#"{"type":"event","data":{"event_type":"final"}}"#);
+        let evs: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            matches!(&evs[0], TtsEvent::Audio { pcm, generation: 4, req: 2, text } if pcm == &[9, 9] && text == "● clip1 hello "),
+            "{evs:?}"
+        );
+        assert!(matches!(evs[1], TtsEvent::Done(4)), "Done follows the clip, the last thing of the generation: {evs:?}");
+        assert_eq!(evs.len(), 2);
     }
 
     #[test]

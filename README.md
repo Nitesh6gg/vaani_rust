@@ -8,26 +8,32 @@ self-hosted **Dograh**'s Postgres, exactly as in the Go server — no model sett
 
 ## Status
 
-Milestone 1 — the core call path — is done and tested. Ported from Go:
+Milestones 1 and 2 are done and tested: a Rust call is now a complete call, recorded in Dograh like one of its own. Ported from Go:
 
 | Area | State |
 |---|---|
 | ARI events WebSocket (one per process), reconnect, REST ops, call lifecycle | done |
 | AudioSocket media (single-write frames, 20ms coalescing pacer, port pool, dead-media watchdog) | done |
-| Sarvam STT (VAD signals, lazy one-shot redial) and TTS (generation-tagged, FIFO attribution, keepalive) | done |
-| Streaming LLM client (SSE, tool calls, retries on 429/5xx, idle timeout, shared HTTP/2 client) | done |
+| Sarvam STT (VAD signals, lazy one-shot redial) and TTS (generation-tagged, FIFO attribution, keepalive, recorded clips) | done |
+| Streaming LLM client (SSE, tool calls, token usage, retries on 429/5xx, idle timeout, shared HTTP/2 client) | done |
 | Agent state machine: greeting / LLM opening, sentence chunker, tools + workflow edges, idle prompts, LLM-failure fallback | done |
 | Barge-in: Earshot vote window, pause → confirm/resume, 5 cuts, backchannel filter, held speech | done |
 | Dograh reads: workflow graph, `{{templates}}`, models/keys + overrides, `end_call` and `http_api` tools (with credentials), call limits | done |
+| **Dograh call record**: `workflow_runs` created at call start and completed at the end (conversation events, nodes visited, disposition + organization mapping, usage/cost info, call tags) | done |
+| **Recording + transcript** mixed to mono WAV and uploaded to Dograh's MinIO (hand-written SigV4, checked against the MinIO Python client) | done |
+| **Recorded clips**: audio greeting, audio transitions, tool messages, and the `● recording_id` / `▸ text` reply mode (MinIO → ffmpeg → trimmed, cached in memory and on disk) | done |
 | `/metrics` (Prometheus text) and `/healthz` | done |
 
 Not ported yet (in rough priority order):
 
-1. Writing each call's record back to Dograh (`workflow_runs`, call log, recording/transcript upload to MinIO), QA analysis nodes, cost
-2. `transfer_call` tool (needs ARI dial + bridge swap), recorded clips (audio greetings / transition speech), variable extraction
-3. Outbound campaigns (`Manager.Dial`, Redis limiter) — ARI only
-4. STT speech-only gate / early flush, debug WAV recording, OpenTelemetry
-5. TLS to Dograh's Postgres (`tokio-postgres-rustls`)
+1. Variable extraction (feeds `gathered_context` and disposition)
+2. `transfer_call` tool (needs ARI dial + bridge swap, hold music)
+3. QA analysis nodes and cost pricing (usage is recorded; `cost_info` holds only the duration)
+4. Outbound campaigns (`Manager.Dial`, Redis limiter) — ARI only
+5. STT speech-only gate / early flush (cuts Sarvam STT audio to about half), debug WAV recording, OpenTelemetry
+6. TLS to Dograh's Postgres (`tokio-postgres-rustls`)
+
+Needs on the server: **ffmpeg** on `PATH` (recorded clips) and Dograh's `MINIO_*` settings (see below).
 
 Out of scope by decision: RTP transport, FreeSWITCH/mod_earshot, TEN VAD, RMS-energy VAD.
 
@@ -70,6 +76,7 @@ Same names as the Go server.
 | `MEDIA_DEAD_TIMEOUT_SECONDS` | `30` | no inbound audio at all |
 | `LLM_RETRIES` `LLM_RETRY_MAX_WAIT_MS` `LLM_MAX_FAILED_TURNS` `LLM_FALLBACK_TEXT` | `2` `2000` `3` `` | |
 | `SARVAM_STT_WS_URL` / `SARVAM_TTS_WS_URL` | Sarvam production | point at mocks for load runs |
+| `MINIO_ENDPOINT` `MINIO_ACCESS_KEY` `MINIO_SECRET_KEY` `MINIO_BUCKET` `MINIO_SECURE` | `` `` `` `voice-audio` `false` | Dograh's MinIO (host:port). Without an endpoint, recordings/transcripts aren't uploaded and recorded clips can't play |
 | `METRICS_ADDR` | `0.0.0.0:9091` | `/metrics`, `/healthz` |
 | `LOG_LEVEL` / `LOG_FORMAT` | `info` / text (`json`) | |
 
@@ -93,9 +100,11 @@ BENCH_CALLS=500 cargo test --release bench_concurrent_agents -- --ignored --noca
 ```
 
 The tests that prove the call path: `agent::e2e_tests` (a full turn, a confirmed barge-in with all
-cuts, a backchannel resume) and `ari::manager::tests` (StasisStart → answer → bind-before-
-externalMedia → bridge → Dograh workflow from Postgres → agent audio over AudioSocket → teardown
-frees the port and ARI resources exactly once).
+cuts, a backchannel resume, recorded greeting/transition/`●` replies) and `ari::manager::tests`
+(StasisStart → answer → bind-before-externalMedia → bridge → Dograh workflow from Postgres → agent
+audio over AudioSocket → teardown frees the port and ARI resources exactly once → the Dograh run is
+completed with its conversation, usage, disposition, and the recording and transcript uploaded).
+`dograh::store` tests load a workflow and its recordings (fake MinIO + real ffmpeg) from Postgres.
 
 First numbers (4 vCPU sandbox, mock providers in-process): 500 concurrent agents ≈ 515 KB RSS per
 call, ≈ 0.3% of a core per call, worst 20ms-tick lateness ≈ 1 ms. **Not a substitute for the

@@ -3,6 +3,7 @@
 //! api/utils/credential_auth.py). `transfer_call` needs ARI call control and is
 //! skipped with a warning for now.
 
+use super::recordings::{ClipSet, recording_ref};
 use crate::{
     agent::workflow::{Tool, ToolKind, ToolRun},
     ai::llm::{self, FunctionDef},
@@ -46,6 +47,12 @@ struct ToolConfig {
     message_type: String,
     #[serde(default, rename = "customMessage")]
     custom_message: String,
+    #[serde(default, rename = "audioRecordingId", deserialize_with = "recording_ref")]
+    audio_recording_id: i64,
+    #[serde(default, rename = "customMessageType")]
+    custom_message_type: String,
+    #[serde(default, rename = "customMessageRecordingId", deserialize_with = "recording_ref")]
+    custom_message_recording_id: i64,
     #[serde(default, rename = "endCallReason")]
     end_call_reason: bool,
     #[serde(default, rename = "endCallReasonDescription")]
@@ -95,7 +102,19 @@ pub fn function_name(tool_name: &str) -> String {
 
 /// Builds one agent tool. `Ok((tool, warning))`: a warning is a problem that
 /// doesn't stop the tool from being used. `Err` skips the tool (logged by the caller).
-pub fn build_tool(r: &ToolRow) -> Result<(Tool, Option<String>)> {
+/// The recording a tool's message plays, if it's an "audio" one (0 = none).
+pub fn tool_clip_ref(r: &ToolRow) -> i64 {
+    let Some(cfg) = r.definition.get("config").and_then(|c| serde_json::from_value::<ToolConfig>(c.clone()).ok()) else { return 0 };
+    if r.category == CATEGORY_HTTP {
+        if cfg.custom_message_type == "audio" { cfg.custom_message_recording_id } else { 0 }
+    } else if cfg.message_type == "audio" {
+        cfg.audio_recording_id
+    } else {
+        0
+    }
+}
+
+pub fn build_tool(r: &ToolRow, clips: &ClipSet) -> Result<(Tool, Option<String>)> {
     // A missing or null config is an empty one.
     let cfg: ToolConfig = match r.definition.get("config").filter(|c| !c.is_null()) {
         None => ToolConfig::default(),
@@ -106,7 +125,17 @@ pub fn build_tool(r: &ToolRow) -> Result<(Tool, Option<String>)> {
         description: if r.description.is_empty() { format!("Execute {} tool", r.name) } else { r.description.clone() },
         parameters: None,
     };
-    let message = if cfg.message_type == "custom" { cfg.custom_message.clone() } else { String::new() };
+    let (mut message, mut message_clip, mut warning) = (String::new(), None, None);
+    match cfg.message_type.as_str() {
+        "custom" => message = cfg.custom_message.clone(),
+        "audio" => {
+            message_clip = clips.by_pk.get(&cfg.audio_recording_id).cloned();
+            if message_clip.is_none() && r.category != CATEGORY_HTTP {
+                warning = Some(format!("tool {:?} ({}): message recording unavailable; nothing is said", r.name, r.uuid));
+            }
+        }
+        _ => {}
+    }
 
     match r.category.as_str() {
         CATEGORY_END_CALL => {
@@ -119,15 +148,15 @@ pub fn build_tool(r: &ToolRow) -> Result<(Tool, Option<String>)> {
                 def.parameters =
                     Some(json!({"type":"object","properties":{"reason":{"type":"string","description":desc}},"required":["reason"]}));
             }
-            Ok((Tool { def, kind: ToolKind::EndCall, message }, None))
+            Ok((Tool { def, kind: ToolKind::EndCall, message, message_clip }, warning))
         }
-        CATEGORY_HTTP => build_http_tool(r, cfg, def),
+        CATEGORY_HTTP => build_http_tool(r, cfg, def, clips),
         CATEGORY_TRANSFER => bail!("tool {:?} ({}): transfer_call isn't supported yet", r.name, r.uuid),
         other => bail!("tool {:?} (category {other}): tool category not supported yet", r.name),
     }
 }
 
-fn build_http_tool(r: &ToolRow, cfg: ToolConfig, mut def: FunctionDef) -> Result<(Tool, Option<String>)> {
+fn build_http_tool(r: &ToolRow, cfg: ToolConfig, mut def: FunctionDef, clips: &ClipSet) -> Result<(Tool, Option<String>)> {
     if cfg.url.trim().is_empty() {
         bail!("http tool {:?} ({}) has no url", r.name, r.uuid);
     }
@@ -166,7 +195,18 @@ fn build_http_tool(r: &ToolRow, cfg: ToolConfig, mut def: FunctionDef) -> Result
         let t = http.clone();
         Box::pin(async move { Ok(t.run(args).await) })
     });
-    Ok((Tool { def, kind: ToolKind::Function(run), message: cfg.custom_message }, warning))
+    // An http_api tool's message is customMessage, or with customMessageType
+    // "audio" the recording customMessageRecordingId -- not messageType.
+    let (mut message, mut message_clip) = (cfg.custom_message.clone(), None);
+    if cfg.custom_message_type == "audio" {
+        message.clear();
+        message_clip = clips.by_pk.get(&cfg.custom_message_recording_id).cloned();
+        if message_clip.is_none() {
+            let msg = format!("http tool {:?} ({}): message recording unavailable; nothing is said", r.name, r.uuid);
+            warning = Some(warning.map_or(msg.clone(), |w| format!("{w}; {msg}")));
+        }
+    }
+    Ok((Tool { def, kind: ToolKind::Function(run), message, message_clip }, warning))
 }
 
 /// `{"type":"object","properties":...,"required":[...]}`. Only top-level
@@ -317,7 +357,7 @@ mod tests {
     #[test]
     fn end_call_tool_with_a_required_reason() {
         let r = row("end_call", "End Call", json!({"config": {"messageType":"custom","customMessage":"Bye!","endCallReason":true}}));
-        let (t, w) = build_tool(&r).unwrap();
+        let (t, w) = build_tool(&r, &ClipSet::default()).unwrap();
         assert!(w.is_none() && matches!(t.kind, ToolKind::EndCall));
         assert_eq!((t.message.as_str(), t.def.name.as_str(), t.def.description.as_str()), ("Bye!", "end_call", "Execute End Call tool"));
         assert_eq!(t.def.parameters.unwrap()["required"], json!(["reason"]));
@@ -335,7 +375,7 @@ mod tests {
                 {"name": "tags", "type": "array", "required": false, "item_schema": [{"name":"k","type":"weird"}]}]}}),
         );
         r.credential = Some(Credential { kind: "bearer_token".into(), data: json!({"token": "tok"}) });
-        let (t, w) = build_tool(&r).unwrap();
+        let (t, w) = build_tool(&r, &ClipSet::default()).unwrap();
         assert!(w.is_none());
         assert_eq!(t.message, "One moment");
         let p = t.def.parameters.unwrap();
@@ -344,10 +384,10 @@ mod tests {
         assert_eq!(p["required"], json!(["id"]));
 
         r.credential = None;
-        let (_, w) = build_tool(&r).unwrap();
+        let (_, w) = build_tool(&r, &ClipSet::default()).unwrap();
         assert!(w.unwrap().contains("not found or not active"));
-        assert!(build_tool(&row("http_api", "X", json!({"config": {}}))).is_err(), "no url");
-        assert!(build_tool(&row("transfer_call", "T", json!({}))).is_err());
+        assert!(build_tool(&row("http_api", "X", json!({"config": {}})), &ClipSet::default()).is_err(), "no url");
+        assert!(build_tool(&row("transfer_call", "T", json!({})), &ClipSet::default()).is_err());
     }
 
     #[test]

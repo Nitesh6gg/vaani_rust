@@ -2,6 +2,7 @@ pub mod backchannel;
 pub mod calllog;
 pub mod handler;
 pub mod recorder;
+pub mod recordings;
 pub mod vad;
 pub mod workflow;
 

@@ -39,9 +39,16 @@ pub struct LoadedWorkflow {
 #[derive(Clone)]
 pub struct Store {
     pool: Pool,
+    /// Set by `use_storage`: without it recordings can't be played.
+    pub(super) clips: Option<super::recordings::ClipCache>,
 }
 
 impl Store {
+    /// Lets the store play Dograh's recordings, read from `storage` (its MinIO).
+    pub fn use_storage(&mut self, storage: super::storage::Storage) {
+        self.clips = Some(super::recordings::ClipCache::new(storage));
+    }
+
     pub(crate) async fn db(&self) -> Result<deadpool_postgres::Object> {
         self.pool.get().await.context("dograh: get connection")
     }
@@ -54,7 +61,7 @@ impl Store {
         cfg.pool = Some(deadpool_postgres::PoolConfig::new(max_conns));
         let pool = cfg.create_pool(Some(Runtime::Tokio1), NoTls).context("dograh: connect")?;
         pool.get().await.context("dograh: ping")?.simple_query("SELECT 1").await.context("dograh: ping")?;
-        Ok(Self { pool })
+        Ok(Self { pool, clips: None })
     }
 
     /// Loads workflow `workflow_id`. `call_vars` (caller_number, called_number)
@@ -98,8 +105,11 @@ impl Store {
         vars.extend(call_vars.clone());
 
         let tool_rows = self.tools(&db, &wf.tool_uuids(), org_id).await?;
-        let (workflow, mut warnings) =
-            wfjson::build(&wf, &vars, &tool_rows, Utc::now()).with_context(|| format!("dograh: workflow {workflow_id}"))?;
+        let (pks, by_id) = wf.recording_needs(&tool_rows);
+        let (clips, mut warnings) = self.load_clips(org_id, &pks, by_id).await;
+        let (workflow, build_warnings) =
+            wfjson::build(&wf, &vars, &tool_rows, &clips, Utc::now()).with_context(|| format!("dograh: workflow {workflow_id}"))?;
+        warnings.extend(build_warnings);
         let (services, w) =
             services::resolve(&user_config, &def_config).with_context(|| format!("dograh: workflow {workflow_id}: models"))?;
         warnings.extend(w);
@@ -273,5 +283,80 @@ mod tests {
         assert_eq!(w.warnings, [r#"node "Start": tool 22222222-2222-2222-2222-222222222222 not found or not active"#]);
         let err = store.workflow(999, &Map::new()).await.err().unwrap();
         assert!(err.to_string().contains("not found"), "{err}");
+    }
+
+    /// Recordings end to end: rows in Postgres, objects in (a fake) MinIO, ffmpeg
+    /// conversion and silence trimming, then the clips wired into the workflow.
+    /// Needs `DOGRAH_TEST_DB_URL` and ffmpeg.
+    #[tokio::test]
+    async fn recordings_become_clips_in_the_workflow() {
+        use crate::{agent::recorder::wav, testkit::mock_minio_objects};
+        let tone = |ms: usize, v: i16| -> Vec<u8> { (0..16 * ms).flat_map(|_| v.to_le_bytes()).collect() };
+        // 100ms of silence, 200ms of sound, 100ms of silence: trimming keeps the 200ms.
+        let file = wav(&[tone(100, 0), tone(200, 5000), tone(100, 0)].concat());
+        let endpoint = mock_minio_objects(vec![
+            ("/voice-audio/recordings/greet.wav".into(), file.clone()),
+            ("/voice-audio/recordings/offer.wav".into(), file),
+        ])
+        .await;
+
+        let Some((mut store, _)) = Store::for_test(
+            "t_recordings",
+            r#"
+            CREATE TABLE workflows (id serial PRIMARY KEY, user_id int, organization_id int, released_definition_id int, template_context_variables jsonb);
+            CREATE TABLE workflow_definitions (id serial PRIMARY KEY, workflow_id int, workflow_json jsonb, template_context_variables jsonb, workflow_configurations jsonb, is_current bool);
+            CREATE TABLE user_configurations (id serial PRIMARY KEY, user_id int, configuration jsonb);
+            CREATE TABLE tools (tool_uuid uuid, organization_id int, name text, description text, category text, status text, definition jsonb);
+            CREATE TABLE external_credentials (credential_uuid varchar, organization_id int, credential_type text, credential_data jsonb, is_active bool);
+            CREATE TABLE workflow_recordings (id serial PRIMARY KEY, organization_id int, recording_id text, transcript text, storage_key text, storage_backend text, is_active bool);
+            INSERT INTO workflow_recordings (id, organization_id, recording_id, transcript, storage_key, storage_backend, is_active) VALUES
+              (5, 3, 'greet', 'Namaste!', 'recordings/greet.wav', 'minio', true),
+              (6, 3, 'offer', 'Our offer.', 'recordings/offer.wav', 'minio', true),
+              (7, 3, 'old', 'Old.', 'recordings/old.wav', 'minio', false);
+            INSERT INTO user_configurations (user_id, configuration) VALUES (7, '{
+              "llm": {"provider":"openai","api_key":"sk","model":"m"},
+              "stt": {"provider":"sarvam","api_key":"k"}, "tts": {"provider":"sarvam","api_key":"k"}}');
+            INSERT INTO workflows (id, user_id, organization_id) VALUES (42, 7, 3);
+            INSERT INTO workflow_definitions (workflow_id, workflow_json, is_current) VALUES (42, '{"nodes":[
+                {"id":"1","type":"startCall","data":{"name":"Start","prompt":"Reply with RECORDING_ID: offer when asked.","is_start":true,
+                   "greeting_type":"audio","greeting_recording_id":"5"}},
+                {"id":"2","type":"agentNode","data":{"name":"Main","prompt":"Plain prompt."}}],
+              "edges":[{"source":"1","target":"2","data":{"label":"Go","condition":"c","transition_speech_type":"audio","transition_speech_recording_id":6}},
+                       {"source":"2","target":"1","data":{"label":"Back","condition":"c","transition_speech_type":"audio","transition_speech_recording_id":7}}]}', true);
+            "#,
+        )
+        .await
+        else {
+            eprintln!("skipped: DOGRAH_TEST_DB_URL not set");
+            return;
+        };
+        store.use_storage(crate::dograh::storage::Storage {
+            endpoint,
+            access_key: "a".into(),
+            secret_key: "b".into(),
+            bucket: "voice-audio".into(),
+            secure: false,
+        });
+
+        let w = store.workflow(42, &Map::new()).await.unwrap();
+        let start = &w.workflow.nodes[w.workflow.start];
+        let greeting = start.greeting_clip.as_ref().expect("the audio greeting is a clip");
+        assert_eq!((greeting.id.as_str(), greeting.transcript.as_str()), ("greet", "Namaste!"));
+        assert_eq!(greeting.pcm.len(), 200 * 32, "leading and trailing silence trimmed, 200ms kept");
+        assert!(start.greeting.is_empty());
+
+        // The start prompt names RECORDING_ID: -> response-mode instructions and the by-id clips.
+        assert!(start.prompt.contains("RESPONSE MODE INSTRUCTIONS - MANDATORY FORMAT"));
+        let clips = start.clips.as_ref().expect("recording response mode");
+        assert!(clips.contains_key("offer") && clips.contains_key("greet") && !clips.contains_key("old"), "active recordings only");
+        assert!(w.workflow.nodes[1].clips.is_none() && !w.workflow.nodes[1].prompt.contains("RESPONSE MODE"));
+
+        // Transitions: an available recording plays; an inactive one says nothing, with a warning.
+        assert_eq!(start.edges[0].speech_clip.as_ref().map(|c| c.id.as_str()), Some("offer"));
+        assert!(w.workflow.nodes[1].edges[0].speech_clip.is_none());
+        assert_eq!(
+            w.warnings,
+            ["recording 7 not found or not active", r#"edge "Back": transition recording unavailable; nothing is said"#]
+        );
     }
 }

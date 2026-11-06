@@ -24,8 +24,9 @@ use super::{
     backchannel::backchannel,
     calllog::{self, CallLog, Summary},
     recorder::MixRecorder,
+    recordings::{ClipRouter, RECORDING_MARKER, strip_recording_refs},
     vad::BargeInDetector,
-    workflow::{Node, ToolKind, Workflow, plain_history, request_messages},
+    workflow::{Clip, Edge, Node, ToolKind, Workflow, plain_history, request_messages},
 };
 use crate::{
     ai::{
@@ -400,11 +401,18 @@ impl Agent {
         let n = self.node();
         let (id, name, allow) = (n.id.clone(), n.name.clone(), n.allow_interrupt);
         self.log.node_entered(&id, &name, allow);
-        if self.node().greeting.is_empty() {
-            tracing::debug!(call_id = %self.id, event = "agent.opening", "llm speaks first");
-            self.start_turn();
-        } else {
-            self.start_greeting();
+        let n = self.node();
+        let greeting = match (&n.greeting_clip, n.greeting.is_empty()) {
+            (Some(clip), _) => Some(Greeting::Clip(clip.clone())),
+            (None, false) => Some(Greeting::Text(n.greeting.clone())),
+            (None, true) => None,
+        };
+        match greeting {
+            Some(g) => self.start_greeting(g),
+            None => {
+                tracing::debug!(call_id = %self.id, event = "agent.opening", "llm speaks first");
+                self.start_turn();
+            }
         }
     }
 
@@ -801,7 +809,7 @@ impl Agent {
 
     // -------------------------------------------------------------- turns ---
 
-    fn turn_ctx(&mut self, greeting: Option<String>) -> TurnCtx {
+    fn turn_ctx(&mut self, greeting: Option<Greeting>) -> TurnCtx {
         self.generation += 1;
         self.turn_started = Instant::now();
         self.start_turn_chunks();
@@ -834,10 +842,9 @@ impl Agent {
     /// Speaks the start node's fixed greeting before the caller says anything,
     /// bypassing the LLM. It reaches history like any reply (via `record_reply`,
     /// once it has played) so the LLM doesn't greet again.
-    fn start_greeting(&mut self) {
+    fn start_greeting(&mut self, g: Greeting) {
         self.state = State::Thinking;
-        let g = self.node().greeting.clone();
-        tracing::debug!(call_id = %self.id, event = "agent.greeting", text = %g, "agent greeting");
+        tracing::debug!(call_id = %self.id, event = "agent.greeting", text = %g.text(), "agent greeting");
         let ctx = self.turn_ctx(Some(g));
         tokio::spawn(turn_task(ctx));
     }
@@ -1034,9 +1041,14 @@ impl Agent {
         if let Some(d) = self.turn_ttfa {
             self.log.ttfb("tts", d);
         }
-        self.log.agent_said(&text, Some(self.turn_started));
+        // The LLM's own history keeps "● <id>" (it needs the format it's asked to
+        // follow); the call's log and transcript get only what was said.
+        let (spoken, recordings) = strip_recording_refs(&text);
+        if !spoken.is_empty() {
+            self.log.agent_said(&spoken, Some(self.turn_started));
+        }
         tracing::info!(call_id = %self.id, event = "turn.agent", turn = self.turn, node = %self.node().name,
-            generation = self.generation, cut, text = %text,
+            generation = self.generation, cut, text = %spoken, recordings = ?recordings,
             llm_ttft_ms = self.turn_ttft.map(|d| d.as_millis() as u64),
             tts_ttfa_ms = self.turn_ttfa.map(|d| d.as_millis() as u64), "agent turn");
     }
@@ -1179,7 +1191,23 @@ struct TurnCtx {
     tool_running: Arc<AtomicBool>,
     fallback: FailurePolicy,
     started: Instant,
-    greeting: Option<String>,
+    greeting: Option<Greeting>,
+}
+
+/// The start node's opening, spoken before the caller says anything.
+enum Greeting {
+    Text(String),
+    /// A recording, played as-is; recorded in history as its transcript.
+    Clip(Arc<Clip>),
+}
+
+impl Greeting {
+    fn text(&self) -> &str {
+        match self {
+            Greeting::Text(t) => t,
+            Greeting::Clip(c) => &c.transcript,
+        }
+    }
 }
 
 impl TurnCtx {
@@ -1197,6 +1225,39 @@ impl TurnCtx {
             }
             Err(_) => {}
         }
+    }
+
+    /// Queues `clip` in place of synthesized speech, after whatever this turn
+    /// already sent to TTS; `text` is what the turn records for it (history, call
+    /// log). Unlike `speak` it costs no TTS characters.
+    fn play_clip(&self, tts: &TtsClient, clip: &Clip, text: &str) {
+        if self.cancel.is_cancelled() {
+            return;
+        }
+        match tts.play(clip.pcm.clone(), text, self.generation) {
+            Ok(()) => {
+                tracing::debug!(call_id = %self.call_id, event = "tts.clip", generation = self.generation, recording_id = %clip.id, audio_ms = clip.pcm.len() / 32, "recorded clip queued")
+            }
+            Err(e) if !self.cancel.is_cancelled() => {
+                tracing::warn!(call_id = %self.call_id, event = "tts.error", generation = self.generation, recording_id = %clip.id, error = %e, "recorded clip failed")
+            }
+            Err(_) => {}
+        }
+    }
+
+    /// Plays the recording the LLM asked for with "● <id>": what the turn records
+    /// is the marker, id and transcript, so the LLM's history shows the reply
+    /// format it's asked to keep, as Dograh's context does. Reports whether the
+    /// recording exists; if not, nothing was played and the caller falls back to
+    /// speaking the text the LLM wrote (`ClipRouter::speak_rest`).
+    fn play_recording(&self, tts: &TtsClient, clips: &std::collections::HashMap<String, Arc<Clip>>, id: &str) -> bool {
+        let Some(clip) = clips.get(id) else {
+            tracing::warn!(call_id = %self.call_id, generation = self.generation, event = "tts.clip_missing", recording_id = %id,
+                "llm asked for a recording that isn't available; speaking the text it wrote instead");
+            return false;
+        };
+        self.play_clip(tts, clip, &format!("{RECORDING_MARKER} {} {} ", clip.id, clip.transcript));
+        true
     }
 }
 
@@ -1234,17 +1295,26 @@ async fn turn_task(c: TurnCtx) {
         }
     };
 
-    if let Some(g) = &c.greeting {
-        let mut chunker = SentenceChunker::default();
-        for chunk in chunker.feed(g) {
-            c.speak(&tts, &chunk);
+    match &c.greeting {
+        Some(Greeting::Clip(clip)) => {
+            // A recorded greeting goes into history as its transcript, as Dograh's does.
+            c.play_clip(&tts, clip, &clip.transcript);
+            tts.end_generation(c.generation);
+            return;
         }
-        let rest = chunker.flush();
-        if !rest.is_empty() {
-            c.speak(&tts, &rest);
+        Some(Greeting::Text(g)) => {
+            let mut chunker = SentenceChunker::default();
+            for chunk in chunker.feed(g) {
+                c.speak(&tts, &chunk);
+            }
+            let rest = chunker.flush();
+            if !rest.is_empty() {
+                c.speak(&tts, &rest);
+            }
+            tts.end_generation(c.generation);
+            return;
         }
-        tts.end_generation(c.generation);
-        return;
+        None => {}
     }
     run_llm_turn(&c, &tts).await;
 }
@@ -1277,12 +1347,28 @@ async fn run_llm_turn(c: &TurnCtx, tts: &Arc<TtsClient>) {
             msgs = plain_history(&msgs);
         }
         let mut said = String::new();
+        // A node with recordings answers "● <id>" (play it) or "▸ <text>". The
+        // clips are the round's node's, even if a tool call moves `node` below.
+        let round_clips = n.clips.clone();
+        let mut router = round_clips.as_ref().map(|_| ClipRouter::default());
         let res = c
             .llm
             .stream(&c.cancel, &msgs, &tools, &mut |tok| {
                 ttft.get_or_insert_with(|| c.started.elapsed());
                 said.push_str(tok);
-                for chunk in chunker.feed(tok) {
+                let speak = match (router.as_mut(), round_clips.as_ref()) {
+                    (Some(r), Some(clips)) => {
+                        let (mut speak, id) = r.feed(tok);
+                        if let Some(id) = id
+                            && !c.play_recording(tts, clips, &id)
+                        {
+                            speak += &r.speak_rest();
+                        }
+                        speak
+                    }
+                    _ => tok.to_string(),
+                };
+                for chunk in chunker.feed(&speak) {
                     c.speak(tts, &chunk);
                 }
             })
@@ -1307,6 +1393,15 @@ async fn run_llm_turn(c: &TurnCtx, tts: &Arc<TtsClient>) {
                 break;
             }
         };
+        if let (Some(r), Some(clips)) = (router.as_mut(), round_clips.as_ref()) {
+            let (speak, id) = r.flush();
+            if let Some(id) = id {
+                c.play_recording(tts, clips, &id);
+            }
+            for chunk in chunker.feed(&speak) {
+                c.speak(tts, &chunk);
+            }
+        }
         // Speak the tail now, before any tool runs, so the caller isn't left in silence.
         let rest = chunker.flush();
         if !rest.is_empty() {
@@ -1333,7 +1428,7 @@ async fn run_llm_turn(c: &TurnCtx, tts: &Arc<TtsClient>) {
         for call in &calls {
             let _ = c.ev.send(Event::Function { name: call.function.name.clone(), call_id: call.id.clone(), result: None });
             let (result, action) = if let Some(e) = wf.nodes[node].edge(&call.function.name) {
-                let r = take_edge(c, tts, node, e.to, &e.speech, &e.def.name);
+                let r = take_edge(c, tts, node, e);
                 node = e.to;
                 (r, Action::None)
             } else {
@@ -1395,11 +1490,14 @@ async fn run_llm_turn(c: &TurnCtx, tts: &Arc<TtsClient>) {
 
 /// The LLM called an edge's function: speak the transition, switch node.
 /// Returns Dograh's transition result.
-fn take_edge(c: &TurnCtx, tts: &TtsClient, from: usize, to: usize, speech: &str, via: &str) -> String {
-    if !speech.is_empty() {
-        // Trailing space: a piece spoken on its own must not run into the LLM's
-        // reply in the recorded text.
-        c.speak(tts, &format!("{speech} "));
+fn take_edge(c: &TurnCtx, tts: &TtsClient, from: usize, e: &Edge) -> String {
+    let (to, via) = (e.to, e.def.name.as_str());
+    // Trailing space: a piece spoken on its own must not run into the LLM's
+    // reply in the recorded text.
+    match (&e.speech_clip, e.speech.is_empty()) {
+        (Some(clip), _) => c.play_clip(tts, clip, &format!("{} ", clip.transcript)),
+        (None, false) => c.speak(tts, &format!("{} ", e.speech)),
+        (None, true) => {}
     }
     let (f, t) = (&c.wf.nodes[from], &c.wf.nodes[to]);
     tracing::info!(call_id = %c.call_id, event = "workflow.node_transition", generation = c.generation,
@@ -1424,8 +1522,10 @@ async fn run_tool(c: &TurnCtx, tts: &TtsClient, node: usize, call: &ToolCall) ->
         return (tool_error(format!("unknown tool {name:?}")), Action::None);
     };
     tracing::info!(call_id = %c.call_id, event = "tool.call", tool = %name, args = %truncate(&call.function.arguments, 200), "tool call");
-    if !t.message.is_empty() {
-        c.speak(tts, &format!("{} ", t.message));
+    match (&t.message_clip, t.message.is_empty()) {
+        (Some(clip), _) => c.play_clip(tts, clip, &format!("{} ", clip.transcript)),
+        (None, false) => c.speak(tts, &format!("{} ", t.message)),
+        (None, true) => {}
     }
     match &t.kind {
         ToolKind::EndCall => {
