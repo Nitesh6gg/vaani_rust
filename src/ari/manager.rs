@@ -364,9 +364,12 @@ impl Manager {
                 disposition = end.summary.end_reason.unwrap_or(calllog::USER_HANGUP), events = end.summary.events.len(),
                 recording_bytes, minio = storage.is_some(), "dograh run completed"),
             Err(e) => {
-                tracing::error!(call_id = %id, component = "dograh", event = "run.complete_failed", run_id, error = %format!("{e:#}"), "dograh run: completing it failed")
+                tracing::error!(call_id = %id, component = "dograh", event = "run.complete_failed", run_id, error = %format!("{e:#}"), "dograh run: completing it failed");
+                return;
             }
         }
+        // Dograh's cost job, likewise never triggered for Vaani's calls.
+        self.store.record_cost(id, &end.meta, run_id, &end.summary, end.duration).await;
     }
 
     /// Idempotent: cancels the call and releases what it holds, each resource
@@ -522,6 +525,14 @@ mod tests {
                 CREATE TABLE workflow_runs (id bigserial PRIMARY KEY, name text, workflow_id int, definition_id bigint, mode text, call_type text, state text,
                     is_completed bool, usage_info json, cost_info json, initial_context json, gathered_context json, logs json, annotations json,
                     created_at timestamptz, recording_url text, transcript_url text, storage_backend text);
+                CREATE TABLE users (id serial PRIMARY KEY, selected_organization_id bigint);
+                CREATE TABLE organizations (id bigint PRIMARY KEY, price_per_second_usd float8);
+                CREATE TABLE organization_usage_cycles (id serial PRIMARY KEY, organization_id bigint, period_start timestamptz, period_end timestamptz,
+                    used_dograh_tokens float8 DEFAULT 0, total_duration_seconds bigint DEFAULT 0, used_amount_usd float8);
+                INSERT INTO users (id, selected_organization_id) VALUES (7, 3);
+                INSERT INTO organizations (id, price_per_second_usd) VALUES (3, 0.001);
+                INSERT INTO organization_usage_cycles (organization_id, period_start, period_end, used_amount_usd)
+                  VALUES (3, now() - interval '1 day', now() + interval '1 day', 1.0);
                 CREATE TABLE organization_configurations (id serial PRIMARY KEY, organization_id bigint, key text, value jsonb);
                 INSERT INTO organization_configurations (organization_id, key, value) VALUES (3, 'DISPOSITION_CODE_MAPPING', '{{"user_hangup": "HU"}}');
                 CREATE TABLE workflow_definitions (id serial PRIMARY KEY, workflow_id int, workflow_json jsonb, template_context_variables jsonb, workflow_configurations jsonb, is_current bool);
@@ -529,7 +540,7 @@ mod tests {
                 CREATE TABLE tools (tool_uuid uuid, organization_id int, name text, description text, category text, status text, definition jsonb);
                 CREATE TABLE external_credentials (credential_uuid varchar, organization_id int, credential_type text, credential_data jsonb, is_active bool);
                 INSERT INTO user_configurations (user_id, configuration) VALUES (7, '{{
-                  "llm": {{"provider":"speaches","base_url":"{llm_url}","api_key":"k","model":"m"}},
+                  "llm": {{"provider":"speaches","base_url":"{llm_url}","api_key":"k","model":"gpt-4.1"}},
                   "stt": {{"provider":"sarvam","api_key":"k"}}, "tts": {{"provider":"sarvam","api_key":"k"}}}}');
                 INSERT INTO workflows (id, user_id, organization_id) VALUES (42, 7, 3);
                 INSERT INTO workflow_definitions (workflow_id, workflow_json, is_current)
@@ -655,6 +666,32 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&row.get::<_, String>(8)).unwrap()["call_duration_seconds"],
             usage["call_duration_seconds"]
         );
+        // Priced like Dograh's own cost job: cost_info, and the organization's usage cycle.
+        let mut cost_row = None;
+        for _ in 0..200 {
+            let r = db.query_one("SELECT cost_info::text, usage_info::text FROM workflow_runs WHERE id = $1", &[&run_id]).await.unwrap();
+            if r.get::<_, String>(0).contains("cost_breakdown") {
+                cost_row = Some(r);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let cost_row = cost_row.expect("cost_info with a cost_breakdown");
+        let cost: serde_json::Value = serde_json::from_str(&cost_row.get::<_, String>(0)).unwrap();
+        let usage: serde_json::Value = serde_json::from_str(&cost_row.get::<_, String>(1)).unwrap();
+        assert_eq!(usage["llm"]["LLM|||gpt-4.1"]["prompt_tokens"], 100);
+        // 100 prompt tokens * $2/M + 20 completion * $8/M
+        assert!((cost["cost_breakdown"]["llm_cost"].as_f64().unwrap() - 0.00036).abs() < 1e-9, "{cost}");
+        assert!(cost["cost_breakdown"]["tts_cost"].as_f64().unwrap() > 0.0);
+        let secs = cost["call_duration_seconds"].as_i64().unwrap();
+        assert!((cost["charge_usd"].as_f64().unwrap() - secs as f64 * 0.001).abs() < 1e-9, "{cost}");
+        let cyc = db
+            .query_one("SELECT total_duration_seconds, used_amount_usd, used_dograh_tokens FROM organization_usage_cycles", &[])
+            .await
+            .unwrap();
+        assert_eq!(cyc.get::<_, i64>(0), secs);
+        assert!((cyc.get::<_, f64>(1) - (1.0 + secs as f64 * 0.001)).abs() < 1e-9);
+        assert!(cyc.get::<_, f64>(2) > 0.0, "Dograh tokens were charged");
         let puts = minio_puts.lock().unwrap().clone();
         let wav = puts.iter().find(|(p, _)| p == &format!("/voice-audio/recordings/{run_id}.wav")).expect("the recording upload");
         assert_eq!(&wav.1[..4], b"RIFF");

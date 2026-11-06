@@ -5,6 +5,7 @@
 //! uploads its process_workflow_completion job makes).
 
 use super::{
+    pricing::calculate_cost,
     services::Services,
     storage::Storage,
     store::{LoadedWorkflow, Store},
@@ -214,6 +215,103 @@ impl Store {
         }
 
         if errs.is_empty() { Ok(()) } else { Err(anyhow!(errs.join("; "))) }
+    }
+
+    /// Dograh's calculate_workflow_run_cost job for a Vaani call, which never
+    /// triggers that job: rewrites the run's usage_info, prices it into cost_info
+    /// (the cost_breakdown Dograh's run pages show) and adds the call to its
+    /// organization's current usage cycle. Failures are logged only.
+    pub async fn record_cost(&self, call_id: &str, m: &RunMeta, run_id: i64, sum: &Summary, duration: Duration) {
+        let usage = usage_info(m, sum, duration);
+        let cost = calculate_cost(&usage);
+        let tokens = (cost.total * 100.0 * 100.0).round() / 100.0; // 1 cent = 1 Dograh token
+        match tokio::time::timeout(DB_TIMEOUT, self.try_record_cost(m, run_id, &usage, cost, tokens)).await {
+            Ok(Ok(())) => tracing::info!(
+                call_id,
+                component = "dograh",
+                event = "run.cost",
+                total_usd = cost.total,
+                llm_usd = cost.llm,
+                tts_usd = cost.tts,
+                stt_usd = cost.stt,
+                dograh_tokens = tokens,
+                "dograh run cost"
+            ),
+            Ok(Err(e)) => {
+                tracing::warn!(call_id, component = "dograh", event = "run.cost_failed", error = %format!("{e:#}"), "dograh: recording the call's cost failed")
+            }
+            Err(_) => tracing::warn!(
+                call_id,
+                component = "dograh",
+                event = "run.cost_failed",
+                error = "timed out",
+                "dograh: recording the call's cost failed"
+            ),
+        }
+    }
+
+    async fn try_record_cost(&self, _m: &RunMeta, run_id: i64, usage: &Value, c: super::pricing::Cost, tokens: f64) -> Result<()> {
+        let db = self.db().await?;
+        // Dograh charges the workflow owner's selected organization.
+        let row = db
+            .query_one(
+                "SELECT to_char(r.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"+00:00\"'), o.id::bigint, o.price_per_second_usd::float8
+                 FROM workflow_runs r
+                 JOIN workflows w ON w.id = r.workflow_id
+                 LEFT JOIN users usr ON usr.id = w.user_id
+                 LEFT JOIN organizations o ON o.id = usr.selected_organization_id
+                 WHERE r.id = $1::bigint",
+                &[&run_id],
+            )
+            .await
+            .with_context(|| format!("read run {run_id}"))?;
+        let (created_at, org, price_per_sec): (String, Option<i64>, Option<f64>) = (row.get(0), row.get(1), row.get(2));
+        let seconds = usage["call_duration_seconds"].as_i64().unwrap_or(0);
+
+        let mut cost_info = json!({
+            "cost_breakdown": {"llm_cost": c.llm, "tts_cost": c.tts, "stt_cost": c.stt, "total": c.total},
+            "total_cost_usd": c.total,
+            "dograh_token_usage": tokens,
+            "calculated_at": created_at, // Python isoformat()
+            "call_duration_seconds": seconds,
+        });
+        let charge = price_per_sec.filter(|p| *p != 0.0).map(|p| seconds as f64 * p);
+        if let (Some(ch), Some(p)) = (charge, price_per_sec) {
+            cost_info["charge_usd"] = json!(ch);
+            cost_info["price_per_second_usd"] = json!(p);
+        }
+        db.execute(
+            "UPDATE workflow_runs SET usage_info = $2::text::json, cost_info = (cost_info::jsonb || $3::text::jsonb)::json WHERE id = $1::bigint",
+            &[&run_id, &usage.to_string(), &cost_info.to_string()],
+        )
+        .await
+        .with_context(|| format!("update run {run_id}"))?;
+
+        let Some(org) = org else { return Ok(()) };
+        // Dograh's update_usage_after_run, on the cycle covering now. Creating a
+        // missing cycle is left to Dograh, which owns the quota/period rules.
+        let n = db
+            .execute(
+                "UPDATE organization_usage_cycles SET
+                    used_dograh_tokens = used_dograh_tokens + $2::float8,
+                    total_duration_seconds = total_duration_seconds + $3::bigint,
+                    used_amount_usd = CASE WHEN $4::float8 IS NULL THEN used_amount_usd
+                        ELSE COALESCE(used_amount_usd, 0) + $4::float8 END
+                 WHERE organization_id = $1::bigint AND period_start <= now() AND period_end >= now()",
+                &[&org, &tokens, &seconds, &charge],
+            )
+            .await
+            .with_context(|| format!("update org {org} usage"))?;
+        if n == 0 {
+            tracing::info!(
+                component = "dograh",
+                event = "run.usage_cycle_missing",
+                org_id = org,
+                run_id,
+                "dograh: no current usage cycle for the organization; its usage isn't updated"
+            );
+        }
+        Ok(())
     }
 
     /// The organization's DISPOSITION_CODE_MAPPING ({"user_hangup": "HU", ...}), if it has one.

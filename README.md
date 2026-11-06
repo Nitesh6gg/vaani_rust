@@ -22,6 +22,7 @@ Milestones 1 and 2 are done and tested: a Rust call is now a complete call, reco
 | **Dograh call record**: `workflow_runs` created at call start and completed at the end (conversation events, nodes visited, disposition + organization mapping, usage/cost info, call tags) | done |
 | **Recording + transcript** mixed to mono WAV and uploaded to Dograh's MinIO (hand-written SigV4, checked against the MinIO Python client) | done |
 | **Recorded clips**: audio greeting, audio transitions, tool messages, and the `● recording_id` / `▸ text` reply mode (MinIO → ffmpeg → trimmed, cached in memory and on disk) | done |
+| **Cost**: Dograh's pricing tables, `cost_info` breakdown, organization usage cycle and charge | done |
 | **Variable extraction** (per node on leaving it, and at call end after teardown) feeding `gathered_context`, the disposition and call tags | done |
 | **STT speech-only gate** (pre-roll, hangover, keepalive) and **early flush** | done |
 | `/metrics` (Prometheus text) and `/healthz` | done |
@@ -29,7 +30,7 @@ Milestones 1 and 2 are done and tested: a Rust call is now a complete call, reco
 Not ported yet (in rough priority order):
 
 1. `transfer_call` tool (needs ARI dial + bridge swap, hold music)
-2. QA analysis nodes and cost pricing (usage is recorded; `cost_info` holds only the duration)
+2. QA analysis nodes (their tokens aren't priced yet)
 3. Outbound campaigns (`Manager.Dial`, Redis limiter) — ARI only
 4. Debug WAV recording, OpenTelemetry
 5. TLS to Dograh's Postgres (`tokio-postgres-rustls`)

@@ -145,7 +145,12 @@ pub(crate) async fn mock_llm(
 }
 
 pub(crate) fn sse(text: &str) -> String {
-    format!("data: {}\n\ndata: [DONE]\n\n", serde_json::json!({"choices":[{"delta":{"content":text}}]}))
+    // The usage chunk comes last, as OpenAI-compatible providers send it with include_usage.
+    format!(
+        "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+        serde_json::json!({"choices":[{"delta":{"content":text}}]}),
+        serde_json::json!({"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":20,"total_tokens":120}})
+    )
 }
 
 /// Mock Sarvam STT accepting any number of connections; only counts audio messages.
