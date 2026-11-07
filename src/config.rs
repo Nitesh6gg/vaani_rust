@@ -226,8 +226,9 @@ impl Config {
             ari_pass: "p".into(),
             ari_app: "vaani".into(),
             media_ip: "127.0.0.1".into(),
-            media_port_base: 41000,
-            media_port_count: 4,
+            // Tests run in parallel and bind real sockets: each config gets its own range.
+            media_port_base: 30000 + (rand::random::<u16>() % 2000) * 16,
+            media_port_count: 8,
             dograh_db_url: db_url.into(),
             dograh_db_max_conns: 4,
             dograh_workflow_id: 42,
