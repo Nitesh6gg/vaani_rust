@@ -381,7 +381,8 @@ impl Runner {
         if n > 0 {
             metrics::CAMPAIGN_CALLS_IN_FLIGHT.fetch_add(n as u64, Relaxed);
         } else {
-            let _ = metrics::CAMPAIGN_CALLS_IN_FLIGHT.fetch_update(Relaxed, Relaxed, |v| Some(v.saturating_sub(n.unsigned_abs())));
+            // Every decrement follows its own increment (place -> finished), so this can't underflow.
+            metrics::CAMPAIGN_CALLS_IN_FLIGHT.fetch_sub(n.unsigned_abs(), Relaxed);
         }
         let e = st.inflight.entry(campaign).or_default();
         *e += n;
