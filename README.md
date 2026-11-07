@@ -111,6 +111,8 @@ audio over AudioSocket → teardown frees the port and ARI resources exactly onc
 completed with its conversation, usage, disposition, and the recording and transcript uploaded).
 `dograh::store` tests load a workflow and its recordings (fake MinIO + real ffmpeg) from Postgres.
 
+`/metrics` exports `process_cpu_seconds_total`, `process_resident_memory_bytes`, `process_threads` and `vaani_tokio_alive_tasks` under the Go engine's names; `docs/BENCHMARK.md` is the method for a fair Go-vs-Rust run on your box.
+
 First numbers (4 vCPU sandbox, mock providers in-process): 500 concurrent agents ≈ 515 KB RSS per
 call, ≈ 0.3% of a core per call, worst 20ms-tick lateness ≈ 1 ms. **Not a substitute for the
 Go-vs-Rust SIPp run against real Asterisk** — do that next and record it in `docs/BENCHMARK.md`.

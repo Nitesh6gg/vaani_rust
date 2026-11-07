@@ -36,6 +36,40 @@ pub fn campaign_pause(reason: &str) {
     }
 }
 
+/// What the kernel says about this process, in the units of Prometheus' standard `process_*` metrics
+/// (and of the Go server's, so `docs/BENCHMARK.md`'s method works unchanged on either engine).
+#[derive(Debug, Default, PartialEq)]
+pub struct ProcStats {
+    pub cpu_seconds: f64,
+    pub resident_bytes: u64,
+    pub resident_peak_bytes: u64,
+    pub virtual_bytes: u64,
+    pub threads: u64,
+}
+
+/// Linux's USER_HZ: the unit of /proc/<pid>/stat's CPU times (100 on every mainstream build).
+const CLOCK_TICKS: f64 = 100.0;
+
+/// Parses /proc/self/stat (CPU time) and /proc/self/status (memory, threads).
+pub fn parse_proc(stat: &str, status: &str) -> ProcStats {
+    // Fields after the parenthesised command name (which may itself contain spaces): utime and stime are the 12th and 13th.
+    let after: Vec<&str> = stat.rsplit_once(") ").map_or("", |(_, r)| r).split_whitespace().collect();
+    let tick = |i: usize| after.get(i).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+    let kb = |key: &str| status.lines().find_map(|l| l.strip_prefix(key)?.split_whitespace().next()?.parse::<u64>().ok()).unwrap_or(0);
+    ProcStats {
+        cpu_seconds: (tick(11) + tick(12)) / CLOCK_TICKS,
+        resident_bytes: kb("VmRSS:") * 1024,
+        resident_peak_bytes: kb("VmHWM:") * 1024,
+        virtual_bytes: kb("VmSize:") * 1024,
+        threads: kb("Threads:"),
+    }
+}
+
+fn proc_stats() -> ProcStats {
+    let read = |p| std::fs::read_to_string(p).unwrap_or_default();
+    parse_proc(&read("/proc/self/stat"), &read("/proc/self/status"))
+}
+
 pub fn render() -> String {
     let mut out = format!(
         "# TYPE vaani_calls_active gauge\nvaani_calls_active {}\n\
@@ -55,6 +89,19 @@ pub fn render() -> String {
         CAMPAIGNS_COMPLETED.load(Relaxed),
         CAMPAIGN_CALLS_IN_FLIGHT.load(Relaxed),
     );
+    let p = proc_stats();
+    let open_fds = std::fs::read_dir("/proc/self/fd").map_or(0, |d| d.count());
+    let tasks = tokio::runtime::Handle::try_current().map_or(0, |h| h.metrics().num_alive_tasks());
+    out.push_str(&format!(
+        "# TYPE process_cpu_seconds_total counter\nprocess_cpu_seconds_total {:.2}\n\
+         # TYPE process_resident_memory_bytes gauge\nprocess_resident_memory_bytes {}\n\
+         # TYPE process_resident_memory_peak_bytes gauge\nprocess_resident_memory_peak_bytes {}\n\
+         # TYPE process_virtual_memory_bytes gauge\nprocess_virtual_memory_bytes {}\n\
+         # TYPE process_threads gauge\nprocess_threads {}\n\
+         # TYPE process_open_fds gauge\nprocess_open_fds {open_fds}\n\
+         # TYPE vaani_tokio_alive_tasks gauge\nvaani_tokio_alive_tasks {tasks}\n",
+        p.cpu_seconds, p.resident_bytes, p.resident_peak_bytes, p.virtual_bytes, p.threads
+    ));
     out.push_str("# TYPE vaani_campaign_outcomes_total counter\n");
     for (l, c) in OUTCOME_LABELS.iter().zip(&CAMPAIGN_OUTCOMES) {
         out.push_str(&format!("vaani_campaign_outcomes_total{{status=\"{l}\"}} {}\n", c.load(Relaxed)));
@@ -89,5 +136,42 @@ pub async fn serve(addr: String) {
                 format!("HTTP/1.1 {code}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
             let _ = s.write_all(resp.as_bytes()).await;
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_cpu_time_and_memory_like_the_kernel_writes_them() {
+        // The command name can hold spaces and parentheses; utime=250, stime=50 ticks -> 3.00s.
+        let stat = "123 (va ani) x) S 1 123 123 0 -1 4194304 100 0 0 0 250 50 0 0 20 0 9 0 5000 1000000 500 18446744073709551615";
+        let status = "Name:\tvaani\nVmPeak:\t  900000 kB\nVmSize:\t  800000 kB\nVmHWM:\t   60000 kB\nVmRSS:\t   51200 kB\nThreads:\t17\n";
+        assert_eq!(
+            parse_proc(stat, status),
+            ProcStats {
+                cpu_seconds: 3.0,
+                resident_bytes: 51200 * 1024,
+                resident_peak_bytes: 60000 * 1024,
+                virtual_bytes: 800000 * 1024,
+                threads: 17
+            }
+        );
+        assert_eq!(parse_proc("", ""), ProcStats::default(), "unreadable input is zeros, not a panic");
+    }
+
+    #[tokio::test]
+    async fn the_endpoint_reports_this_processs_own_numbers() {
+        let m = render();
+        let value = |name: &str| {
+            m.lines().find_map(|l| l.strip_prefix(name)?.trim().parse::<f64>().ok()).unwrap_or_else(|| panic!("{name} missing from\n{m}"))
+        };
+        if cfg!(target_os = "linux") {
+            assert!(value("process_resident_memory_bytes ") > 1_000_000.0, "a running test binary holds more than 1 MB");
+            assert!(value("process_threads ") >= 1.0 && value("process_open_fds ") >= 3.0);
+            assert!(value("process_resident_memory_peak_bytes ") >= value("process_resident_memory_bytes "));
+        }
+        assert!(value("vaani_tokio_alive_tasks ") >= 0.0 && value("process_cpu_seconds_total ") >= 0.0);
     }
 }
