@@ -248,3 +248,21 @@ pub(crate) async fn mock_minio_objects(objects: Vec<(String, Vec<u8>)>) -> Strin
     });
     addr
 }
+
+/// The slice of Dograh's schema campaigns use (types as Dograh has them: enum states, json documents).
+pub(crate) const CAMPAIGN_SCHEMA: &str = r#"
+    CREATE TYPE campaign_state AS ENUM ('created', 'running', 'paused', 'completed', 'failed');
+    CREATE TYPE queued_run_state AS ENUM ('queued', 'processing', 'processed', 'failed');
+    CREATE TABLE organization_configurations (id serial PRIMARY KEY, organization_id bigint, key text, value jsonb);
+    CREATE TABLE organizations (id bigint PRIMARY KEY, billing_mode text, billing_rate_per_min_inr numeric, wallet_balance_inr numeric, credit_limit_inr numeric);
+    CREATE TABLE workflows (id serial PRIMARY KEY, user_id int, organization_id int, released_definition_id int, template_context_variables jsonb, call_disposition_codes json);
+    CREATE TABLE workflow_definitions (id serial PRIMARY KEY, workflow_id int, workflow_json jsonb, template_context_variables jsonb, workflow_configurations jsonb, is_current bool);
+    CREATE TABLE campaigns (id serial PRIMARY KEY, organization_id int, workflow_id int, state campaign_state, rate_limit_per_second int DEFAULT 1,
+        retry_config json, orchestrator_metadata json, processed_rows int DEFAULT 0, failed_rows int DEFAULT 0, completed_at timestamptz);
+    CREATE TABLE queued_runs (id serial PRIMARY KEY, campaign_id int, source_uuid text, context_variables json, state queued_run_state DEFAULT 'queued',
+        retry_count int DEFAULT 0, parent_queued_run_id int, scheduled_for timestamptz, retry_reason text, created_at timestamptz DEFAULT now(),
+        processed_at timestamptz, UNIQUE (campaign_id, source_uuid, retry_count));
+    CREATE TABLE workflow_runs (id bigserial PRIMARY KEY, name text, workflow_id int, definition_id bigint, mode text, call_type text, state text,
+        is_completed bool, usage_info json, cost_info json, initial_context json, gathered_context json, logs json, annotations json,
+        created_at timestamptz, recording_url text, transcript_url text, storage_backend text, campaign_id int, queued_run_id int);
+"#;

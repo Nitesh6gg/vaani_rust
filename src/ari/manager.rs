@@ -16,7 +16,11 @@
 //! Every ARI-facing step runs off the event loop in its own task, so a slow
 //! REST call or database read for one call never stalls another's events.
 
-use super::{Ari, Event, uuid_v4};
+use super::{
+    Ari, Event,
+    outbound::{OUTBOUND_APP_ARG, OutboundCall},
+    uuid_v4,
+};
 use crate::{
     agent::{
         calllog, extract,
@@ -67,6 +71,8 @@ struct Call {
     info: CallInfo,
     external_id: String,
     cancel: CancellationToken,
+    /// Set for a call Vaani dialed.
+    out: Option<Arc<OutboundCall>>,
     /// Scopes the media plane and the agent (a child of `cancel`). A transfer
     /// cancels it to take the agent out of a call that carries on without it.
     media_cancel: CancellationToken,
@@ -108,7 +114,7 @@ fn percentiles(v: &[u64]) -> (Option<u64>, Option<u64>) {
 }
 
 pub struct Manager {
-    ari: Ari,
+    pub(super) ari: Ari,
     cfg: Arc<Config>,
     ports: PortAllocator,
     store: Store,
@@ -116,7 +122,9 @@ pub struct Manager {
     calls: Mutex<HashMap<String, Arc<Call>>>,
     /// Transfer destinations that are ringing, by channel id.
     transfers: Mutex<HashMap<String, mpsc::Sender<TransferSignal>>>,
-    tracker: TaskTracker,
+    /// Calls Vaani dialed, by channel id, from dialing until over.
+    pub(super) outbound: Mutex<HashMap<String, Arc<OutboundCall>>>,
+    pub(super) tracker: TaskTracker,
 }
 
 /// What happened to a ringing transfer destination.
@@ -136,6 +144,7 @@ impl Manager {
             store,
             calls: Mutex::new(HashMap::new()),
             transfers: Mutex::new(HashMap::new()),
+            outbound: Mutex::new(HashMap::new()),
             tracker: TaskTracker::new(),
         })
     }
@@ -152,6 +161,7 @@ impl Manager {
                 },
             }
         }
+        self.hangup_ringing_outbound();
         self.teardown_all();
         self.tracker.close();
         if tokio::time::timeout(Duration::from_secs(10), self.tracker.wait()).await.is_err() {
@@ -166,6 +176,10 @@ impl Manager {
                 // app, so it must not be mistaken for a new inbound call.
                 if args.first().is_some_and(|a| a == TRANSFER_APP_ARG) {
                     return self.on_transfer_answered(&channel.id);
+                }
+                // A call we dialed has been answered.
+                if args.first().is_some_and(|a| a == OUTBOUND_APP_ARG) {
+                    return self.on_outbound_answered(channel);
                 }
                 let found = self.calls.lock().unwrap().get(&channel.id).cloned();
                 match found {
@@ -195,6 +209,7 @@ impl Manager {
                 if let Some(tx) = self.transfers.lock().unwrap().get(&channel.id) {
                     let _ = tx.try_send(TransferSignal::Failed(format!("{cause_txt}, cause {cause}")));
                 }
+                self.on_outbound_destroyed(&channel.id, cause, &cause_txt);
             }
             // Events during the gap, StasisEnd above all, are unrecoverable: any
             // call spanning it may be over without us knowing -- a billable
@@ -209,11 +224,34 @@ impl Manager {
         }
     }
 
-    fn start_call(self: &Arc<Self>, channel: super::Channel) {
+    pub(super) fn start_call(self: &Arc<Self>, channel: super::Channel) {
+        // A call we dialed is already answered (it only enters Stasis on answer).
+        let out = self.outbound_for(&channel.id);
         let external_id = format!("vaani-ext-{}", &uuid_v4()[..13]);
         let cancel = CancellationToken::new();
         let call = Arc::new(Call {
-            info: CallInfo { id: channel.id.clone(), caller_number: channel.caller_number(), called_number: channel.called_number() },
+            info: match &out {
+                // The caller ID we showed, and the number we dialed.
+                Some(o) => CallInfo {
+                    id: channel.id.clone(),
+                    caller_number: o.caller_id.clone(),
+                    called_number: o.called.clone(),
+                    direction: "outbound",
+                    workflow_id: Some(o.workflow_id),
+                    run_id: Some(o.run_id),
+                    variables: o.variables.clone(),
+                },
+                None => CallInfo {
+                    id: channel.id.clone(),
+                    caller_number: channel.caller_number(),
+                    called_number: channel.called_number(),
+                    direction: "inbound",
+                    workflow_id: None,
+                    run_id: None,
+                    variables: Default::default(),
+                },
+            },
+            out,
             external_id: external_id.clone(),
             media_cancel: cancel.child_token(),
             cancel,
@@ -256,7 +294,9 @@ impl Manager {
     async fn setup(&self, call: &Arc<Call>) -> anyhow::Result<()> {
         use anyhow::Context;
         let id = &call.info.id;
-        self.ari.answer(id).await.context("answer")?;
+        if call.out.is_none() {
+            self.ari.answer(id).await.context("answer")?;
+        }
 
         let port = self.ports.alloc().context("no free media port")?;
         call.res.lock().unwrap().port = Some(port);
@@ -273,7 +313,7 @@ impl Manager {
             .context("externalMedia")?;
 
         tracing::info!(call_id = %id, event = "call.answered", external_id = %call.external_id, port,
-            caller_number = %call.info.caller_number, called_number = %call.info.called_number, direction = "inbound",
+            caller_number = %call.info.caller_number, called_number = %call.info.called_number, direction = call.info.direction,
             "call answered, media socket listening, externalMedia staged");
         Ok(())
     }
@@ -350,7 +390,12 @@ impl Manager {
 
         // The call's place in Dograh's history, created while the agent runs.
         let meta = prepared.run_meta();
-        let run = {
+        let run = if let Some(run_id) = call.info.run_id {
+            // An outbound call's run exists already (the dialer made it before dialing, so even an
+            // unanswered call is recorded): it starts now.
+            let store = self.store.clone();
+            tokio::spawn(async move { store.mark_run_running(run_id).await.map(|()| run_id) })
+        } else {
             let (store, meta, rc) = (
                 self.store.clone(),
                 meta.clone(),
@@ -363,6 +408,9 @@ impl Manager {
             tokio::spawn(async move { store.start_run(&meta, &rc).await })
         };
 
+        if let Some(out) = &call.out {
+            out.agent_started(); // from here its Dograh run is completed by the agent's own record
+        }
         let media = media_call::spawn(id.clone(), stream, self.cfg.media_dead_timeout, call.media_cancel.child_token());
         tracing::info!(call_id = %id, component = "media", event = "media.started", "audiosocket connected, media plane running");
         let stats = media.stats.clone();
@@ -464,6 +512,9 @@ impl Manager {
         }
         if first {
             tracing::debug!(call_id = %call.info.id, event = "call.teardown", "tearing down call");
+            if let Some(out) = &call.out {
+                self.finish_outbound(&call.info.id, out);
+            }
         }
         if bridge.is_none() && !ext && !first && transferred.is_none() {
             return;
@@ -884,7 +935,16 @@ mod tests {
     fn bare_call(id: &str, ext: &str) -> Arc<Call> {
         let cancel = CancellationToken::new();
         Arc::new(Call {
-            info: CallInfo { id: id.into(), caller_number: "98765".into(), called_number: "1000".into() },
+            info: CallInfo {
+                id: id.into(),
+                caller_number: "98765".into(),
+                called_number: "1000".into(),
+                direction: "inbound",
+                workflow_id: None,
+                run_id: None,
+                variables: Default::default(),
+            },
+            out: None,
             external_id: ext.into(),
             media_cancel: cancel.child_token(),
             cancel,
@@ -970,5 +1030,176 @@ mod tests {
         call3.cancel.cancel();
         assert!(dialing.await.unwrap().is_err());
         wait_for("the ringing destination hung up", || log.lock().unwrap().contains(&format!("DELETE /ari/channels/{dest3}"))).await;
+    }
+
+    fn dial_request(
+        run_id: i64,
+        ring: Duration,
+    ) -> (super::super::outbound::DialRequest, mpsc::UnboundedReceiver<super::super::outbound::Outcome>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let req = super::super::outbound::DialRequest {
+            endpoint: "PJSIP/9876543210@carrier".into(),
+            caller_id: "0739999".into(),
+            called: "+919876543210".into(),
+            ring_timeout: ring,
+            workflow_id: 42,
+            run_id,
+            variables: serde_json::json!({"name": "Asha"}).as_object().cloned().unwrap(),
+            done: Box::new(move |o| {
+                let _ = tx.send(o);
+            }),
+        };
+        (req, rx)
+    }
+
+    #[tokio::test]
+    async fn a_dialed_call_that_is_not_answered_reports_its_status_exactly_once() {
+        use super::super::outbound::Outcome;
+        let (ari_url, log, _ext) = mock_ari().await;
+        let Some((store, _)) = Store::for_test("t_outbound_unanswered", "SELECT 1").await else {
+            eprintln!("skipped: DOGRAH_TEST_DB_URL not set");
+            return;
+        };
+        let mgr = Manager::new(Ari::new(&ari_url, "u", "p", "vaani"), Arc::new(Config::for_test("")), store);
+
+        // Busy (17), rejected (21), anything else failed -- Dograh's mapping of the hangup cause.
+        for (cause, status) in [(17, "busy"), (21, "rejected"), (38, "failed"), (19, "no-answer")] {
+            let (req, mut done) = dial_request(77, Duration::from_secs(30));
+            let id = mgr.dial(req).await.unwrap();
+            let line = log.lock().unwrap().iter().rev().find(|l| l.contains(&id)).cloned().unwrap();
+            assert!(line.starts_with("POST /ari/channels?endpoint=PJSIP%2F9876543210%40carrier"), "{line}");
+            assert!(line.contains("appArgs=outbound%2C77") && line.contains("timeout=30") && line.contains("callerId=0739999"), "{line}");
+            mgr.on_event(Event::ChannelDestroyed { channel: channel(&id), cause, cause_txt: "x".into() });
+            mgr.on_event(Event::ChannelDestroyed { channel: channel(&id), cause: 16, cause_txt: "again".into() });
+            assert_eq!(done.recv().await.unwrap(), Outcome { connected: false, status, cause });
+            assert!(done.try_recv().is_err(), "Done is called exactly once");
+            assert!(mgr.outbound.lock().unwrap().is_empty());
+        }
+
+        // Asterisk never reports: the watchdog gives up, hangs the channel up, and calls it unanswered.
+        let (req, mut done) = dial_request(78, Duration::from_millis(50));
+        let id = mgr.dial(req).await.unwrap();
+        let out = tokio::time::timeout(Duration::from_secs(3), done.recv()).await.expect("the watchdog fires").unwrap();
+        assert_eq!((out.connected, out.status), (false, "no-answer"));
+        wait_for("the stuck channel hung up", || log.lock().unwrap().contains(&format!("DELETE /ari/channels/{id}"))).await;
+
+        // A leg answered after we gave up on it is hung up, not left connected to nothing.
+        mgr.on_event(Event::StasisStart { channel: channel(&id), args: vec!["outbound".into(), "78".into()] });
+        wait_for("the orphan hung up", || log.lock().unwrap().iter().filter(|l| **l == format!("DELETE /ari/channels/{id}")).count() >= 2)
+            .await;
+
+        // Nothing was dialed (Asterisk refused): an error, and Done is never called.
+        let dead = Manager::new(Ari::new("http://127.0.0.1:1/ari", "u", "p", "vaani"), Arc::new(Config::for_test("")), mgr.store.clone());
+        let (req, mut done) = dial_request(79, Duration::from_secs(30));
+        assert!(dead.dial(req).await.unwrap_err().to_string().contains("could not dial PJSIP/9876543210@carrier"));
+        assert!(done.try_recv().is_err() && dead.outbound.lock().unwrap().is_empty());
+    }
+
+    /// A dialed call that IS answered follows the inbound path -- minus the answer, which already
+    /// happened -- with the campaign's workflow, the contact's variables and the run the dialer made.
+    #[tokio::test]
+    async fn an_answered_outbound_call_runs_the_agent_on_the_dialers_run() {
+        use super::super::outbound::Outcome;
+        use crate::dograh::campaign::{Campaign, QueuedRun};
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (tts_url, _tts) = mock_tts(10).await;
+        let (stt_url, _stt_tx, _stt_audio, _) = mock_stt().await;
+        let (llm_url, llm_reqs) = mock_llm(|_| sse("Namaste Asha.")).await;
+        let (ari_url, log, mut ext_req) = mock_ari().await;
+        let Some((store, db_url)) = Store::for_test(
+            "t_outbound_answered",
+            &format!(
+                r#"{CAMPAIGN_SCHEMA}
+                CREATE TABLE user_configurations (id serial PRIMARY KEY, user_id int, configuration jsonb);
+                INSERT INTO user_configurations (user_id, configuration) VALUES (7, '{{
+                  "llm": {{"provider":"speaches","base_url":"{llm_url}","api_key":"k","model":"m"}},
+                  "stt": {{"provider":"sarvam","api_key":"k"}}, "tts": {{"provider":"sarvam","api_key":"k"}}}}');
+                INSERT INTO workflows (id, user_id, organization_id) VALUES (42, 7, 3);
+                INSERT INTO workflow_definitions (workflow_id, workflow_json, is_current)
+                  VALUES (42, '{{"nodes":[{{"id":"1","type":"startCall","data":{{"name":"Start","prompt":"Greet {{{{name}}}} at {{{{called_number}}}}","is_start":true}}}}]}}', true);"#
+            ),
+        )
+        .await
+        else {
+            eprintln!("skipped: DOGRAH_TEST_DB_URL not set");
+            return;
+        };
+        let mut cfg = Config::for_test(&db_url);
+        cfg.stt_ws_url = stt_url;
+        cfg.tts_ws_url = tts_url;
+        let check = store.clone();
+        let mgr = Manager::new(Ari::new(&ari_url, "u", "p", "vaani"), Arc::new(cfg), store.clone());
+
+        // The dialer creates the run first, then dials.
+        let campaign = Campaign { workflow_id: 42, ..Default::default() };
+        let run = store.create_outbound_run(&campaign, &QueuedRun::default(), "+919876543210", "0739999").await.unwrap();
+        let (req, mut done) = dial_request(run, Duration::from_secs(30));
+        let id = mgr.dial(req).await.unwrap();
+
+        // The callee answers: the channel enters Stasis with the "outbound" argument.
+        mgr.on_event(Event::StasisStart { channel: channel(&id), args: vec!["outbound".into(), run.to_string()] });
+        let ext = tokio::time::timeout(Duration::from_secs(5), ext_req.recv()).await.unwrap().unwrap();
+        assert!(
+            !log.lock().unwrap().iter().any(|l| l.ends_with("/answer")),
+            "a dialed call is already answered: {:?}",
+            log.lock().unwrap()
+        );
+
+        let mut asterisk = TcpStream::connect(ext["external_host"].as_str().unwrap()).await.unwrap();
+        let mut scratch = [0u8; audiosocket::HEADER_SIZE + FRAME_SIZE];
+        audiosocket::write_frame(&mut asterisk, &mut scratch, 0x01, ext["data"].as_str().unwrap().as_bytes()).await.unwrap();
+        mgr.on_event(Event::StasisStart { channel: channel(ext["channelId"].as_str().unwrap()), args: vec![] });
+        let (mut rd, mut wr) = asterisk.into_split();
+        tokio::spawn(async move {
+            let mut scratch = [0u8; audiosocket::HEADER_SIZE + FRAME_SIZE];
+            let mut tick = media_call::new_ticker();
+            loop {
+                tick.tick().await;
+                if audiosocket::write_frame(&mut wr, &mut scratch, audiosocket::KIND_SLIN16, &[0u8; FRAME_SIZE]).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let mut tone = 0;
+        tokio::time::timeout(Duration::from_secs(8), async {
+            while let Ok(audiosocket::Inbound::Audio(f)) = audiosocket::read_frame(&mut rd).await {
+                tone += usize::from(f[..2] == TONE.to_le_bytes());
+                if tone >= 10 {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(tone, 10, "the agent speaks on the dialed call");
+        assert_eq!(
+            llm_reqs.lock().unwrap()[0]["messages"][0]["content"],
+            "Greet Asha at +919876543210",
+            "the contact's variables and the dialed number"
+        );
+
+        // The dialer's run goes 'running' (not a second run).
+        let db = check.db().await.unwrap();
+        assert_eq!(db.query_one("SELECT state FROM workflow_runs WHERE id = $1", &[&run]).await.unwrap().get::<_, String>(0), "running");
+
+        // Hangup: the call is over -> Done(connected); the agent completes the SAME run.
+        mgr.on_event(Event::StasisEnd { channel: channel(&id) });
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), done.recv()).await.unwrap().unwrap(),
+            Outcome { connected: true, status: "", cause: 0 }
+        );
+        wait_for("the run to complete", || mgr.calls.lock().unwrap().is_empty()).await;
+        let mut row = None;
+        for _ in 0..200 {
+            let r = db.query_one("SELECT is_completed, state, (SELECT count(*) FROM workflow_runs), initial_context::text FROM workflow_runs WHERE id = $1", &[&run]).await.unwrap();
+            if r.get::<_, bool>(0) {
+                row = Some(r);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let row = row.expect("the dialer's run is completed by the agent");
+        assert_eq!((row.get::<_, String>(1).as_str(), row.get::<_, i64>(2)), ("completed", 1));
+        assert!(row.get::<_, String>(3).contains("\"called_number\":\"+919876543210\""), "the dialer's initial context survives");
     }
 }

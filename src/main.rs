@@ -7,6 +7,7 @@ mod ai;
 mod ari;
 mod assets;
 mod callagent;
+mod campaign;
 mod config;
 mod dograh;
 mod media;

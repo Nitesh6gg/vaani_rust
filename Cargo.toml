@@ -14,6 +14,7 @@ earshot = "1.2"
 futures-util = "0.3"
 hmac = "0.13"
 rand = "0.10"
+redis = { version = "1.8.1", features = ["tokio-comp", "connection-manager", "script"] }
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "json", "stream"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

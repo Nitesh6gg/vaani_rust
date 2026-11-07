@@ -1,5 +1,7 @@
 //! Dograh integration: agent configuration read from its Postgres.
 
+pub mod campaign;
+pub mod outbound;
 pub mod pricing;
 pub mod recordings;
 pub mod run;

@@ -315,7 +315,7 @@ impl Store {
     }
 
     /// The organization's DISPOSITION_CODE_MAPPING ({"user_hangup": "HU", ...}), if it has one.
-    async fn disposition_mapping(&self, org: Option<i64>) -> Option<Map<String, Value>> {
+    pub(super) async fn disposition_mapping(&self, org: Option<i64>) -> Option<Map<String, Value>> {
         let org = org?;
         let db = self.db().await.ok()?;
         let row = tokio::time::timeout(

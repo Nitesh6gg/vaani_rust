@@ -3,6 +3,7 @@
 //! calls a call needs.
 
 pub mod manager;
+pub mod outbound;
 
 use crate::ai::urlenc;
 use anyhow::{Context, Result, bail};
@@ -167,6 +168,8 @@ impl Ari {
             urlenc(channel_id),
             urlenc(caller_id)
         );
+        // No callerId when there is none: an empty one would blank the callee's caller ID.
+        let url = if caller_id.is_empty() { url.replace("&callerId=", "") } else { url };
         self.send(http().post(url), "originate").await
     }
 

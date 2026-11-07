@@ -30,6 +30,13 @@ pub struct CallInfo {
     pub id: String,
     pub caller_number: String,
     pub called_number: String,
+    /// "inbound", or "outbound" for a call Vaani dialed.
+    pub direction: &'static str,
+    /// An outbound campaign call has its own workflow, a Dograh run the dialer created before dialing,
+    /// and the contact's template variables; an inbound call uses DOGRAH_WORKFLOW_ID and gets a run created.
+    pub workflow_id: Option<i32>,
+    pub run_id: Option<i64>,
+    pub variables: serde_json::Map<String, Value>,
 }
 
 /// Everything a call needs before its media connection exists.
@@ -42,9 +49,11 @@ pub struct Prepared {
 /// Loads the workflow and opens the STT. Runs concurrently with Asterisk
 /// connecting the media socket, so neither waits for the other.
 pub async fn prepare(cfg: &Config, store: &Store, info: &CallInfo, cancel: &CancellationToken) -> Result<Prepared> {
-    let vars: Map<String, Value> =
-        json!({"caller_number": info.caller_number, "called_number": info.called_number}).as_object().cloned().unwrap_or_default();
-    let wf = tokio::time::timeout(LOAD_TIMEOUT, store.workflow(cfg.dograh_workflow_id, &vars))
+    // The contact's variables, over which the call's own numbers are laid.
+    let mut vars = info.variables.clone();
+    vars.insert("caller_number".into(), json!(info.caller_number));
+    vars.insert("called_number".into(), json!(info.called_number));
+    let wf = tokio::time::timeout(LOAD_TIMEOUT, store.workflow(info.workflow_id.unwrap_or(cfg.dograh_workflow_id), &vars))
         .await
         .context("dograh: workflow load timed out")??;
     for w in &wf.warnings {
