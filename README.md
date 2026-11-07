@@ -8,7 +8,7 @@ self-hosted **Dograh**'s Postgres, exactly as in the Go server — no model sett
 
 ## Status
 
-Milestones 1-3 are done except QA analysis and outbound campaigns (below): a Rust call is a complete call, recorded and priced in Dograh like one of its own, with transfers, extraction and the STT gate. Ported from Go:
+Milestones 1-3 are done except QA analysis (below): a Rust call is a complete call, recorded and priced in Dograh like one of its own, with transfers, extraction and the STT gate. Ported from Go:
 
 | Area | State |
 |---|---|
@@ -23,6 +23,7 @@ Milestones 1-3 are done except QA analysis and outbound campaigns (below): a Rus
 | **Recording + transcript** mixed to mono WAV and uploaded to Dograh's MinIO (hand-written SigV4, checked against the MinIO Python client) | done |
 | **Recorded clips**: audio greeting, audio transitions, tool messages, and the `● recording_id` / `▸ text` reply mode (MinIO → ffmpeg → trimmed, cached in memory and on disk) | done |
 | **`transfer_call`**: dial via ARI, hold audio while it rings, beep on answer, bridge swap, the agent leaves; failures go back to the LLM | done |
+| **Outbound campaigns** (`docs/OUTBOUND.md`): the dialer over Dograh's queue, org rate/concurrency in Dograh's own Redis keys and Lua scripts, retries, circuit breaker, schedule, wallet, restart recovery, `OUTBOUND_TEST_CALL` | done |
 | **Cost**: Dograh's pricing tables, `cost_info` breakdown, organization usage cycle and charge | done |
 | **Variable extraction** (per node on leaving it, and at call end after teardown) feeding `gathered_context`, the disposition and call tags | done |
 | **STT speech-only gate** (pre-roll, hangover, keepalive) and **early flush** | done |
@@ -31,9 +32,8 @@ Milestones 1-3 are done except QA analysis and outbound campaigns (below): a Rus
 Not ported yet (in rough priority order):
 
 1. QA analysis nodes (their tokens aren't priced yet)
-2. Outbound campaigns (`Manager.Dial`, Redis limiter) — ARI only
-3. Debug WAV recording, OpenTelemetry
-4. TLS to Dograh's Postgres (`tokio-postgres-rustls`)
+2. Debug WAV recording, OpenTelemetry
+3. TLS to Dograh's Postgres (`tokio-postgres-rustls`)
 
 Needs on the server: **ffmpeg** on `PATH` (recorded clips) and Dograh's `MINIO_*` settings (see below).
 
@@ -82,6 +82,7 @@ Same names as the Go server.
 | `SARVAM_STT_WS_URL` / `SARVAM_TTS_WS_URL` | Sarvam production | point at mocks for load runs |
 | `MINIO_ENDPOINT` `MINIO_ACCESS_KEY` `MINIO_SECRET_KEY` `MINIO_BUCKET` `MINIO_SECURE` | `` `` `` `voice-audio` `false` | Dograh's MinIO (host:port). Without an endpoint, recordings/transcripts aren't uploaded and recorded clips can't play |
 | `METRICS_ADDR` | `0.0.0.0:9091` | `/metrics`, `/healthz` |
+| `CAMPAIGNS_ENABLED` `REDIS_URL` `OUTBOUND_MAX_CALLS` `OUTBOUND_DEFAULT_ORG_CONCURRENCY` `CAMPAIGN_POLL_SECONDS` `OUTBOUND_RING_TIMEOUT_SECONDS` `OUTBOUND_TEST_CALL` | `0` `` `20` `2` `5` `30` `` | outbound campaigns; see `docs/OUTBOUND.md` |
 | `LOG_LEVEL` / `LOG_FORMAT` | `info` / text (`json`) | |
 
 Asterisk side: route calls into `Stasis(vaani)`; the externalMedia channel uses
@@ -95,8 +96,8 @@ cargo build --release && ./target/release/vaani
 
 cargo test                       # unit + mock-provider end-to-end tests (no network)
 
-# also run the tests that need a real Postgres (each uses its own schema):
-DOGRAH_TEST_DB_URL=postgres://postgres@127.0.0.1:5432/postgres cargo test
+# also run the tests that need a real Postgres (each uses its own schema) and Redis (campaign limiter and dialer):
+DOGRAH_TEST_DB_URL=postgres://postgres@127.0.0.1:5432/postgres REDIS_TEST_URL=redis://127.0.0.1:6379/ cargo test
 
 # rough capacity probe: N agents against shared mock providers (an upper bound,
 # the mocks run in the same process)

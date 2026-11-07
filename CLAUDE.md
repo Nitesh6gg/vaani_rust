@@ -13,6 +13,8 @@ to-port list.
   `calllog.rs` (Dograh's call-history events + summary), `recorder.rs` (mono mix + WAV), `recordings.rs` (`●`/`▸` reply router)
 - `src/dograh/` — Postgres reads: `store.rs`, `workflow.rs`, `services.rs`, `tools.rs`, `template.rs`;
   writes: `run.rs` (`workflow_runs`); MinIO: `storage.rs` (SigV4), `recordings.rs` (clips via ffmpeg)
+- `src/campaign/` — outbound campaigns (`docs/OUTBOUND.md`): `runner.rs` the dialer, `limiter.rs` Redis counters, `testcall.rs`;
+  `src/ari/outbound.rs` is `Manager::dial` (ARI only); `src/dograh/campaign.rs`/`outbound.rs` its tables
 - `src/callagent.rs` — builds a call's agent from Dograh; `src/testkit.rs` — mock Sarvam/LLM servers
 
 ## Invariants (from the Go repo; where they live here)

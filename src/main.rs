@@ -61,7 +61,30 @@ async fn main() -> Result<()> {
         }
     });
 
-    let manager = ari::manager::Manager::new(ari, cfg.clone(), store);
+    let manager = ari::manager::Manager::new(ari, cfg.clone(), store.clone());
+    let runner = if cfg.campaigns_enabled {
+        let lim = campaign::limiter::Limiter::connect(&cfg.redis_url, cfg.outbound_max_calls).await?;
+        let rcfg = campaign::runner::RunnerConfig {
+            poll: cfg.campaign_poll,
+            default_org_limit: cfg.outbound_default_org_concurrency,
+            ring_timeout: cfg.outbound_ring_timeout,
+        };
+        let placer: Arc<dyn campaign::runner::CallPlacer> = Arc::new(manager.clone());
+        let runner = campaign::runner::Runner::new(store.clone(), lim, placer.clone(), rcfg, cancel.clone());
+        tracing::info!(poll_s = cfg.campaign_poll.as_secs(), max_calls = cfg.outbound_max_calls, "outbound campaigns enabled");
+        if !cfg.outbound_test_call.is_empty() {
+            let tc = campaign::testcall::parse(&cfg.outbound_test_call)?;
+            let (st, ring) = (store.clone(), cfg.outbound_ring_timeout);
+            tokio::spawn(async move {
+                if let Err(e) = campaign::testcall::run(st, placer, tc, ring).await {
+                    tracing::error!(error = %format!("{e:#}"), "outbound test call failed");
+                }
+            });
+        }
+        Some(tokio::spawn(runner.run()))
+    } else {
+        None
+    };
     let run = tokio::spawn(manager.run(ev_rx, cancel.clone()));
 
     tracing::info!(ari = %cfg.ari_url, app = %cfg.ari_app, media_ip = %cfg.media_ip,
@@ -70,6 +93,9 @@ async fn main() -> Result<()> {
     tracing::info!("shutting down");
     cancel.cancel();
     run.await.context("manager")?;
+    if let Some(r) = runner {
+        r.await.context("campaign runner")?;
+    }
     Ok(())
 }
 

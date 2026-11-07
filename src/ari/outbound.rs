@@ -71,7 +71,6 @@ struct State {
 
 /// A dialed call from origination until it is over.
 pub struct OutboundCall {
-    pub endpoint: String,
     pub caller_id: String,
     pub called: String,
     pub workflow_id: i32,
@@ -100,7 +99,6 @@ impl Manager {
     pub async fn dial(self: &Arc<Self>, req: DialRequest) -> Result<String> {
         let id = format!("vaani-out-{}", &uuid_v4()[..13]);
         let oc = Arc::new(OutboundCall {
-            endpoint: req.endpoint.clone(),
             caller_id: req.caller_id.clone(),
             called: req.called.clone(),
             workflow_id: req.workflow_id,

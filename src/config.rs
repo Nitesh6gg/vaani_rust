@@ -35,6 +35,18 @@ pub struct Config {
     /// A frame at least this loud also opens the gate (media::rms units). 0 = off.
     pub stt_gate_rms_floor: f64,
     pub metrics_addr: String,
+    /// Dial Dograh's campaigns for organizations whose media engine is "vaani" (needs `redis_url`).
+    pub campaigns_enabled: bool,
+    /// **Dograh's** Redis: the organizations' rate and concurrency counters live there, so limits hold across both engines.
+    pub redis_url: String,
+    /// Campaign calls this Vaani may have up at once (its own key, not Dograh's fleet cap). 0 = org limits only.
+    pub outbound_max_calls: u32,
+    /// The concurrent-call limit of an organization with none set (Dograh's default).
+    pub outbound_default_org_concurrency: i32,
+    pub campaign_poll: Duration,
+    pub outbound_ring_timeout: Duration,
+    /// "<number>,<org id>,<workflow id>": dial once at startup, outside any campaign.
+    pub outbound_test_call: String,
     /// Dograh's MinIO (its own MINIO_* settings, which live in its environment, not its database);
     /// without an endpoint recordings and transcripts aren't uploaded.
     pub minio_endpoint: String,
@@ -133,6 +145,13 @@ impl Config {
             ack_filter: get("BARGE_IN_ACK_FILTER", "1") == "1",
             ack_end_margin: ms("ACK_END_MARGIN_MS", 300)?,
             metrics_addr: get("METRICS_ADDR", "0.0.0.0:9091"),
+            campaigns_enabled: get("CAMPAIGNS_ENABLED", "0") == "1",
+            redis_url: get("REDIS_URL", ""),
+            outbound_max_calls: get_num("OUTBOUND_MAX_CALLS", 20)?,
+            outbound_default_org_concurrency: get_num("OUTBOUND_DEFAULT_ORG_CONCURRENCY", 2)?,
+            campaign_poll: secs("CAMPAIGN_POLL_SECONDS", 5)?,
+            outbound_ring_timeout: secs("OUTBOUND_RING_TIMEOUT_SECONDS", 30)?,
+            outbound_test_call: get("OUTBOUND_TEST_CALL", ""),
             minio_endpoint: get("MINIO_ENDPOINT", ""),
             minio_access_key: get("MINIO_ACCESS_KEY", ""),
             minio_secret_key: get("MINIO_SECRET_KEY", ""),
@@ -175,6 +194,18 @@ impl Config {
                 self.stt_flush_after.as_millis()
             );
         }
+        if self.campaigns_enabled && self.redis_url.is_empty() {
+            bail!("config: CAMPAIGNS_ENABLED=1 needs REDIS_URL (Dograh's Redis)");
+        }
+        if !(5..=300).contains(&self.outbound_ring_timeout.as_secs()) {
+            bail!("config: OUTBOUND_RING_TIMEOUT_SECONDS must be 5-300, got {}", self.outbound_ring_timeout.as_secs());
+        }
+        if self.outbound_default_org_concurrency < 1 || self.campaign_poll.is_zero() {
+            bail!("config: OUTBOUND_DEFAULT_ORG_CONCURRENCY and CAMPAIGN_POLL_SECONDS must be at least 1");
+        }
+        if !self.outbound_test_call.is_empty() {
+            crate::campaign::testcall::parse(&self.outbound_test_call)?;
+        }
         if self.dograh_db_url.is_empty() {
             bail!("config: DOGRAH_DB_URL is required (agent config is read from Dograh's Postgres)");
         }
@@ -207,6 +238,13 @@ impl Config {
             ack_filter: true,
             ack_end_margin: Duration::from_millis(300),
             metrics_addr: String::new(),
+            campaigns_enabled: false,
+            redis_url: String::new(),
+            outbound_max_calls: 20,
+            outbound_default_org_concurrency: 2,
+            campaign_poll: Duration::from_secs(5),
+            outbound_ring_timeout: Duration::from_secs(30),
+            outbound_test_call: String::new(),
             minio_endpoint: String::new(),
             minio_access_key: String::new(),
             minio_secret_key: String::new(),

@@ -290,6 +290,7 @@ impl Limiter {
 
     /// How many calls the organization has in flight, both engines together (stale slots included
     /// until the next acquire trims them).
+    #[cfg(test)]
     pub async fn active_slots(&self, org: i32) -> Result<i64> {
         redis::cmd("ZCARD").arg(concurrent_key(org)).query_async(&mut self.rdb.clone()).await.context("campaign: active slots")
     }
@@ -335,7 +336,8 @@ impl Limiter {
         breaker_result(&res)
     }
 
-    /// Clears the campaign's window, as Dograh does on resume.
+    /// Clears the campaign's window. Dograh does this itself on resume; here it's for tests.
+    #[cfg(test)]
     pub async fn reset_breaker(&self, campaign: i32) -> Result<()> {
         let (f, s) = breaker_keys(campaign);
         let _: i64 = redis::cmd("DEL").arg(f).arg(s).query_async(&mut self.rdb.clone()).await.context("campaign: reset breaker")?;

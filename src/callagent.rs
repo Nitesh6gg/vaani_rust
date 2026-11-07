@@ -18,7 +18,7 @@ use crate::{
     media::call::MediaIo,
 };
 use anyhow::{Context, Result};
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_util::sync::CancellationToken;
