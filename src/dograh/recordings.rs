@@ -5,7 +5,7 @@
 //! to 16kHz mono PCM, trimmed of leading/trailing silence, and cached in memory
 //! and on disk -- as Dograh does.
 
-use super::storage::Storage;
+use super::{storage::Storage, store::Cached};
 use crate::agent::workflow::Clip;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Deserializer};

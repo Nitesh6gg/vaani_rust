@@ -68,7 +68,7 @@ Same names as the Go server.
 | `MEDIA_PORT_BASE` / `MEDIA_PORT_COUNT` | `20000` / `256` | one TCP port per call |
 | `DOGRAH_DB_URL` | **required** | |
 | `DOGRAH_WORKFLOW_ID` | `0` | workflow run by inbound calls |
-| `DOGRAH_DB_MAX_CONNS` | `50` | |
+| `DOGRAH_DB_MAX_CONNS` | `80` | shared by the campaign dial workers and the calls being set up |
 | `BARGE_IN_ENABLED` | `1` | `0` = observe only |
 | `BARGE_IN_MIN_SPEECH_MS` / `BARGE_IN_GUARD_MS` | `200` / `300` | |
 | `BARGE_IN_POST_CUT_SILENCE_MS` | `1200` | |
@@ -83,6 +83,9 @@ Same names as the Go server.
 | `MINIO_ENDPOINT` `MINIO_ACCESS_KEY` `MINIO_SECRET_KEY` `MINIO_BUCKET` `MINIO_SECURE` | `` `` `` `voice-audio` `false` | Dograh's MinIO (host:port). Without an endpoint, recordings/transcripts aren't uploaded and recorded clips can't play |
 | `METRICS_ADDR` | `0.0.0.0:9091` | `/metrics`, `/healthz` |
 | `CAMPAIGNS_ENABLED` `REDIS_URL` `OUTBOUND_MAX_CALLS` `OUTBOUND_DEFAULT_ORG_CONCURRENCY` `CAMPAIGN_POLL_SECONDS` `OUTBOUND_RING_TIMEOUT_SECONDS` `OUTBOUND_TEST_CALL` | `0` `` `20` `2` `5` `30` `` | outbound campaigns; see `docs/OUTBOUND.md` |
+| `CAMPAIGN_DIAL_WORKERS` `OUTBOUND_MAX_SETUP` | `10` `30` | contacts of one campaign dialed at once; the dialer holds back while this many answered calls wait in setup (0 = no cap) |
+| `LOAD_SHED_CPU_PERCENT` `LOAD_SHED_RESUME_PERCENT` | `90` `80` | CPU guard: while the whole machine's CPU (5 s average) is at/over the first, new calls are refused (inbound hung up as congestion before answering, campaigns don't dial); calls in progress are never dropped. 0 = off. Linux only |
+| `ORPHAN_SWEEP_SECONDS` | `30` | every N s, hang up channels of this ARI app that Vaani lost track of (older than 90 s). Needs this Vaani to be the only one on its ARI app name. 0 = off |
 | `LOG_LEVEL` / `LOG_FORMAT` | `info` / text (`json`) | |
 
 Asterisk side: route calls into `Stasis(vaani)`; the externalMedia channel uses

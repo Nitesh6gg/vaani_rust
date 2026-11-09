@@ -4,6 +4,7 @@
 //! (event_handlers.py on_pipeline_finished, plus the recording and transcript
 //! uploads its process_workflow_completion job makes).
 
+use super::store::Cached;
 use super::{
     pricing::calculate_cost,
     services::Services,

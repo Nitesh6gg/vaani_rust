@@ -4,6 +4,7 @@
 
 pub mod manager;
 pub mod outbound;
+pub mod sweep;
 
 use crate::ai::urlenc;
 use anyhow::{Context, Result, bail};
@@ -21,6 +22,9 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct Channel {
     pub id: String,
+    /// "tech/name-id": an externalMedia channel over AudioSocket is "AudioSocket/host:port-uuid".
+    #[serde(default)]
+    pub name: String,
     #[serde(default)]
     pub caller: Option<Number>,
     #[serde(default)]
@@ -104,7 +108,7 @@ pub fn events_url(base: &str, app: &str, user: &str, pass: &str) -> Result<Strin
 /// Dedicated to the ARI REST calls, with a bounded timeout so a hung Asterisk
 /// can't block call setup forever. This isn't the "shared client for hot-path
 /// provider calls" of invariant #5: it fires a handful of times per call.
-fn http() -> &'static reqwest::Client {
+pub(crate) fn http() -> &'static reqwest::Client {
     static C: OnceLock<reqwest::Client> = OnceLock::new();
     C.get_or_init(|| reqwest::Client::builder().timeout(Duration::from_secs(10)).build().expect("ari http client"))
 }
@@ -139,6 +143,11 @@ impl Ari {
 
     pub async fn hangup(&self, channel: &str) -> Result<()> {
         self.send(http().delete(format!("{}/channels/{channel}", self.base)), "hangup").await
+    }
+
+    /// Hangs a channel up with a SIP-visible reason ("congestion" is a 503, "busy" a 486).
+    pub async fn hangup_reason(&self, channel: &str, reason: &str) -> Result<()> {
+        self.send(http().delete(format!("{}/channels/{channel}?reason={}", self.base, urlenc(reason))), "hangup").await
     }
 
     pub async fn create_bridge(&self, id: &str) -> Result<()> {

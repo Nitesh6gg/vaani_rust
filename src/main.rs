@@ -10,6 +10,7 @@ mod callagent;
 mod campaign;
 mod config;
 mod dograh;
+mod load;
 mod media;
 mod metrics;
 #[cfg(test)]
@@ -62,16 +63,42 @@ async fn main() -> Result<()> {
     });
 
     let manager = ari::manager::Manager::new(ari, cfg.clone(), store.clone());
+
+    // Over LOAD_SHED_CPU_PERCENT: no new calls, in or out (calls up are kept).
+    let guard = load::Guard::new(cfg.load_shed_cpu_percent, cfg.load_resume_percent).map(Arc::new);
+    let overloaded: Option<campaign::runner::Probe<bool>> =
+        guard.clone().map(|g| Arc::new(move || g.overloaded()) as campaign::runner::Probe<bool>);
+    if let Some(g) = guard {
+        tokio::spawn({
+            let cancel = cancel.clone();
+            async move { g.run(cancel).await }
+        });
+    }
+    if let Some(f) = overloaded.clone() {
+        manager.set_overloaded(f);
+    }
     let runner = if cfg.campaigns_enabled {
         let lim = campaign::limiter::Limiter::connect(&cfg.redis_url, cfg.outbound_max_calls).await?;
         let rcfg = campaign::runner::RunnerConfig {
             poll: cfg.campaign_poll,
             default_org_limit: cfg.outbound_default_org_concurrency,
             ring_timeout: cfg.outbound_ring_timeout,
+            workers: cfg.campaign_dial_workers,
+            overloaded,
+            setting_up: Some({
+                let m = manager.clone();
+                Arc::new(move || m.setting_up()) as campaign::runner::Probe<usize>
+            }),
+            max_setting_up: cfg.outbound_max_setup,
         };
         let placer: Arc<dyn campaign::runner::CallPlacer> = Arc::new(manager.clone());
         let runner = campaign::runner::Runner::new(store.clone(), lim, placer.clone(), rcfg, cancel.clone());
-        tracing::info!(poll_s = cfg.campaign_poll.as_secs(), max_calls = cfg.outbound_max_calls, "outbound campaigns enabled");
+        tracing::info!(
+            poll_s = cfg.campaign_poll.as_secs(),
+            max_calls = cfg.outbound_max_calls,
+            dial_workers = cfg.campaign_dial_workers,
+            "outbound campaigns enabled"
+        );
         if !cfg.outbound_test_call.is_empty() {
             let tc = campaign::testcall::parse(&cfg.outbound_test_call)?;
             let (st, ring) = (store.clone(), cfg.outbound_ring_timeout);

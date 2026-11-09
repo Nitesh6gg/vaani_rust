@@ -15,6 +15,8 @@ to-port list.
   writes: `run.rs` (`workflow_runs`); MinIO: `storage.rs` (SigV4), `recordings.rs` (clips via ffmpeg)
 - `src/campaign/` — outbound campaigns (`docs/OUTBOUND.md`): `runner.rs` the dialer, `limiter.rs` Redis counters, `testcall.rs`;
   `src/ari/outbound.rs` is `Manager::dial` (ARI only); `src/dograh/campaign.rs`/`outbound.rs` its tables
+- `src/load.rs` — CPU guard (`LOAD_SHED_CPU_PERCENT`): refuse *new* calls while the machine is over the limit; `src/ari/sweep.rs` —
+  hangs up channels of our Stasis app that nothing tracks (`ORPHAN_SWEEP_SECONDS`)
 - `src/callagent.rs` — builds a call's agent from Dograh; `src/testkit.rs` — mock Sarvam/LLM servers
 
 ## Invariants (from the Go repo; where they live here)
@@ -33,6 +35,8 @@ to-port list.
 10. n/a (RTP). 11. **AudioSocket frame = ONE write** (`audiosocket::write_frame`, 643-byte buffer).
 
 ## Conventions
+- Dograh queries: `use super::store::Cached` wherever `db.query(...)` is called, so statements are prepared once per
+  connection (tokio-postgres's own `query(&str)` is two round trips). The dialer's pre-dial read is one query, `Store::dial_check`.
 - Errors: `anyhow` with `.context()`, never panic in the request path. Logging: `tracing`, `call_id` on
   every call line, an `event` field (`turn.user`, `call.summary`, …). INFO tells the call's story; detail is DEBUG.
 - Edition 2024: `gen` is reserved — use `generation`.

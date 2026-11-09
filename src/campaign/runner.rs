@@ -8,8 +8,8 @@ use crate::{
     ari::outbound::{DialRequest, Outcome},
     dograh::{
         Store,
-        campaign::{Campaign, QueuedRun, RunState},
-        outbound::{STATUS_BUSY, STATUS_FAILED, STATUS_NO_ANSWER, STATUS_REJECTED},
+        campaign::{Campaign, DialCheck, QueuedRun, RunState},
+        outbound::{DialSettings, STATUS_BUSY, STATUS_FAILED, STATUS_NO_ANSWER, STATUS_REJECTED},
     },
     metrics,
 };
@@ -36,7 +36,10 @@ impl CallPlacer for Arc<crate::ari::manager::Manager> {
     }
 }
 
-#[derive(Debug, Clone)]
+/// A reading the dialer takes before each dial (the CPU guard, the setup backlog).
+pub type Probe<T> = Arc<dyn Fn() -> T + Send + Sync>;
+
+#[derive(Clone)]
 pub struct RunnerConfig {
     /// How often Dograh's database is scanned for campaigns to dial.
     pub poll: Duration,
@@ -44,6 +47,40 @@ pub struct RunnerConfig {
     /// DEFAULT_ORG_CONCURRENCY_LIMIT, 2).
     pub default_org_limit: i32,
     pub ring_timeout: Duration,
+    /// How many contacts of one campaign are dialed at the same time (CAMPAIGN_DIAL_WORKERS); 0 means 1.
+    /// Dialing one contact takes ~10 round trips to Postgres, Redis and Asterisk, so one worker tops out
+    /// near 5 calls a second whatever the dial rate; the organization's rate and concurrency limits still
+    /// decide the real speed. At most twice this many workers run across all campaigns, so they can't
+    /// take the whole database pool from the calls being set up.
+    pub workers: usize,
+    /// Says the machine is too busy for another call: the dialer then places none and claims no
+    /// contact (LOAD_SHED_CPU_PERCENT).
+    pub overloaded: Option<Probe<bool>>,
+    /// How many answered calls are staged and not yet bridged, and the most the dialer lets pile up
+    /// (OUTBOUND_MAX_SETUP; 0 = no cap): it places no call while that many wait, so it never dials
+    /// faster than Vaani and Asterisk can set calls up.
+    pub setting_up: Option<Probe<usize>>,
+    pub max_setting_up: usize,
+}
+
+impl Default for RunnerConfig {
+    fn default() -> Self {
+        Self {
+            poll: Duration::from_secs(5),
+            default_org_limit: 2,
+            ring_timeout: Duration::from_secs(30),
+            workers: 1,
+            overloaded: None,
+            setting_up: None,
+            max_setting_up: 0,
+        }
+    }
+}
+
+/// How many calls per second campaign `c`'s organization may start: its DIAL_RATE_LIMIT_PER_SECOND,
+/// which overrides the campaign's own rate_limit_per_second, or that rate when the organization has none set.
+fn dial_rate(c: &Campaign, chk: &DialCheck) -> i32 {
+    chk.dial_rate.map_or(c.rate_per_second, |r| r.max(1))
 }
 
 /// What one attempt to dial a contact came to.
@@ -58,8 +95,9 @@ enum Step {
 
 #[derive(Default)]
 struct State {
-    /// Campaigns a drain task is working on.
-    draining: HashSet<i32>,
+    /// Dial workers running, per campaign, and in all.
+    workers: HashMap<i32, usize>,
+    total_workers: usize,
     /// Calls placed and not yet over, per campaign.
     inflight: HashMap<i32, i64>,
     live_runs: HashSet<i64>,
@@ -74,6 +112,7 @@ pub struct Runner {
     cancel: CancellationToken,
     state: Mutex<State>,
     wake: Notify,
+    tracker: tokio_util::task::TaskTracker,
 }
 
 fn phone_of(vars: &serde_json::Map<String, Value>) -> String {
@@ -95,7 +134,7 @@ fn retry_reason(status: &str) -> Option<&'static str> {
 
 impl Runner {
     pub fn new(store: Store, lim: Limiter, placer: Arc<dyn CallPlacer>, cfg: RunnerConfig, cancel: CancellationToken) -> Arc<Self> {
-        Arc::new(Self { store, lim, placer, cfg, cancel, state: Mutex::default(), wake: Notify::new() })
+        Arc::new(Self { store, lim, placer, cfg, cancel, state: Mutex::default(), wake: Notify::new(), tracker: Default::default() })
     }
 
     /// Scans for campaigns until the runner's token is cancelled, then waits for the dialing tasks to stop.
@@ -105,9 +144,8 @@ impl Runner {
         let (mut poll, mut sweep) = (tokio::time::interval(self.cfg.poll), tokio::time::interval(Duration::from_secs(60)));
         poll.tick().await;
         sweep.tick().await;
-        let tracker = tokio_util::task::TaskTracker::new();
         loop {
-            self.scan(&tracker).await;
+            self.scan().await;
             tokio::select! {
                 _ = self.cancel.cancelled() => break,
                 _ = poll.tick() => {}
@@ -115,8 +153,8 @@ impl Runner {
                 _ = sweep.tick() => self.sweep(false).await,
             }
         }
-        tracker.close();
-        tracker.wait().await;
+        self.tracker.close();
+        self.tracker.wait().await;
     }
 
     /// Makes the next scan happen now (a call ended, so a slot is free).
@@ -124,7 +162,7 @@ impl Runner {
         self.wake.notify_one();
     }
 
-    async fn scan(self: &Arc<Self>, tracker: &tokio_util::task::TaskTracker) {
+    async fn scan(self: &Arc<Self>) {
         let campaigns = match self.store.vaani_campaigns().await {
             Ok((c, bad)) => {
                 for b in bad {
@@ -140,25 +178,49 @@ impl Runner {
             }
         };
         for c in campaigns {
-            if !self.state.lock().unwrap().draining.insert(c.id) {
-                continue; // a drain task is already on it
-            }
-            let me = self.clone();
-            tracker.spawn(async move {
-                me.drain(&c).await;
-                me.state.lock().unwrap().draining.remove(&c.id);
-            });
+            self.start_worker(&c, false);
         }
+    }
+
+    /// Starts a dial worker for campaign `c`, unless it has its share already. A scan starts one; each
+    /// worker that dials a contact starts the next (`grow`), up to `workers`, so a campaign with no room
+    /// (a full slot limit) costs one failed attempt per scan, not `workers` of them.
+    fn start_worker(self: &Arc<Self>, c: &Campaign, grow: bool) {
+        let workers = self.cfg.workers.max(1);
+        {
+            let mut st = self.state.lock().unwrap();
+            let n = st.workers.get(&c.id).copied().unwrap_or(0);
+            if n >= workers || st.total_workers >= 2 * workers || (!grow && n > 0) {
+                return;
+            }
+            *st.workers.entry(c.id).or_default() += 1;
+            st.total_workers += 1;
+        }
+        let (me, c) = (self.clone(), c.clone());
+        self.tracker.spawn(async move {
+            me.drain(&c).await;
+            let mut st = me.state.lock().unwrap();
+            if let Some(n) = st.workers.get_mut(&c.id) {
+                *n -= 1;
+                if *n == 0 {
+                    st.workers.remove(&c.id);
+                }
+            }
+            st.total_workers -= 1;
+        });
     }
 
     /// Dials campaign `c`'s contacts until it runs out of work or room.
     async fn drain(self: &Arc<Self>, c: &Campaign) {
         while !self.cancel.is_cancelled() {
             match self.dial_one(c).await {
-                Step::Dialed => {}
+                Step::Dialed => self.start_worker(c, true),
                 Step::Wait(d) => {
+                    // Workers waiting for the same token don't all ask again at once.
+                    let d = d.clamp(Duration::from_millis(10), Duration::from_secs(1));
+                    let d = d + Duration::from_micros(rand::random_range(0..=(d.as_micros() as u64 / 4)));
                     tokio::select! {
-                        _ = tokio::time::sleep(d.clamp(Duration::from_millis(10), Duration::from_secs(1))) => {}
+                        _ = tokio::time::sleep(d) => {}
                         _ = self.cancel.cancelled() => {}
                     }
                 }
@@ -194,39 +256,52 @@ impl Runner {
 
     /// How many calls campaign `c`'s organization may have at once: its CONCURRENT_CALL_LIMIT or the
     /// default, lowered by the campaign's own max_concurrency.
-    async fn org_limit(&self, c: &Campaign) -> Result<i32> {
-        let limit = self.store.org_concurrency_limit(c.organization_id).await?.unwrap_or(self.cfg.default_org_limit);
-        Ok(if c.max_concurrency > 0 && c.max_concurrency < limit { c.max_concurrency } else { limit })
-    }
-
-    /// How many calls per second campaign `c`'s organization may start: its DIAL_RATE_LIMIT_PER_SECOND,
-    /// which overrides the campaign's own rate_limit_per_second, or that rate when the organization has none set.
-    async fn dial_rate(&self, c: &Campaign) -> Result<i32> {
-        Ok(self.store.org_dial_rate(c.organization_id).await?.map_or(c.rate_per_second, |r| r.max(1)))
+    fn org_limit(&self, c: &Campaign, chk: &DialCheck) -> i32 {
+        let limit = chk.concurrent_max.unwrap_or(self.cfg.default_org_limit);
+        if c.max_concurrency > 0 && c.max_concurrency < limit { c.max_concurrency } else { limit }
     }
 
     /// Takes the next contact of campaign `c` and places the call, if the campaign is running, inside its
     /// window, healthy, paid for, and under the organization's rate and concurrency limits.
     async fn dial_one(self: &Arc<Self>, c: &Campaign) -> Step {
-        if !self.store.campaign_running(c.id).await.unwrap_or(false) || !c.schedule.allows(Utc::now()) {
+        // Before anything is read, taken or claimed: nothing to give back, and the campaign carries on by
+        // itself once the CPU is back under the limit or the calls waiting in setup are bridged.
+        if self.cfg.overloaded.as_ref().is_some_and(|f| f()) {
+            metrics::call_rejected("cpu", "outbound");
+            return Step::Wait(Duration::from_secs(1));
+        }
+        if self.cfg.max_setting_up > 0 && self.cfg.setting_up.as_ref().is_some_and(|f| f() >= self.cfg.max_setting_up) {
+            metrics::call_rejected("setup", "outbound");
+            return Step::Wait(Duration::from_millis(200));
+        }
+
+        // The database checks and the breaker (Redis) don't depend on each other: one round trip each, at once.
+        let (chk, breaker) = tokio::join!(self.store.dial_check(c.id, c.organization_id), self.lim.breaker_open(c.id, &c.breaker));
+        let Ok(chk) = chk else { return Step::Stop };
+        if !chk.running || !c.schedule.allows(Utc::now()) {
             return Step::Stop;
         }
-        if let Ok((true, stats)) = self.lim.breaker_open(c.id, &c.breaker).await {
+        if let Ok((true, stats)) = breaker {
             self.pause(c, "breaker", &format!("circuit breaker: {} of {} calls failed", stats.failures, stats.total())).await;
             return Step::Stop;
         }
-        if self.store.wallet_blocks(c.organization_id).await {
+        if chk.wallet_blocks {
             self.pause(c, "wallet", "the organization's wallet is out of credit").await;
             return Step::Stop;
         }
-        let limit = match self.org_limit(c).await {
-            Ok(l) => l,
-            Err(e) => return self.limit_failed(c, "organization limit", e),
+        // Checked before a contact is claimed, so there is nothing to give back.
+        let Some(settings) = chk.settings.clone() else {
+            tracing::error!(component = "campaign", event = "campaign.place_failed", campaign_id = c.id,
+                error = %format!("organization {} has no telephony configuration", c.organization_id), "campaign: the organization's telephony settings are unreadable");
+            return Step::Stop;
         };
-        let rate = match self.dial_rate(c).await {
-            Ok(r) => r,
-            Err(e) => return self.limit_failed(c, "organization dial rate", e),
-        };
+        if settings.provider != "ari" {
+            self.pause(c, "provider", &format!("the organization's telephony provider is {:?}, not ari", settings.provider)).await;
+            tracing::error!(component = "campaign", event = "campaign.place_failed", campaign_id = c.id,
+                error = %format!("provider {:?}", settings.provider), "campaign: cannot dial over ARI");
+            return Step::Stop;
+        }
+        let (limit, rate) = (self.org_limit(c, &chk), dial_rate(c, &chk));
         match self.lim.acquire_token(c.organization_id, rate).await {
             Ok(true) => {}
             Ok(false) => return Step::Wait(self.lim.next_token_wait(c.organization_id).await),
@@ -239,7 +314,7 @@ impl Runner {
         };
 
         match self.store.claim_runs(c.id, 1, Utc::now()).await {
-            Ok(mut runs) if !runs.is_empty() => self.place(c, runs.remove(0), slot).await,
+            Ok(mut runs) if !runs.is_empty() => self.place(c, runs.remove(0), settings, slot).await,
             Ok(_) => {
                 self.release(&slot).await;
                 self.maybe_complete(c).await;
@@ -266,7 +341,7 @@ impl Runner {
 
     /// Dials claimed contact `q`. It owns `slot` from here: released when the call is over, or at once if
     /// it was never placed.
-    async fn place(self: &Arc<Self>, c: &Campaign, q: QueuedRun, slot: Slot) -> Step {
+    async fn place(self: &Arc<Self>, c: &Campaign, q: QueuedRun, settings: DialSettings, slot: Slot) -> Step {
         let phone = phone_of(&q.variables);
         if phone.is_empty() {
             tracing::warn!(
@@ -286,18 +361,6 @@ impl Runner {
             tracing::error!(component = "campaign", event = "campaign.place_failed", campaign_id = c.id, queued_run_id = q.id, error = %e, "campaign: {why}");
         };
 
-        let settings = match self.store.dial_settings(c.organization_id).await {
-            Ok(s) => s,
-            Err(e) => {
-                give_back("the organization's telephony settings are unreadable", format!("{e:#}"));
-                return self.give_back(&q, &slot).await;
-            }
-        };
-        if settings.provider != "ari" {
-            self.pause(c, "provider", &format!("the organization's telephony provider is {:?}, not ari", settings.provider)).await;
-            give_back("cannot dial over ARI", format!("provider {:?}", settings.provider));
-            return self.give_back(&q, &slot).await;
-        }
         let caller = settings.caller_id(c.workflow_id);
 
         let run_id = match self.store.create_outbound_run(c, &q, &phone, &caller).await {
@@ -542,11 +605,20 @@ mod tests {
     struct FakePlacer {
         placed: Placed,
         refuse: Arc<std::sync::atomic::AtomicBool>,
+        /// How long placing a call takes.
+        delay: Duration,
+        /// Placements going on now, and at most at once.
+        cur: Arc<std::sync::atomic::AtomicUsize>,
+        peak: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl CallPlacer for FakePlacer {
         fn dial(&self, req: DialRequest) -> BoxFuture<'_, Result<String>> {
             Box::pin(async move {
+                let now = self.cur.fetch_add(1, Relaxed) + 1;
+                self.peak.fetch_max(now, Relaxed);
+                tokio::time::sleep(self.delay).await;
+                self.cur.fetch_sub(1, Relaxed);
                 if self.refuse.load(Relaxed) {
                     anyhow::bail!("asterisk refused");
                 }
@@ -587,6 +659,21 @@ mod tests {
     /// A runner over a real Postgres and Redis (`DOGRAH_TEST_DB_URL`, `REDIS_TEST_URL`); `None` when either is unset.
     /// `contacts` are phone numbers; `retry` and `meta` are the campaign's JSON settings; `extra` more config rows/SQL.
     async fn rig(schema: &str, contacts: &[&str], retry: &str, meta: &str, extra: &str, org_limit: Option<i32>) -> Option<Rig> {
+        rig_with(schema, contacts, retry, meta, extra, org_limit, Duration::ZERO, |_| {}).await
+    }
+
+    /// `rig` with the placer's delay and a say in the runner's config.
+    #[allow(clippy::too_many_arguments)]
+    async fn rig_with(
+        schema: &str,
+        contacts: &[&str],
+        retry: &str,
+        meta: &str,
+        extra: &str,
+        org_limit: Option<i32>,
+        delay: Duration,
+        tweak: impl FnOnce(&mut RunnerConfig),
+    ) -> Option<Rig> {
         let redis = std::env::var("REDIS_TEST_URL").ok()?;
         // Ids no other run shares, so Redis counters from earlier runs can't interfere.
         let (org, campaign) = ((rand::random::<u32>() >> 8) as i32 + 1000, (rand::random::<u32>() >> 8) as i32 + 1000);
@@ -610,10 +697,16 @@ mod tests {
         )
         .replace("),;", ");");
         let (store, _) = Store::for_test(schema, &sql).await?;
-        let placer = FakePlacer::default();
+        let placer = FakePlacer { delay, ..Default::default() };
         let cancel = CancellationToken::new();
         let lim = Limiter::connect(&redis, 0).await.unwrap();
-        let cfg = RunnerConfig { poll: Duration::from_millis(50), default_org_limit: 2, ring_timeout: Duration::from_secs(30) };
+        let mut cfg = RunnerConfig {
+            poll: Duration::from_millis(50),
+            default_org_limit: 2,
+            ring_timeout: Duration::from_secs(30),
+            ..Default::default()
+        };
+        tweak(&mut cfg);
         let runner = Runner::new(store.clone(), lim, Arc::new(placer.clone()), cfg, cancel.clone());
         let task = tokio::spawn(runner.run());
         Some(Rig { store, placer, cancel, campaign, task })
@@ -814,6 +907,127 @@ mod tests {
         };
         wait_for("the recovered contact to be dialed", || r.placer.count() == 1).await;
         assert_eq!(r.placer.placed.lock().unwrap()[0].2, "+911");
+        r.cancel.cancel();
+        r.task.await.unwrap();
+    }
+
+    fn many(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("+9{i:05}")).collect()
+    }
+
+    async fn queued(r: &Rig) -> i64 {
+        let db = r.store.db().await.unwrap();
+        db.query_one("SELECT count(*) FROM queued_runs WHERE state::text = 'queued'", &[]).await.unwrap().get(0)
+    }
+
+    #[tokio::test]
+    async fn workers_dial_every_contact_exactly_once() {
+        let nums = many(100);
+        let refs: Vec<&str> = nums.iter().map(String::as_str).collect();
+        let Some(r) = rig_with("t_runner_workers", &refs, "{}", "{}", "", Some(100), Duration::from_millis(20), |c| c.workers = 10).await
+        else {
+            return eprintln!("skipped: DOGRAH_TEST_DB_URL / REDIS_TEST_URL not set");
+        };
+        wait_for("100 calls", || r.placer.count() == 100).await;
+        let run_ids: HashSet<i64> = r.placer.placed.lock().unwrap().iter().map(|p| p.4).collect();
+        assert_eq!(run_ids.len(), 100, "every call has its own run: no contact was dialed twice");
+        let db = r.store.db().await.unwrap();
+        let processed: i64 = db.query_one("SELECT count(*) FROM queued_runs WHERE state::text = 'processed'", &[]).await.unwrap().get(0);
+        assert_eq!(processed, 100);
+        assert_eq!(r.placer.peak.load(Relaxed), 10, "ramped up to the 10 workers, and no further");
+        r.cancel.cancel();
+        r.task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn workers_stay_under_the_org_limit_and_rate() {
+        let nums = many(100);
+        let refs: Vec<&str> = nums.iter().map(String::as_str).collect();
+        let Some(r) =
+            rig_with("t_runner_workers_limit", &refs, "{}", "{}", "", Some(30), Duration::from_millis(5), |c| c.workers = 10).await
+        else {
+            return eprintln!("skipped: DOGRAH_TEST_DB_URL / REDIS_TEST_URL not set");
+        };
+        wait_for("30 calls", || r.placer.count() == 30).await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(r.placer.count(), 30, "30 slots, however many workers");
+        assert_eq!(queued(&r).await, 70, "a contact is claimed only with a slot in hand");
+        r.cancel.cancel();
+        r.task.await.unwrap();
+
+        // The organization's dial rate is shared by the workers: 5 a second in all, not per worker.
+        let rate = "UPDATE organization_configurations SET value = '{\"value\": 5}' WHERE key = 'DIAL_RATE_LIMIT_PER_SECOND';";
+        let Some(r) =
+            rig_with("t_runner_workers_rate", &refs, "{}", "{}", rate, Some(100), Duration::from_millis(5), |c| c.workers = 10).await
+        else {
+            return;
+        };
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(r.placer.count(), 5, "within one rate window");
+        r.cancel.cancel();
+        r.task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_pause_stops_every_worker() {
+        let nums = many(200);
+        let refs: Vec<&str> = nums.iter().map(String::as_str).collect();
+        let Some(r) =
+            rig_with("t_runner_workers_pause", &refs, "{}", "{}", "", Some(200), Duration::from_millis(20), |c| c.workers = 10).await
+        else {
+            return eprintln!("skipped: DOGRAH_TEST_DB_URL / REDIS_TEST_URL not set");
+        };
+        wait_for("5 calls", || r.placer.count() >= 5).await;
+        assert!(r.store.set_campaign_state(r.campaign, "running", "paused").await.unwrap());
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let n = r.placer.count();
+        assert!(n < 40, "the 10 workers finish the contact in hand, no more: {n}");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(r.placer.count(), n, "nothing more is dialed");
+        r.cancel.cancel();
+        r.task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn nothing_is_dialed_or_claimed_while_overloaded_or_while_calls_pile_up_in_setup() {
+        let over = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let setting = Arc::new(std::sync::atomic::AtomicUsize::new(30));
+        let (o, s2) = (over.clone(), setting.clone());
+        let Some(r) = rig_with("t_runner_guard", &["+911", "+912", "+913"], "{}", "{}", "", Some(2), Duration::ZERO, move |c| {
+            c.overloaded = Some(Arc::new(move || o.load(Relaxed)));
+            c.setting_up = Some(Arc::new(move || s2.load(Relaxed)));
+            c.max_setting_up = 30;
+        })
+        .await
+        else {
+            return eprintln!("skipped: DOGRAH_TEST_DB_URL / REDIS_TEST_URL not set");
+        };
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(r.placer.count(), 0, "over the CPU limit");
+        assert_eq!(queued(&r).await, 3, "no contact claimed");
+        assert_eq!(campaign_state(&r).await, "running", "not a reason to pause the campaign");
+
+        over.store(false, Relaxed);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(r.placer.count(), 0, "30 answered calls are still waiting in setup");
+        assert_eq!(queued(&r).await, 3);
+
+        setting.store(29, Relaxed);
+        wait_for("dialing resumes (org limit 2)", || r.placer.count() == 2).await;
+        r.cancel.cancel();
+        r.task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_organization_without_telephony_settings_keeps_its_contacts() {
+        let gone = "DELETE FROM organization_configurations WHERE key = 'TELEPHONY_CONFIGURATION';";
+        let Some(r) = rig("t_runner_no_telephony", &["+911", "+912"], "{}", "{}", gone, Some(2)).await else {
+            return eprintln!("skipped: DOGRAH_TEST_DB_URL / REDIS_TEST_URL not set");
+        };
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(r.placer.count(), 0);
+        assert_eq!(queued(&r).await, 2, "checked before a contact is claimed");
+        assert_eq!(campaign_state(&r).await, "running", "an error to fix, not a reason to pause");
         r.cancel.cancel();
         r.task.await.unwrap();
     }

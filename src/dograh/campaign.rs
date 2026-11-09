@@ -3,7 +3,7 @@
 //! alone (api/services/campaign/media_engine.py). The defaults below are Dograh's,
 //! so a campaign behaves the same whichever engine dials.
 
-use super::Store;
+use super::{Store, outbound::DialSettings, store::Cached};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use serde::Deserialize;
@@ -230,28 +230,40 @@ impl Store {
         Ok((out, bad))
     }
 
-    /// The organization's CONCURRENT_CALL_LIMIT; `None` when it has none set (the caller uses its default).
-    pub async fn org_concurrency_limit(&self, org: i32) -> Result<Option<i32>> {
-        self.org_config_int(org, "CONCURRENT_CALL_LIMIT").await
-    }
-
-    /// The organization's DIAL_RATE_LIMIT_PER_SECOND (Dograh's superadmin page); `None` when it has
-    /// none set (the campaign's own rate_limit_per_second then applies).
-    pub async fn org_dial_rate(&self, org: i32) -> Result<Option<i32>> {
-        self.org_config_int(org, "DIAL_RATE_LIMIT_PER_SECOND").await
-    }
-
-    /// An integer organization_configurations value of the form {"value": n}; `None` when the row, or the number in it, is missing.
-    async fn org_config_int(&self, org: i32, key: &str) -> Result<Option<i32>> {
+    /// Everything the dialer needs before dialing a contact of campaign `campaign`, in one round trip.
+    /// The campaign's state is read fresh every time (not cached), so a Pause in Dograh's UI stops
+    /// dialing at the next contact. A campaign that doesn't exist is not running.
+    pub async fn dial_check(&self, campaign: i32, org: i32) -> Result<DialCheck> {
         let db = self.db().await?;
         let row = db
-            .query_opt("SELECT value::text FROM organization_configurations WHERE organization_id = $1::int AND key = $2", &[&org, &key])
+            .query_opt(
+                "SELECT c.state::text = 'running',
+                    (SELECT value::text FROM organization_configurations WHERE organization_id = $2::int AND key = 'CONCURRENT_CALL_LIMIT' LIMIT 1),
+                    (SELECT value::text FROM organization_configurations WHERE organization_id = $2::int AND key = 'DIAL_RATE_LIMIT_PER_SECOND' LIMIT 1),
+                    o.billing_mode::text, o.billing_rate_per_min_inr::float8, o.wallet_balance_inr::float8, o.credit_limit_inr::float8,
+                    t.v IS NOT NULL,
+                    COALESCE(t.v->>'provider', 'twilio'), COALESCE(t.v->>'sip_technology', 'PJSIP'),
+                    COALESCE(t.v->>'outbound_trunk', ''), COALESCE(t.v->>'strip_number_prefix', ''),
+                    COALESCE((t.v->'from_numbers')::text, '[]'), COALESCE((t.v->'number_workflow_map')::text, '{}')
+                 FROM campaigns c
+                 LEFT JOIN organizations o ON o.id = $2::int
+                 LEFT JOIN LATERAL (SELECT value::text::jsonb AS v FROM organization_configurations
+                                    WHERE organization_id = $2::int AND key = 'TELEPHONY_CONFIGURATION' LIMIT 1) t ON true
+                 WHERE c.id = $1::int",
+                &[&campaign, &org],
+            )
             .await
-            .with_context(|| format!("dograh: org {org} {key}"))?;
-        Ok(row
-            .and_then(|r| serde_json::from_str::<Value>(&r.get::<_, String>(0)).ok())
-            .and_then(|v| v.get("value")?.as_i64())
-            .map(|n| n as i32))
+            .with_context(|| format!("dograh: campaign {campaign} dial check"))?;
+        let Some(r) = row else { return Ok(DialCheck::default()) };
+        Ok(DialCheck {
+            running: r.get(0),
+            concurrent_max: r.get::<_, Option<String>>(1).as_deref().and_then(config_int),
+            dial_rate: r.get::<_, Option<String>>(2).as_deref().and_then(config_int),
+            wallet_blocks: wallet_blocks(r.get::<_, Option<String>>(3).as_deref(), r.get(4), r.get(5), r.get(6)),
+            settings: r.get::<_, bool>(7).then(|| {
+                DialSettings::from_columns(r.get(8), r.get(9), r.get(10), r.get(11), &r.get::<_, String>(12), &r.get::<_, String>(13))
+            }),
+        })
     }
 
     /// Takes up to `limit` runs that are due, scheduled retries first (the earliest first), then the
@@ -292,30 +304,29 @@ impl Store {
     /// stamps processed_at; 'failed' counts it in failed_rows. Both counters are incremented in SQL, so
     /// concurrent updates can't lose one.
     pub async fn set_run_state(&self, run: i32, state: RunState) -> Result<()> {
-        let mut db = self.db().await?;
-        let tx = db.transaction().await.with_context(|| format!("dograh: run {run}"))?;
+        let db = self.db().await?;
         let s = state.as_str();
-        let row = tx
-            .query_one(
-                "UPDATE queued_runs SET state = $2::text::queued_run_state,
+        // One statement, so one round trip: the run's new state and, for a contact that was handled, the
+        // campaign's counter.
+        let mut sql = String::from(
+            "WITH u AS (UPDATE queued_runs SET state = $2::text::queued_run_state,
                     processed_at = CASE WHEN $2::text = 'queued' THEN NULL ELSE now() END
-                 WHERE id = $1::int RETURNING campaign_id::int",
-                &[&run, &s],
-            )
-            .await
-            .with_context(|| format!("dograh: run {run} to {s}"))?;
-        let campaign: i32 = row.get(0);
+                 WHERE id = $1::int RETURNING campaign_id)",
+        );
         let column = match state {
             RunState::Processed => Some("processed_rows"),
             RunState::Failed => Some("failed_rows"),
             RunState::Queued => None,
         };
         if let Some(col) = column {
-            tx.execute(&format!("UPDATE campaigns SET {col} = {col} + 1 WHERE id = $1::int"), &[&campaign])
-                .await
-                .with_context(|| format!("dograh: campaign {campaign} counter"))?;
+            sql.push_str(&format!(", c AS (UPDATE campaigns SET {col} = {col} + 1 FROM u WHERE campaigns.id = u.campaign_id)"));
         }
-        tx.commit().await.map_err(Into::into)
+        sql.push_str(" SELECT count(*)::int FROM u");
+        let n: i32 = db.query_one(&sql, &[&run, &s]).await.with_context(|| format!("dograh: run {run} to {s}"))?.get(0);
+        if n == 0 {
+            bail!("dograh: run {run} to {s}: no such run");
+        }
+        Ok(())
     }
 
     /// Adds a new run for `run`'s contact, due after `delay`, as Dograh's orchestrator does: the same
@@ -341,16 +352,6 @@ impl Store {
         Ok(())
     }
 
-    /// Whether campaign `id` is still 'running': a Pause in Dograh's UI takes effect at the next call to be placed.
-    pub async fn campaign_running(&self, id: i32) -> Result<bool> {
-        let db = self.db().await?;
-        let row = db
-            .query_opt("SELECT state::text = 'running' FROM campaigns WHERE id = $1::int", &[&id])
-            .await
-            .with_context(|| format!("dograh: campaign {id} state"))?;
-        Ok(row.is_some_and(|r| r.get(0)))
-    }
-
     /// Moves a campaign from one state to another, only if it is still in `from` (a Pause or Resume made
     /// meanwhile in Dograh's UI wins). Says whether it moved.
     pub async fn set_campaign_state(&self, id: i32, from: &str, to: &str) -> Result<bool> {
@@ -369,22 +370,6 @@ impl Store {
             .await
             .with_context(|| format!("dograh: campaign {campaign} failed_rows"))?;
         Ok(())
-    }
-
-    /// Whether the organization's wallet forbids new calls: Dograh's wallet_blocks_calls /
-    /// can_start_call. Billing off, or a lookup that fails, never blocks.
-    pub async fn wallet_blocks(&self, org: i32) -> bool {
-        let Ok(db) = self.db().await else { return false };
-        let Ok(Some(r)) = db
-            .query_opt(
-                "SELECT billing_mode::text, billing_rate_per_min_inr::float8, wallet_balance_inr::float8, credit_limit_inr::float8 FROM organizations WHERE id = $1::int",
-                &[&org],
-            )
-            .await
-        else {
-            return false;
-        };
-        wallet_blocks(r.get::<_, Option<String>>(0).as_deref(), r.get(1), r.get(2), r.get(3))
     }
 
     /// Counts campaign `id`'s contacts still to be called ('queued', retries due later included) and
@@ -470,6 +455,25 @@ pub struct StaleRun {
     pub state: String,
 }
 
+/// What the dialer reads before dialing a contact (see `Store::dial_check`).
+#[derive(Debug, Clone, Default)]
+pub struct DialCheck {
+    /// The campaign is still 'running'.
+    pub running: bool,
+    /// The organization's CONCURRENT_CALL_LIMIT; `None` when it has none set (the caller uses its default).
+    pub concurrent_max: Option<i32>,
+    /// The organization's DIAL_RATE_LIMIT_PER_SECOND; `None` when it has none set (the campaign's own rate applies).
+    pub dial_rate: Option<i32>,
+    pub wallet_blocks: bool,
+    /// The organization's telephony configuration; `None` when it has none.
+    pub settings: Option<DialSettings>,
+}
+
+/// The integer in an organization_configurations value of the form {"value": n}.
+fn config_int(raw: &str) -> Option<i32> {
+    serde_json::from_str::<Value>(raw).ok()?.get("value")?.as_i64().map(|n| n as i32)
+}
+
 /// Dograh's can_start_call, inverted: prepaid needs at least a minute of balance; postpaid needs to be
 /// above its credit limit, if it has one.
 fn wallet_blocks(mode: Option<&str>, rate: Option<f64>, balance: Option<f64>, credit: Option<f64>) -> bool {
@@ -484,6 +488,7 @@ fn wallet_blocks(mode: Option<&str>, rate: Option<f64>, balance: Option<f64>, cr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::CAMPAIGN_SCHEMA;
     use chrono::TimeZone;
 
     fn campaign(retry: &str, meta: &str) -> Campaign {
@@ -590,14 +595,17 @@ mod tests {
             [(1, 3, 42, 1, 2)],
             "rate 0 -> at least 1"
         );
-        assert_eq!(
-            (
-                store.org_concurrency_limit(3).await.unwrap(),
-                store.org_dial_rate(3).await.unwrap(),
-                store.org_concurrency_limit(4).await.unwrap()
-            ),
-            (Some(7), Some(5), None)
-        );
+        // The dialer's pre-dial read, in one query: the organization's own keys, not each other's, and none
+        // where it has none; the telephony settings; a paused or missing campaign is not running.
+        let chk = store.dial_check(1, 3).await.unwrap();
+        assert_eq!((chk.running, chk.concurrent_max, chk.dial_rate, chk.wallet_blocks), (true, Some(7), Some(5), false));
+        let st = chk.settings.expect("org 3 has a telephony configuration");
+        assert_eq!((st.provider.as_str(), st.endpoint("+919876543210").as_str()), ("ari", "PJSIP/9876543210@carrier"));
+        let chk = store.dial_check(3, 4).await.unwrap();
+        assert_eq!((chk.running, chk.concurrent_max, chk.dial_rate), (true, None, None));
+        assert!(chk.settings.is_none(), "org 4 has no telephony configuration");
+        assert!(!store.dial_check(2, 3).await.unwrap().running, "paused: seen at once");
+        assert!(!store.dial_check(99, 3).await.unwrap().running, "no such campaign");
 
         // Scheduled retries first (earliest first), then loading order; a future retry isn't due.
         let now = Utc::now();
@@ -715,14 +723,73 @@ mod tests {
 
         // The campaign is complete once nothing is queued or being handled.
         assert!(!store.complete_campaign(2).await.unwrap(), "a paused campaign isn't completed");
-        assert!(
-            store.campaign_running(1).await.unwrap()
-                && !store.campaign_running(2).await.unwrap()
-                && !store.campaign_running(99).await.unwrap()
-        );
+        assert!(store.dial_check(1, 3).await.unwrap().running);
         assert!(store.set_campaign_state(1, "running", "paused").await.unwrap());
         assert!(!store.set_campaign_state(1, "running", "paused").await.unwrap(), "only from the state it is in");
         assert!(store.set_campaign_state(1, "paused", "running").await.unwrap());
         assert!(store.complete_campaign(1).await.unwrap() && !store.complete_campaign(1).await.unwrap());
+    }
+
+    /// The wallet rules reach the dialer through the same one query as Dograh's can_start_call.
+    #[tokio::test]
+    async fn dial_check_reads_the_wallet_like_dograhs_can_start_call() {
+        let Some((store, _)) = Store::for_test(
+            "t_dial_check_wallet",
+            &format!(
+                "{CAMPAIGN_SCHEMA}
+                 INSERT INTO organizations (id, billing_mode, billing_rate_per_min_inr, credit_limit_inr, wallet_balance_inr) VALUES
+                   (1, NULL, NULL, NULL, 0), (2, 'prepaid', 1.5, NULL, 1.4), (3, 'prepaid', 1.5, NULL, 1.5),
+                   (4, 'postpaid', 1.5, 100, -100), (5, 'postpaid', 1.5, 100, -99.99), (6, 'postpaid', 1.5, NULL, -5000);
+                 INSERT INTO campaigns (id, organization_id, workflow_id, state) VALUES (1, 1, 1, 'running');"
+            ),
+        )
+        .await
+        else {
+            return eprintln!("skipped: DOGRAH_TEST_DB_URL not set");
+        };
+        for (org, want) in [(1, false), (2, true), (3, false), (4, true), (5, false), (6, false), (99, false)] {
+            assert_eq!(store.dial_check(1, org).await.unwrap().wallet_blocks, want, "org {org}");
+        }
+    }
+
+    /// Dial workers finish contacts at the same time: no counter increment is lost.
+    #[tokio::test]
+    async fn concurrent_run_state_updates_lose_no_count() {
+        let Some((store, _)) = Store::for_test(
+            "t_run_state_concurrent",
+            &format!(
+                "{CAMPAIGN_SCHEMA}
+                 INSERT INTO campaigns (id, organization_id, workflow_id, state) VALUES (1, 1, 1, 'running');
+                 INSERT INTO queued_runs (campaign_id, source_uuid, state) SELECT 1, 'r' || g, 'processing' FROM generate_series(1, 40) g;"
+            ),
+        )
+        .await
+        else {
+            return eprintln!("skipped: DOGRAH_TEST_DB_URL not set");
+        };
+        let ids: Vec<i32> = store
+            .db()
+            .await
+            .unwrap()
+            .query("SELECT id FROM queued_runs ORDER BY id", &[])
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+        let tasks: Vec<_> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| {
+                let (store, id) = (store.clone(), *id);
+                tokio::spawn(async move { store.set_run_state(id, if i % 4 == 3 { RunState::Failed } else { RunState::Processed }).await })
+            })
+            .collect();
+        for t in tasks {
+            t.await.unwrap().unwrap();
+        }
+        let row = store.db().await.unwrap().query_one("SELECT processed_rows, failed_rows FROM campaigns WHERE id = 1", &[]).await.unwrap();
+        assert_eq!((row.get::<_, i32>(0), row.get::<_, i32>(1)), (30, 10));
+        assert!(store.set_run_state(9999, RunState::Processed).await.is_err(), "no such run");
     }
 }

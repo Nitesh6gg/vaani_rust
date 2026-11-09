@@ -28,6 +28,7 @@ use crate::{
         recorder,
     },
     callagent::{self, CallInfo},
+    campaign::runner::Probe,
     config::Config,
     dograh::{
         Store,
@@ -38,10 +39,13 @@ use crate::{
 };
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, atomic::Ordering::Relaxed},
+    sync::{Arc, Mutex, OnceLock, atomic::Ordering::Relaxed},
     time::Duration,
 };
-use tokio::{net::TcpListener, sync::mpsc};
+use tokio::{
+    net::TcpListener,
+    sync::{Semaphore, mpsc},
+};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 /// The first Stasis argument on a transfer destination's channel, so `on_event` can tell it
@@ -53,6 +57,10 @@ const TRANSFER_ANSWER_SLACK: Duration = Duration::from_secs(5);
 
 /// How long to wait for Asterisk to open the AudioSocket TCP connection after the bridge is up.
 const ACCEPT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The call setups (answer, externalMedia, bridge) running against Asterisk at once; a burst waits its
+/// turn here, in Vaani, instead of piling onto Asterisk.
+const MAX_CONCURRENT_SETUPS: usize = 16;
 
 #[derive(Default)]
 struct Res {
@@ -76,6 +84,8 @@ struct Call {
     /// Scopes the media plane and the agent (a child of `cancel`). A transfer
     /// cancels it to take the agent out of a call that carries on without it.
     media_cancel: CancellationToken,
+    /// Cancelled when the externalMedia channel enters Stasis: the setup timeout stops waiting for it.
+    arrived: CancellationToken,
     res: Mutex<Res>,
 }
 
@@ -125,6 +135,9 @@ pub struct Manager {
     /// Calls Vaani dialed, by channel id, from dialing until over.
     pub(super) outbound: Mutex<HashMap<String, Arc<OutboundCall>>>,
     pub(super) tracker: TaskTracker,
+    /// Says the machine is too busy for another call (the CPU guard); set once, before `run`.
+    overloaded: OnceLock<Probe<bool>>,
+    setup_sem: Arc<Semaphore>,
 }
 
 /// What happened to a ringing transfer destination.
@@ -146,17 +159,70 @@ impl Manager {
             transfers: Mutex::new(HashMap::new()),
             outbound: Mutex::new(HashMap::new()),
             tracker: TaskTracker::new(),
+            overloaded: OnceLock::new(),
+            setup_sem: Arc::new(Semaphore::new(MAX_CONCURRENT_SETUPS)),
         })
+    }
+
+    /// Refuses new inbound calls while `f` says the machine is overloaded (the CPU guard).
+    pub fn set_overloaded(&self, f: Probe<bool>) {
+        let _ = self.overloaded.set(f);
+    }
+
+    /// How many answered calls are staged and not yet bridged.
+    pub fn setting_up(&self) -> usize {
+        let calls = self.calls.lock().unwrap();
+        // Each call is in the map under both its channel ids: count it once, under its caller's.
+        calls
+            .iter()
+            .filter(|(id, c)| {
+                **id == c.info.id && {
+                    let r = c.res.lock().unwrap();
+                    !r.ended && !r.counted_active
+                }
+            })
+            .count()
+    }
+
+    /// Whether Vaani knows channel `id`: a call being set up or bridged (either leg, or a transfer
+    /// destination), a transfer ringing, or a call it dialed.
+    pub(super) fn tracks(&self, id: &str) -> bool {
+        self.calls.lock().unwrap().contains_key(id)
+            || self.transfers.lock().unwrap().contains_key(id)
+            || self.outbound.lock().unwrap().contains_key(id)
+    }
+
+    /// Every `ORPHAN_SWEEP_SECONDS`, hangs up the channels of this ARI app that Vaani lost track of.
+    async fn sweep_loop(self: Arc<Self>, cancel: CancellationToken) {
+        let mut tick = tokio::time::interval(self.cfg.orphan_sweep);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        tick.tick().await;
+        loop {
+            tokio::select! { _ = cancel.cancelled() => return, _ = tick.tick() => {} }
+            if !metrics::ARI_CONNECTED.load(Relaxed) {
+                continue;
+            }
+            if let Err(e) = super::sweep::sweep_once(&self.ari, &self.cfg.ari_app, chrono::Utc::now(), |id| self.tracks(id)).await {
+                tracing::warn!(event = "channel.sweep_failed", error = %format!("{e:#}"), "orphan channel sweep failed");
+            }
+        }
     }
 
     /// Dispatches events until `cancel`, then tears every call down and waits
     /// (bounded) for the calls' cleanup.
     pub async fn run(self: Arc<Self>, mut events: mpsc::UnboundedReceiver<Event>, cancel: CancellationToken) {
+        if !self.cfg.orphan_sweep.is_zero() {
+            self.tracker.spawn(self.clone().sweep_loop(cancel.clone()));
+        }
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => break,
                 ev = events.recv() => match ev {
-                    Some(ev) => self.on_event(ev),
+                    Some(ev) => {
+                        metrics::ARI_EVENT_QUEUE.store(events.len() as u64, Relaxed);
+                        self.on_event(ev);
+                        metrics::CALLS_SETTING_UP.store(self.setting_up() as u64, Relaxed);
+                    }
                     None => break,
                 },
             }
@@ -185,10 +251,21 @@ impl Manager {
                 match found {
                     // The externalMedia leg arriving: complete the bridge.
                     Some(call) if call.external_id == channel.id => {
+                        call.arrived.cancel();
                         let m = self.clone();
                         self.tracker.spawn(async move { m.complete_bridge(call).await });
                     }
                     Some(_) => {} // the caller leg again; nothing to do
+                    // A media channel of ours that no call is waiting for (its call was already torn down or
+                    // timed out) is not a new caller: hang it up.
+                    None if channel.name.starts_with("AudioSocket/") => {
+                        tracing::warn!(event = "call.media_orphan", channel_id = %channel.id, name = %channel.name,
+                            "media channel entered Stasis but its call is gone; hanging it up");
+                        let (m, id) = (self.clone(), channel.id);
+                        self.tracker.spawn(async move {
+                            let _ = m.ari.hangup(&id).await;
+                        });
+                    }
                     None => self.start_call(channel),
                 }
             }
@@ -227,6 +304,20 @@ impl Manager {
     pub(super) fn start_call(self: &Arc<Self>, channel: super::Channel) {
         // A call we dialed is already answered (it only enters Stasis on answer).
         let out = self.outbound_for(&channel.id);
+        // Over the CPU limit, a new caller is refused before it is answered, as congestion (SIP 503): the
+        // trunk can try another server, and the calls already up keep their CPU. Calls we placed ourselves
+        // are not refused here (the dialer stops placing them while overloaded).
+        if out.is_none() && self.overloaded.get().is_some_and(|f| f()) {
+            metrics::call_rejected("cpu", "inbound");
+            tracing::warn!(call_id = %channel.id, event = "call.rejected", reason = "cpu", "call refused: cpu over the limit");
+            let (m, id) = (self.clone(), channel.id);
+            self.tracker.spawn(async move {
+                if let Err(e) = m.ari.hangup_reason(&id, "congestion").await {
+                    tracing::debug!(call_id = %id, error = %e, "hangup failed");
+                }
+            });
+            return;
+        }
         let external_id = format!("vaani-ext-{}", &uuid_v4()[..13]);
         let cancel = CancellationToken::new();
         let call = Arc::new(Call {
@@ -255,6 +346,7 @@ impl Manager {
             external_id: external_id.clone(),
             media_cancel: cancel.child_token(),
             cancel,
+            arrived: CancellationToken::new(),
             res: Mutex::new(Res::default()),
         });
         {
@@ -280,6 +372,24 @@ impl Manager {
             });
         }
 
+        // If the media channel never enters Stasis (its event lost, Asterisk wedged) nothing else would
+        // ever end this call: hang it up after the setup timeout.
+        {
+            let (m, c) = (self.clone(), call.clone());
+            self.tracker.spawn(async move {
+                tokio::select! {
+                    _ = c.cancel.cancelled() => {}
+                    _ = c.arrived.cancelled() => {}
+                    _ = tokio::time::sleep(m.cfg.setup_timeout) => {
+                        tracing::warn!(call_id = %c.info.id, external_id = %c.external_id, event = "call.setup_timeout", after_s = m.cfg.setup_timeout.as_secs(),
+                            "call setup timed out: its media channel never entered Stasis; hanging it up");
+                        metrics::CALLS_SETUP_TIMEOUT.fetch_add(1, Relaxed);
+                        m.teardown(&c);
+                    }
+                }
+            });
+        }
+
         let m = self.clone();
         self.tracker.spawn(async move {
             if let Err(e) = m.setup(&call).await {
@@ -294,6 +404,8 @@ impl Manager {
     async fn setup(&self, call: &Arc<Call>) -> anyhow::Result<()> {
         use anyhow::Context;
         let id = &call.info.id;
+        // Only so many setups run against Asterisk at once; a burst waits here.
+        let _permit = self.setup_sem.acquire().await.context("setup limiter closed")?;
         if call.out.is_none() {
             self.ari.answer(id).await.context("answer")?;
         }
@@ -324,6 +436,7 @@ impl Manager {
         let bridge = format!("vaani-br-{}", &uuid_v4()[..13]);
         let res = async {
             use anyhow::Context;
+            let _permit = self.setup_sem.acquire().await.context("setup limiter closed")?;
             self.ari.create_bridge(&bridge).await.context("create bridge")?;
             call.res.lock().unwrap().bridge = Some(bridge.clone());
             self.ari.add_to_bridge(&bridge, &[id, &call.external_id]).await.context("add channels to bridge")
@@ -948,6 +1061,7 @@ mod tests {
             external_id: ext.into(),
             media_cancel: cancel.child_token(),
             cancel,
+            arrived: CancellationToken::new(),
             res: Mutex::new(Res { bridge: Some("br1".into()), external_requested: true, ..Default::default() }),
         })
     }
@@ -1201,5 +1315,96 @@ mod tests {
         let row = row.expect("the dialer's run is completed by the agent");
         assert_eq!((row.get::<_, String>(1).as_str(), row.get::<_, i64>(2)), ("completed", 1));
         assert!(row.get::<_, String>(3).contains("\"called_number\":\"+919876543210\""), "the dialer's initial context survives");
+    }
+
+    async fn guard_mgr(schema: &str, tweak: impl FnOnce(&mut Config)) -> Option<(Arc<Manager>, Arc<Mutex<Vec<String>>>)> {
+        let (ari_url, log, _ext) = mock_ari().await;
+        let (store, _) = Store::for_test(schema, "SELECT 1").await?;
+        let mut cfg = Config::for_test("");
+        tweak(&mut cfg);
+        Some((Manager::new(Ari::new(&ari_url, "u", "p", "vaani"), Arc::new(cfg), store), log))
+    }
+
+    fn logged(log: &Arc<Mutex<Vec<String>>>, needle: &str) -> bool {
+        log.lock().unwrap().iter().any(|l| l.contains(needle))
+    }
+
+    #[tokio::test]
+    async fn a_new_caller_is_refused_before_it_is_answered_while_overloaded() {
+        let Some((mgr, log)) = guard_mgr("t_mgr_overloaded", |_| {}).await else { return eprintln!("skipped: DOGRAH_TEST_DB_URL not set") };
+        mgr.set_overloaded(Arc::new(|| true));
+
+        mgr.on_event(Event::StasisStart { channel: channel("caller-9"), args: vec![] });
+
+        wait_for("the hangup", || logged(&log, "DELETE /ari/channels/caller-9?reason=congestion")).await;
+        assert!(!logged(&log, "/answer"), "never answered: {:?}", log.lock().unwrap());
+        assert!(mgr.calls.lock().unwrap().is_empty());
+        assert_eq!(mgr.ports.in_use(), 0, "nothing was allocated for it");
+    }
+
+    /// An answered call whose externalMedia channel never enters Stasis is hung up, its port freed.
+    #[tokio::test]
+    async fn setup_times_out_when_the_media_channel_never_arrives() {
+        let Some((mgr, log)) = guard_mgr("t_mgr_setup_timeout", |c| c.setup_timeout = Duration::from_millis(600)).await else {
+            return eprintln!("skipped: DOGRAH_TEST_DB_URL not set");
+        };
+        mgr.on_event(Event::StasisStart { channel: channel("caller-1"), args: vec![] });
+        wait_for("externalMedia requested", || logged(&log, "/channels/externalMedia")).await;
+        assert_eq!(mgr.setting_up(), 1);
+        assert_eq!(mgr.ports.in_use(), 1);
+
+        wait_for("the caller is hung up", || logged(&log, "DELETE /ari/channels/caller-1")).await;
+        wait_for("and the media channel", || logged(&log, "DELETE /ari/channels/vaani-ext-")).await;
+        assert_eq!(mgr.setting_up(), 0);
+        assert_eq!(mgr.ports.in_use(), 0, "the port is free again");
+    }
+
+    #[tokio::test]
+    async fn the_media_channel_arriving_stops_the_setup_timer() {
+        let Some((mgr, log)) = guard_mgr("t_mgr_setup_arrived", |c| c.setup_timeout = Duration::from_millis(600)).await else {
+            return eprintln!("skipped: DOGRAH_TEST_DB_URL not set");
+        };
+        mgr.on_event(Event::StasisStart { channel: channel("caller-1"), args: vec![] });
+        wait_for("externalMedia requested", || logged(&log, "/channels/externalMedia")).await;
+        let call = mgr.calls.lock().unwrap().get("caller-1").cloned().expect("staged");
+        assert!(!call.arrived.is_cancelled());
+
+        mgr.on_event(Event::StasisStart { channel: channel(&call.external_id), args: vec![] });
+        assert!(call.arrived.is_cancelled(), "the timer no longer waits for it");
+    }
+
+    /// A media channel whose call is already gone is hung up, not taken for a new caller.
+    #[tokio::test]
+    async fn a_stray_media_channel_is_hung_up() {
+        let Some((mgr, log)) = guard_mgr("t_mgr_stray", |_| {}).await else { return eprintln!("skipped: DOGRAH_TEST_DB_URL not set") };
+        let stray = Channel { id: "ext-9".into(), name: "AudioSocket/192.168.36.19:20101-x".into(), ..Default::default() };
+
+        mgr.on_event(Event::StasisStart { channel: stray, args: vec![] });
+
+        wait_for("the hangup", || logged(&log, "DELETE /ari/channels/ext-9")).await;
+        assert!(!logged(&log, "/answer"), "not a new caller");
+        assert_eq!(mgr.ports.in_use(), 0);
+        assert!(mgr.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn setting_up_counts_staged_calls_once_until_they_are_bridged() {
+        let Some((mgr, _log)) = guard_mgr("t_mgr_setting_up", |_| {}).await else {
+            return eprintln!("skipped: DOGRAH_TEST_DB_URL not set");
+        };
+        let (a, b) = (bare_call("a", "a-ext"), bare_call("b", "b-ext"));
+        mgr.calls.lock().unwrap().extend([
+            ("a".to_string(), a.clone()),
+            ("a-ext".to_string(), a.clone()),
+            ("b".to_string(), b.clone()),
+            ("b-ext".to_string(), b.clone()),
+        ]);
+        assert_eq!(mgr.setting_up(), 2, "each call once, though it is in the map under both channel ids");
+
+        a.res.lock().unwrap().counted_active = true; // bridged
+        assert_eq!(mgr.setting_up(), 1);
+        b.res.lock().unwrap().ended = true;
+        assert_eq!(mgr.setting_up(), 0);
+        assert!(mgr.tracks("a-ext") && !mgr.tracks("nobody"));
     }
 }

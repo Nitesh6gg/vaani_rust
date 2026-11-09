@@ -24,6 +24,8 @@ An organization's **media engine** decides. A superadmin sets it per organizatio
 | `OUTBOUND_MAX_CALLS` | 20 | Campaign calls this Vaani may have up at once (own key `vaani_capacity:calls`). 0 = org limits only. |
 | `OUTBOUND_DEFAULT_ORG_CONCURRENCY` | 2 | Limit of an organization with none set (Dograh's default). |
 | `CAMPAIGN_POLL_SECONDS` | 5 | How often Dograh's database is scanned. A call ending wakes the scan at once. |
+| `CAMPAIGN_DIAL_WORKERS` | 10 | Contacts of one campaign dialed at the same time (see "How fast it dials"). 1 = one at a time. |
+| `OUTBOUND_MAX_SETUP` | 30 | The dialer places no call while this many answered calls are still being set up (staged, not yet bridged). 0 = no cap. |
 | `OUTBOUND_RING_TIMEOUT_SECONDS` | 30 | Ring time before a call counts as unanswered (5-300). |
 | `OUTBOUND_TEST_CALL` | | `"<number>,<org id>,<workflow id>"`: dial once at startup, outside any campaign. |
 
@@ -33,11 +35,36 @@ string and caller ID (Vaani uses its own ARI connection from `.env`, never the c
 `<tech>/<number minus prefix>@<trunk>`, caller ID = the number mapped to the workflow, else the first of `from_numbers`.
 The Stasis app must be the one Vaani is connected as (`ARI_APP`): a dialed channel enters it on answer.
 
+## How fast it dials
+
+`DIAL_RATE_LIMIT_PER_SECOND` is a **maximum**, not a target. Dialing one contact is ~10 sequential round
+trips (Postgres, Redis, Asterisk), so one dial worker tops out near 5 calls a second whatever the limit.
+Each campaign therefore has up to `CAMPAIGN_DIAL_WORKERS` workers (default 10): a scan starts one, and
+every worker that dials a contact starts the next, so a campaign with no room (concurrency full) costs one
+attempt per scan, not ten. At most twice that many run in all campaigns. What they share is atomic:
+`FOR UPDATE SKIP LOCKED` hands each contact to one worker, and the rate and slot counters are Redis scripts.
+
+Round trips per dial are cut as well: the campaign's state, the organization's limits, wallet and
+telephony settings come in **one** query (`Store::dial_check`, read fresh every dial so a Pause takes
+effect at the next contact) together with the breaker check; the provider is checked *before* a contact
+is claimed; a contact's final state and the campaign's counter are one statement; and every Dograh query
+runs as a cached prepared statement (`dograh::store::Cached`: tokio-postgres otherwise prepares then runs
+every `query(&str)`, two round trips).
+
+The dialer also **follows the setup backlog**: it places no call while `OUTBOUND_MAX_SETUP` answered calls
+are staged and not yet bridged, and none while the CPU guard says the machine is overloaded.
+
+The real limits are, in order: the organization's concurrency limit, `OUTBOUND_MAX_CALLS`, the dial rate,
+and **your SIP trunk's calls-per-second limit** (ask the provider). On the Go server a dial rate of 100
+produced bursts of hangup cause 34 ("no circuit/channel available") from the trunk, and the breaker
+paused the campaign. **Ramp up**: set the organization's dial rate to 10, then 15, then 20, and stop one
+step below where cause 34 appears.
+
 ## One call
 
-1. The dialer finds a `running` campaign of a `vaani` organization (each scan; one drain task per campaign).
+1. The dialer finds a `running` campaign of a `vaani` organization (each scan starts one dial worker, which starts more as it dials).
 2. Checks, in order: campaign still running, inside its schedule window
-   (`orchestrator_metadata.schedule_config`; none = always), circuit breaker closed, wallet not empty.
+   (`orchestrator_metadata.schedule_config`; none = always), circuit breaker closed, wallet not empty, telephony provider `ari`.
 3. Takes a rate token and a concurrency slot (Redis), **then** claims one contact (`queued_runs`,
    scheduled retries first, `FOR UPDATE SKIP LOCKED`). A contact is never held while waiting for a slot.
    Concurrency and dial rate are both Dograh's superadmin → Organizations → **Concurrency** dialog

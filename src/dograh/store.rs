@@ -13,7 +13,7 @@ use chrono::Utc;
 use deadpool_postgres::{Pool, Runtime};
 use serde_json::{Map, Value};
 use std::time::Duration;
-use tokio_postgres::NoTls;
+use tokio_postgres::{NoTls, Row, types::ToSql};
 
 /// Dograh's backend defaults (api/services/pipecat/run_pipeline.py), used when
 /// the workflow's settings were never saved.
@@ -33,6 +33,41 @@ pub struct LoadedWorkflow {
     pub idle_timeout: Duration,
     pub max_duration: Duration,
     pub warnings: Vec<String>,
+}
+
+/// The queries of a pooled connection, with their statements prepared once per
+/// connection and cached. tokio-postgres's own `query(&str)` prepares the
+/// statement and then runs it: two round trips every time, and Dograh's
+/// Postgres is on another server. This trait is in scope wherever `db.query(...)`
+/// is called, and (being found before the deref to the plain client) takes its place.
+pub(crate) trait Cached {
+    async fn query(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<Row>, tokio_postgres::Error>;
+    async fn query_one(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Row, tokio_postgres::Error>;
+    async fn query_opt(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Option<Row>, tokio_postgres::Error>;
+    async fn execute(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<u64, tokio_postgres::Error>;
+}
+
+impl Cached for deadpool_postgres::Object {
+    async fn query(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<Row>, tokio_postgres::Error> {
+        let st = self.prepare_cached(sql).await?;
+        let client: &tokio_postgres::Client = self;
+        client.query(&st, params).await
+    }
+    async fn query_one(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Row, tokio_postgres::Error> {
+        let st = self.prepare_cached(sql).await?;
+        let client: &tokio_postgres::Client = self;
+        client.query_one(&st, params).await
+    }
+    async fn query_opt(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Option<Row>, tokio_postgres::Error> {
+        let st = self.prepare_cached(sql).await?;
+        let client: &tokio_postgres::Client = self;
+        client.query_opt(&st, params).await
+    }
+    async fn execute(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<u64, tokio_postgres::Error> {
+        let st = self.prepare_cached(sql).await?;
+        let client: &tokio_postgres::Client = self;
+        client.execute(&st, params).await
+    }
 }
 
 /// A connection pool to Dograh's database, shared by every call.

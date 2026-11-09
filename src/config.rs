@@ -44,6 +44,22 @@ pub struct Config {
     /// The concurrent-call limit of an organization with none set (Dograh's default).
     pub outbound_default_org_concurrency: i32,
     pub campaign_poll: Duration,
+    /// Contacts of one campaign dialed at the same time (CAMPAIGN_DIAL_WORKERS, default 10; 1 = one at a time).
+    pub campaign_dial_workers: usize,
+    /// The dialer places no call while this many answered calls are still being set up (staged, not yet
+    /// bridged): it never dials faster than Vaani and Asterisk can set calls up. 0 = no cap.
+    pub outbound_max_setup: usize,
+    /// How often Asterisk's channels are listed and those of this ARI app that Vaani lost track of are
+    /// hung up (ORPHAN_SWEEP_SECONDS, default 30; 0 = off). Needs this Vaani to be the only one on its ARI app name.
+    pub orphan_sweep: Duration,
+    /// A staged call whose media channel doesn't enter Stasis within this long is hung up (15 s; not a setting).
+    pub setup_timeout: Duration,
+    /// While the machine's CPU (a 5-second average, Asterisk included) is at or over this percent, new
+    /// calls are refused -- inbound ones hung up as congestion before they are answered, and campaigns
+    /// don't dial -- so the calls already up don't get jitter. Calls in progress are never dropped.
+    /// 0 = off. It must stay under for 10 seconds below `load_resume_percent` before calls are taken again.
+    pub load_shed_cpu_percent: u32,
+    pub load_resume_percent: u32,
     pub outbound_ring_timeout: Duration,
     /// "<number>,<org id>,<workflow id>": dial once at startup, outside any campaign.
     pub outbound_test_call: String,
@@ -136,7 +152,7 @@ impl Config {
             media_port_base: get_num("MEDIA_PORT_BASE", 20000)?,
             media_port_count: get_num("MEDIA_PORT_COUNT", 256)?,
             dograh_db_url: get("DOGRAH_DB_URL", ""),
-            dograh_db_max_conns: get_num("DOGRAH_DB_MAX_CONNS", 50)?,
+            dograh_db_max_conns: get_num("DOGRAH_DB_MAX_CONNS", 80)?,
             dograh_workflow_id: get_num("DOGRAH_WORKFLOW_ID", 0)?,
             barge_in_enabled: get("BARGE_IN_ENABLED", "1") == "1",
             barge_in_min_speech: ms("BARGE_IN_MIN_SPEECH_MS", 200)?,
@@ -150,6 +166,12 @@ impl Config {
             outbound_max_calls: get_num("OUTBOUND_MAX_CALLS", 20)?,
             outbound_default_org_concurrency: get_num("OUTBOUND_DEFAULT_ORG_CONCURRENCY", 2)?,
             campaign_poll: secs("CAMPAIGN_POLL_SECONDS", 5)?,
+            campaign_dial_workers: get_num("CAMPAIGN_DIAL_WORKERS", 10)?,
+            outbound_max_setup: get_num("OUTBOUND_MAX_SETUP", 30)?,
+            orphan_sweep: secs("ORPHAN_SWEEP_SECONDS", 30)?,
+            setup_timeout: Duration::from_secs(15),
+            load_shed_cpu_percent: get_num("LOAD_SHED_CPU_PERCENT", 90)?,
+            load_resume_percent: get_num("LOAD_SHED_RESUME_PERCENT", 80)?,
             outbound_ring_timeout: secs("OUTBOUND_RING_TIMEOUT_SECONDS", 30)?,
             outbound_test_call: get("OUTBOUND_TEST_CALL", ""),
             minio_endpoint: get("MINIO_ENDPOINT", ""),
@@ -203,6 +225,18 @@ impl Config {
         if self.outbound_default_org_concurrency < 1 || self.campaign_poll.is_zero() {
             bail!("config: OUTBOUND_DEFAULT_ORG_CONCURRENCY and CAMPAIGN_POLL_SECONDS must be at least 1");
         }
+        if self.campaign_dial_workers < 1 {
+            bail!("config: CAMPAIGN_DIAL_WORKERS must be at least 1, got {}", self.campaign_dial_workers);
+        }
+        if self.load_shed_cpu_percent > 100
+            || (self.load_shed_cpu_percent > 0 && !(1..self.load_shed_cpu_percent).contains(&self.load_resume_percent))
+        {
+            bail!(
+                "config: LOAD_SHED_CPU_PERCENT must be 0 (off) to 100, and LOAD_SHED_RESUME_PERCENT from 1 to below it, got {} and {}",
+                self.load_shed_cpu_percent,
+                self.load_resume_percent
+            );
+        }
         if !self.outbound_test_call.is_empty() {
             crate::campaign::testcall::parse(&self.outbound_test_call)?;
         }
@@ -244,6 +278,12 @@ impl Config {
             outbound_max_calls: 20,
             outbound_default_org_concurrency: 2,
             campaign_poll: Duration::from_secs(5),
+            campaign_dial_workers: 1,
+            outbound_max_setup: 0,
+            orphan_sweep: Duration::ZERO,
+            setup_timeout: Duration::from_secs(15),
+            load_shed_cpu_percent: 0,
+            load_resume_percent: 80,
             outbound_ring_timeout: Duration::from_secs(30),
             outbound_test_call: String::new(),
             minio_endpoint: String::new(),
@@ -266,5 +306,32 @@ impl Config {
             llm_max_failed_turns: 3,
             llm_fallback_text: String::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid() -> Config {
+        Config::for_test("postgres://x")
+    }
+
+    #[test]
+    fn the_cpu_guard_and_the_dial_workers_are_validated() {
+        let mut c = valid();
+        assert!(c.validate().is_ok());
+        c.load_shed_cpu_percent = 90;
+        c.load_resume_percent = 80;
+        assert!(c.validate().is_ok());
+        for (limit, resume) in [(101, 80), (90, 90), (90, 0), (90, 95)] {
+            (c.load_shed_cpu_percent, c.load_resume_percent) = (limit, resume);
+            assert!(c.validate().is_err(), "{limit}/{resume}");
+        }
+        c.load_shed_cpu_percent = 0; // off: the resume level doesn't matter
+        c.load_resume_percent = 0;
+        assert!(c.validate().is_ok());
+        c.campaign_dial_workers = 0;
+        assert!(c.validate().is_err());
     }
 }

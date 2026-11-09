@@ -3,6 +3,7 @@
 //! TELEPHONY_CONFIGURATION. Only the dial-string fields are read here: Vaani has
 //! its own ARI connection, so the config's ARI password is never touched.
 
+use super::store::Cached;
 use super::{
     Store,
     campaign::{Campaign, QueuedRun},
@@ -74,6 +75,49 @@ fn not_connected_disposition(status: &str) -> String {
     }
 }
 
+impl DialSettings {
+    /// A telephony configuration read as its columns: the provider, SIP technology, trunk and
+    /// strip prefix as text, and from_numbers / number_workflow_map as JSON text.
+    pub(crate) fn from_columns(
+        provider: String,
+        technology: String,
+        trunk: String,
+        strip_prefix: String,
+        from_json: &str,
+        map_json: &str,
+    ) -> Self {
+        let mut d = DialSettings {
+            provider,
+            technology: technology.trim().to_uppercase(),
+            trunk: trunk.trim().to_string(),
+            strip_prefix: strip_prefix.trim().to_string(),
+            ..Default::default()
+        };
+        if d.technology.is_empty() {
+            d.technology = "PJSIP".into();
+        }
+        // from_numbers is a list, or one string (Dograh accepts both).
+        d.from_numbers = match serde_json::from_str::<Value>(from_json) {
+            Ok(Value::Array(a)) => a.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
+            Ok(Value::String(s)) if !s.is_empty() => vec![s],
+            _ => vec![],
+        };
+        if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(map_json) {
+            for (phone, w) in map {
+                let id = match w {
+                    Value::Number(n) => n.as_i64().map(|n| n as i32),
+                    Value::String(s) => s.parse().ok(),
+                    _ => None,
+                };
+                if let Some(id) = id {
+                    d.workflow_cli.insert(id, phone);
+                }
+            }
+        }
+        d
+    }
+}
+
 impl Store {
     /// Organization `org`'s telephony configuration.
     pub async fn dial_settings(&self, org: i32) -> Result<DialSettings> {
@@ -91,35 +135,7 @@ impl Store {
             .with_context(|| format!("dograh: telephony configuration of organization {org}"))?;
         let Some(r) = row else { bail!("dograh: organization {org} has no telephony configuration") };
 
-        let mut d = DialSettings {
-            provider: r.get(0),
-            technology: r.get::<_, String>(1).trim().to_uppercase(),
-            trunk: r.get::<_, String>(2).trim().to_string(),
-            strip_prefix: r.get::<_, String>(3).trim().to_string(),
-            ..Default::default()
-        };
-        if d.technology.is_empty() {
-            d.technology = "PJSIP".into();
-        }
-        // from_numbers is a list, or one string (Dograh accepts both).
-        d.from_numbers = match serde_json::from_str::<Value>(&r.get::<_, String>(4)) {
-            Ok(Value::Array(a)) => a.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
-            Ok(Value::String(s)) if !s.is_empty() => vec![s],
-            _ => vec![],
-        };
-        if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&r.get::<_, String>(5)) {
-            for (phone, w) in map {
-                let id = match w {
-                    Value::Number(n) => n.as_i64().map(|n| n as i32),
-                    Value::String(s) => s.parse().ok(),
-                    _ => None,
-                };
-                if let Some(id) = id {
-                    d.workflow_cli.insert(id, phone);
-                }
-            }
-        }
-        Ok(d)
+        Ok(DialSettings::from_columns(r.get(0), r.get(1), r.get(2), r.get(3), &r.get::<_, String>(4), &r.get::<_, String>(5)))
     }
 
     /// Records a campaign call before it is dialed, as Dograh's dispatcher does, so even a call nobody

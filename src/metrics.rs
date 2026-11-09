@@ -36,6 +36,26 @@ pub fn campaign_pause(reason: &str) {
     }
 }
 
+// Load and call setup.
+/// The machine's CPU use over the last 5 seconds, in thousandths (`vaani_cpu_load_ratio`).
+pub static CPU_LOAD_PERMILLE: AtomicU64 = AtomicU64::new(0);
+pub static OVERLOADED: AtomicBool = AtomicBool::new(false);
+/// `vaani_calls_rejected_total{reason,direction}`: calls refused or held back.
+pub static CALLS_REJECTED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+const REJECTED_LABELS: [(&str, &str); 3] = [("cpu", "inbound"), ("cpu", "outbound"), ("setup", "outbound")];
+/// Answered calls staged and not yet bridged.
+pub static CALLS_SETTING_UP: AtomicU64 = AtomicU64::new(0);
+pub static CALLS_SETUP_TIMEOUT: AtomicU64 = AtomicU64::new(0);
+pub static ORPHAN_CHANNELS: AtomicU64 = AtomicU64::new(0);
+/// ARI events read from the WebSocket and not yet handled.
+pub static ARI_EVENT_QUEUE: AtomicU64 = AtomicU64::new(0);
+
+pub fn call_rejected(reason: &str, direction: &str) {
+    if let Some(i) = REJECTED_LABELS.iter().position(|l| *l == (reason, direction)) {
+        CALLS_REJECTED[i].fetch_add(1, Relaxed);
+    }
+}
+
 /// What the kernel says about this process, in the units of Prometheus' standard `process_*` metrics
 /// (and of the Go server's, so `docs/BENCHMARK.md`'s method works unchanged on either engine).
 #[derive(Debug, Default, PartialEq)]
@@ -102,6 +122,24 @@ pub fn render() -> String {
          # TYPE vaani_tokio_alive_tasks gauge\nvaani_tokio_alive_tasks {tasks}\n",
         p.cpu_seconds, p.resident_bytes, p.resident_peak_bytes, p.virtual_bytes, p.threads
     ));
+    out.push_str(&format!(
+        "# TYPE vaani_cpu_load_ratio gauge\nvaani_cpu_load_ratio {:.3}\n\
+         # TYPE vaani_overloaded gauge\nvaani_overloaded {}\n\
+         # TYPE vaani_calls_setting_up gauge\nvaani_calls_setting_up {}\n\
+         # TYPE vaani_calls_setup_timeout_total counter\nvaani_calls_setup_timeout_total {}\n\
+         # TYPE vaani_orphan_channels_hung_up_total counter\nvaani_orphan_channels_hung_up_total {}\n\
+         # TYPE vaani_ari_event_queue_length gauge\nvaani_ari_event_queue_length {}\n",
+        CPU_LOAD_PERMILLE.load(Relaxed) as f64 / 1000.0,
+        u8::from(OVERLOADED.load(Relaxed)),
+        CALLS_SETTING_UP.load(Relaxed),
+        CALLS_SETUP_TIMEOUT.load(Relaxed),
+        ORPHAN_CHANNELS.load(Relaxed),
+        ARI_EVENT_QUEUE.load(Relaxed),
+    ));
+    out.push_str("# TYPE vaani_calls_rejected_total counter\n");
+    for ((reason, direction), c) in REJECTED_LABELS.iter().zip(&CALLS_REJECTED) {
+        out.push_str(&format!("vaani_calls_rejected_total{{reason=\"{reason}\",direction=\"{direction}\"}} {}\n", c.load(Relaxed)));
+    }
     out.push_str("# TYPE vaani_campaign_outcomes_total counter\n");
     for (l, c) in OUTCOME_LABELS.iter().zip(&CAMPAIGN_OUTCOMES) {
         out.push_str(&format!("vaani_campaign_outcomes_total{{status=\"{l}\"}} {}\n", c.load(Relaxed)));
@@ -173,5 +211,18 @@ mod tests {
             assert!(value("process_resident_memory_peak_bytes ") >= value("process_resident_memory_bytes "));
         }
         assert!(value("vaani_tokio_alive_tasks ") >= 0.0 && value("process_cpu_seconds_total ") >= 0.0);
+        for name in [
+            "vaani_cpu_load_ratio ",
+            "vaani_overloaded ",
+            "vaani_calls_setting_up ",
+            "vaani_calls_setup_timeout_total ",
+            "vaani_orphan_channels_hung_up_total ",
+            "vaani_ari_event_queue_length ",
+        ] {
+            value(name);
+        }
+        for (reason, direction) in REJECTED_LABELS {
+            assert!(m.contains(&format!("vaani_calls_rejected_total{{reason=\"{reason}\",direction=\"{direction}\"}} ")), "{m}");
+        }
     }
 }
