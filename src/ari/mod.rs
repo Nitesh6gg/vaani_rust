@@ -228,6 +228,7 @@ pub async fn run_events(url: String, tx: mpsc::UnboundedSender<Event>, connected
                 let _ = connected.send(true);
                 if ever_connected {
                     tracing::info!("ari websocket reconnected");
+                    crate::metrics::ARI_RECONNECTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let _ = tx.send(Event::Reconnected);
                 }
                 ever_connected = true;

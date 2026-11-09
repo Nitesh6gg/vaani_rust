@@ -41,6 +41,7 @@ use crate::{
         FRAME_SIZE, Frame, SILENCE,
         call::{MediaIo, new_ticker},
     },
+    metrics,
 };
 use std::{
     collections::VecDeque,
@@ -425,8 +426,10 @@ pub async fn run(cfg: AgentConfig, io: AgentIo, cancel: CancellationToken) -> (S
                 let pcm = media.inbound.try_recv().unwrap_or(SILENCE);
                 let out = a.process_frame(&pcm);
                 a.recorder.frame(&pcm, out.as_ref());
-                if let Some(out) = out {
-                    let _ = media.outbound.try_send(out); // queue full: dropped, never blocks the tick
+                if let Some(out) = out
+                    && media.outbound.try_send(out).is_err()
+                {
+                    metrics::MEDIA_QUEUE_DROPPED.fetch_add(1, Relaxed); // queue full: dropped, never blocks the tick
                 }
             }
             Some(ev) = stt_events.recv() => a.on_stt(ev),
@@ -453,6 +456,9 @@ pub async fn run(cfg: AgentConfig, io: AgentIo, cancel: CancellationToken) -> (S
     let last = a.node().extraction.clone().map(|x| (a.node().name.clone(), (*x).clone(), std::mem::take(&mut a.history)));
     let finisher = Finisher { call_id: a.id.clone(), llm: a.cfg.llm.clone(), pending: std::mem::take(&mut a.extracting), last };
     let truncated = a.recorder.truncated;
+    if truncated {
+        metrics::RECORDING_TRUNCATED.fetch_add(1, Relaxed);
+    }
     let mut summary = a.log.into_summary();
     summary.recording_truncated = truncated;
     summary.recording_pcm = a.recorder.into_pcm();
@@ -476,6 +482,7 @@ impl Agent {
             None => self.stt_frames as f64 * crate::media::FRAME_INTERVAL.as_secs_f64(),
         };
         self.log.stt_gated = self.gate.is_some();
+        metrics::add_stt_seconds(self.log.stt_seconds);
     }
 
     /// Hands the caller's frame to the STT: all of them, or with the gate only
@@ -617,6 +624,7 @@ impl Agent {
             // Pause, don't cut: whether this is the caller or noise isn't known yet.
             self.paused = true;
             self.log.pauses += 1;
+            metrics::AGENT_INTERRUPTION_PAUSES.fetch_add(1, Relaxed);
             self.paused_at = now;
             self.cfg.vad.reset();
             self.speech_run_start = None;
@@ -1032,6 +1040,7 @@ impl Agent {
     /// start when the LLM opens, or when the caller has gone silent.
     fn start_turn(&mut self) {
         self.log.agent_replies += 1;
+        metrics::AGENT_TURNS.fetch_add(1, Relaxed);
         self.stop_idle_timer();
         self.state = State::Thinking;
         let ctx = self.turn_ctx(None);
@@ -1272,6 +1281,7 @@ impl Agent {
         self.paused = false;
         let msg = if matches!(reason, "no transcript" | "backchannel") {
             self.log.false_interruptions += 1;
+            metrics::AGENT_FALSE_INTERRUPTIONS.fetch_add(1, Relaxed);
             "false interruption; resuming the reply"
         } else {
             "resuming the reply"
@@ -1288,6 +1298,7 @@ impl Agent {
         self.state = State::Transcribing;
         self.paused = false;
         self.log.barge_ins += 1;
+        metrics::AGENT_BARGEIN.fetch_add(1, Relaxed);
         self.drop_held("a real interruption followed"); // its words carry the meaning
         tracing::info!(call_id = %self.id, event = "agent.barge_in.confirmed", generation = self.generation,
             paused_ms = self.paused_at.elapsed().as_millis() as u64, "agent barge-in confirmed; reply cut");
@@ -1654,6 +1665,7 @@ async fn run_llm_turn(c: &TurnCtx, tts: &Arc<TtsClient>) {
         let n = c.failures.fetch_add(1, Relaxed) + 1;
         let (text, hangup) = c.fallback.line(n);
         c.speak(tts, &format!("{text} "));
+        metrics::llm_fallback(if hangup { "hangup" } else { "apology" });
         tracing::warn!(call_id = %c.call_id, event = "llm.fallback", consecutive_failures = n, "llm failed; spoke fallback");
         if hangup {
             let _ = c.ev.send(Event::Closing { generation: c.generation, reason: calllog::LLM_DOWN });
@@ -1736,6 +1748,7 @@ async fn run_tool(c: &TurnCtx, tts: &TtsClient, node: usize, call: &ToolCall) ->
             let res = tokio::time::timeout(TOOL_TIMEOUT, run(args)).await;
             c.tool_running.store(false, Relaxed);
             let ms = start.elapsed().as_millis() as u64;
+            metrics::tool_run(name, matches!(res, Ok(Ok(_))), start.elapsed().as_secs_f64() * 1000.0);
             match res {
                 Ok(Ok(r)) => {
                     tracing::info!(call_id = %c.call_id, event = "tool.result", tool = %name, duration_ms = ms, result = %truncate(&r, 200), "tool result");

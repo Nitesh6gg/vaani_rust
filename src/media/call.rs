@@ -12,6 +12,7 @@
 //! missed ticks are skipped, not replayed in a burst.
 
 use super::{FRAME_INTERVAL, FRAME_SIZE, Frame, SILENCE, audiosocket};
+use crate::metrics;
 use std::{
     sync::{
         Arc,
@@ -73,12 +74,18 @@ pub fn spawn(call_id: String, stream: TcpStream, dead_after: Duration, cancel: C
     tokio::spawn(async move {
         let mut tick = new_ticker();
         let mut scratch = [0u8; audiosocket::HEADER_SIZE + FRAME_SIZE]; // reused: no per-frame alloc
+        let mut last_tick: Option<time::Instant> = None;
         loop {
-            tokio::select! {
+            let at = tokio::select! {
                 _ = cancel.cancelled() => break,
                 _ = closed_w.cancelled() => break,
-                _ = tick.tick() => {}
+                at = tick.tick() => at,
+            };
+            // How far this tick's interval is from the nominal 20ms (a stall shows as one big miss).
+            if let Some(prev) = last_tick {
+                metrics::PACER_DRIFT_MS.observe((at - prev).abs_diff(FRAME_INTERVAL).as_secs_f64() * 1000.0);
             }
+            last_tick = Some(at);
             let (frame, filler) = match out_rx.try_recv() {
                 Ok(f) => (f, false),
                 Err(_) => (SILENCE, true),
@@ -89,12 +96,15 @@ pub fn spawn(call_id: String, stream: TcpStream, dead_after: Duration, cancel: C
                 if !closed_w.is_cancelled() {
                     tracing::error!(call_id = %call_id, error = %e, "media write failed; closing (framed stream can no longer be trusted)");
                 }
+                metrics::AUDIOSOCKET_SEND_ERRORS.fetch_add(1, Relaxed);
                 closed_w.cancel();
                 break;
             }
             stats_w.packets_out.fetch_add(1, Relaxed);
+            metrics::AUDIOSOCKET_FRAMES_OUT.fetch_add(1, Relaxed);
             if filler {
                 stats_w.silence_out.fetch_add(1, Relaxed);
+                metrics::AUDIOSOCKET_SILENCE_SENT.fetch_add(1, Relaxed);
             }
         }
         let _ = wr.shutdown().await;
@@ -122,6 +132,7 @@ async fn read_loop(
         };
         let frame = match res {
             Err(_) => {
+                metrics::MEDIA_WATCHDOG_TIMEOUTS.fetch_add(1, Relaxed);
                 tracing::warn!(call_id = %call_id, event = "media.dead", secs = dead_after.as_secs(), "no inbound media; ending call media");
                 break;
             }
@@ -136,12 +147,16 @@ async fn read_loop(
         match frame {
             audiosocket::Inbound::Audio(f) => {
                 stats.packets_in.fetch_add(1, Relaxed);
+                metrics::AUDIOSOCKET_FRAMES_IN.fetch_add(1, Relaxed);
+                metrics::AUDIOSOCKET_BYTES_IN.fetch_add(FRAME_SIZE as u64, Relaxed);
                 if tx.try_send(f).is_err() {
+                    metrics::MEDIA_INBOUND_DROPPED.fetch_add(1, Relaxed);
                     stats.inbound_dropped.fetch_add(1, Relaxed); // consumer behind: drop, never block the reader
                 }
             }
             audiosocket::Inbound::BadAudio(n) => {
                 stats.malformed.fetch_add(1, Relaxed);
+                metrics::AUDIOSOCKET_MALFORMED.fetch_add(1, Relaxed);
                 tracing::debug!(call_id = %call_id, size = n, "audiosocket frame wrong size");
             }
             audiosocket::Inbound::Hangup => break,
@@ -190,6 +205,10 @@ mod tests {
             assert!(g[3..].iter().all(|b| *b == 0));
         }
         assert!(io.stats.silence_out.load(Relaxed) >= 3);
+        let m = crate::metrics::render();
+        let count = |name: &str| m.lines().find_map(|l| l.strip_prefix(name)?.trim().parse::<f64>().ok()).unwrap_or(0.0);
+        assert!(count("vaani_pacer_drift_ms_count ") >= 2.0, "each tick after the first is timed against the nominal 20ms");
+        assert!(count("vaani_audiosocket_frames_out_total ") >= 3.0 && count("vaani_audiosocket_silence_sent_total ") >= 3.0);
         cancel.cancel();
     }
 

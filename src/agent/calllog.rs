@@ -202,6 +202,7 @@ impl CallLog {
 
     /// One turn's time to first byte for a service ("stt", "llm", "tts").
     pub fn ttfb(&mut self, service: &str, d: std::time::Duration) {
+        crate::metrics::ttfb(service, d);
         self.add(TTFB, Self::obj(json!({"ttfb_seconds": d.as_secs_f64(), "service": service})));
     }
 
@@ -211,6 +212,7 @@ impl CallLog {
     }
 
     pub fn error(&mut self, stage: &str) {
+        crate::metrics::agent_error(stage);
         *self.errors.entry(stage.to_string()).or_default() += 1;
     }
 
@@ -258,6 +260,17 @@ fn sorted(mut events: Vec<LogEvent>) -> Vec<LogEvent> {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn the_call_log_feeds_the_process_metrics() {
+        let before = (crate::metrics::LLM_TTFT_MS.count(), crate::metrics::STT_ENDPOINT_MS.count());
+        let mut log = CallLog::default();
+        log.ttfb("llm", std::time::Duration::from_millis(300));
+        log.ttfb("stt", std::time::Duration::from_millis(120));
+        log.error("tts_open");
+        assert!(crate::metrics::LLM_TTFT_MS.count() > before.0 && crate::metrics::STT_ENDPOINT_MS.count() > before.1);
+        assert!(crate::metrics::render().contains("vaani_agent_errors_total{stage=\"tts_open\"} "));
+    }
 
     #[test]
     fn nodes_visited_once_each_and_first_end_reason_wins() {

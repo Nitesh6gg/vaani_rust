@@ -152,6 +152,9 @@ impl LlmClient {
             res = self.stream_once(cancel, messages, tools, on_token).await;
             attempt += 1;
         }
+        if attempt > 1 {
+            crate::metrics::llm_retry(if res.is_ok() { "recovered" } else { "exhausted" });
+        }
         res
     }
 
@@ -482,6 +485,10 @@ mod tests {
         assert_eq!(out.usage, Some(Usage { prompt: 10, completion: 3, total: 13, cached: 4 }));
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "end_call");
+        let m = crate::metrics::render();
+        let recovered =
+            m.lines().find_map(|l| l.strip_prefix("vaani_llm_retries_total{result=\"recovered\"} ")?.trim().parse::<u64>().ok()).unwrap();
+        assert!(recovered >= 1, "a request that needed a retry and then worked is counted as recovered");
     }
 
     #[tokio::test]

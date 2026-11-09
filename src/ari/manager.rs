@@ -86,6 +86,8 @@ struct Call {
     media_cancel: CancellationToken,
     /// Cancelled when the externalMedia channel enters Stasis: the setup timeout stops waiting for it.
     arrived: CancellationToken,
+    /// When the call was staged (answered): `vaani_call_duration_seconds` runs from here to teardown.
+    started: std::time::Instant,
     res: Mutex<Res>,
 }
 
@@ -347,6 +349,7 @@ impl Manager {
             media_cancel: cancel.child_token(),
             cancel,
             arrived: CancellationToken::new(),
+            started: std::time::Instant::now(),
             res: Mutex::new(Res::default()),
         });
         {
@@ -356,7 +359,6 @@ impl Manager {
             calls.insert(channel.id.clone(), call.clone());
             calls.insert(external_id, call.clone());
         }
-        metrics::CALLS_STARTED.fetch_add(1, Relaxed);
 
         if self.cfg.max_call_duration > Duration::ZERO {
             // A backstop against a wedged call burning billable telephony time.
@@ -454,6 +456,7 @@ impl Manager {
             r.counted_active = true;
         }
         metrics::CALLS_ACTIVE.fetch_add(1, Relaxed);
+        metrics::call_started(call.info.direction);
         tracing::info!(call_id = %id, event = "call.bridged", external_id = %call.external_id, bridge = %bridge, "call bridged");
 
         let ended = self.run_media(&call).await;
@@ -622,6 +625,7 @@ impl Manager {
         }
         if active {
             metrics::CALLS_ACTIVE.fetch_sub(1, Relaxed);
+            metrics::CALL_DURATION_SECONDS.observe(call.started.elapsed().as_secs_f64());
         }
         if first {
             tracing::debug!(call_id = %call.info.id, event = "call.teardown", "tearing down call");
@@ -954,6 +958,7 @@ mod tests {
         .unwrap();
         assert_eq!(tone, 10, "the agent's reply plays over AudioSocket");
         assert!(stt_audio.load(SeqCst) > 0, "caller audio reaches the STT");
+        assert!(metrics::render().contains("vaani_calls_started_total{direction=\"inbound\"} "), "counted when bridged");
         let req = llm_reqs.lock().unwrap()[0].clone();
         assert_eq!(req["messages"][0]["content"], "Greet 98765", "Dograh's prompt, variables filled");
         assert!(metrics::CALLS_ACTIVE.load(SeqCst) >= 1);
@@ -1062,6 +1067,7 @@ mod tests {
             media_cancel: cancel.child_token(),
             cancel,
             arrived: CancellationToken::new(),
+            started: std::time::Instant::now(),
             res: Mutex::new(Res { bridge: Some("br1".into()), external_requested: true, ..Default::default() }),
         })
     }
@@ -1406,5 +1412,24 @@ mod tests {
         b.res.lock().unwrap().ended = true;
         assert_eq!(mgr.setting_up(), 0);
         assert!(mgr.tracks("a-ext") && !mgr.tracks("nobody"));
+    }
+
+    /// A bridged call's length, from staging to teardown, goes to `vaani_call_duration_seconds`; one never bridged doesn't.
+    #[tokio::test]
+    async fn a_bridged_calls_duration_is_observed_at_teardown() {
+        let Some((mgr, _log)) = guard_mgr("t_mgr_duration", |_| {}).await else { return eprintln!("skipped: DOGRAH_TEST_DB_URL not set") };
+        let before = metrics::CALL_DURATION_SECONDS.count();
+
+        let never_bridged = bare_call("n", "n-ext");
+        mgr.calls.lock().unwrap().extend([("n".to_string(), never_bridged.clone()), ("n-ext".to_string(), never_bridged.clone())]);
+        mgr.teardown(&never_bridged);
+        assert_eq!(metrics::CALL_DURATION_SECONDS.count(), before, "a call that never reached the bridge isn't an answered call");
+
+        let bridged = bare_call("b", "b-ext");
+        bridged.res.lock().unwrap().counted_active = true;
+        metrics::CALLS_ACTIVE.fetch_add(1, Relaxed);
+        mgr.calls.lock().unwrap().extend([("b".to_string(), bridged.clone()), ("b-ext".to_string(), bridged.clone())]);
+        mgr.teardown(&bridged);
+        assert!(metrics::CALL_DURATION_SECONDS.count() > before);
     }
 }
