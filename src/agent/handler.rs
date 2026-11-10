@@ -461,7 +461,7 @@ pub async fn run(cfg: AgentConfig, io: AgentIo, cancel: CancellationToken) -> (S
     }
     let mut summary = a.log.into_summary();
     summary.recording_truncated = truncated;
-    summary.recording_pcm = a.recorder.into_pcm();
+    summary.recording = a.recorder.finish();
     (summary, finisher)
 }
 

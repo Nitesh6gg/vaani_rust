@@ -19,6 +19,7 @@ to-port list.
   hangs up channels of our Stasis app that nothing tracks (`ORPHAN_SWEEP_SECONDS`)
 - `src/telemetry.rs` — OTLP logs and traces (`OTEL_EXPORTER_OTLP_ENDPOINT`): a `call` span per call (the call's trace id is the `trace_id`
   on its log lines), `llm.request` child spans; no-op when unset
+- `src/bin/loadgen.rs` — load generator: fake Asterisk (ARI + AudioSocket callers) and mock STT/TTS/LLM (`docs/LOADTEST.md`)
 - `src/callagent.rs` — builds a call's agent from Dograh; `src/testkit.rs` — mock Sarvam/LLM servers
 
 ## Invariants (from the Go repo; where they live here)

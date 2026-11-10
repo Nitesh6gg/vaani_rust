@@ -114,7 +114,7 @@ pub struct Summary {
     pub extracted: Option<Map<String, Value>>,
     pub extracted_keys: Vec<String>,
     /// 16kHz mono PCM16 of the whole call (caller and agent mixed); empty when nothing was recorded.
-    pub recording_pcm: Vec<u8>,
+    pub recording: crate::agent::recorder::Recording,
     pub recording_truncated: bool,
 }
 

@@ -1,5 +1,6 @@
 [package]
 name = "vaani"
+default-run = "vaani"
 version = "0.1.0"
 edition = "2024"
 description = "Real-time voice agent: Asterisk ARI + AudioSocket media plane + Sarvam STT/TTS + OpenAI-compatible LLM (Rust port of vaani)"

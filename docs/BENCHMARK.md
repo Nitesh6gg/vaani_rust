@@ -23,6 +23,7 @@ The same names, labels and histogram buckets the Go engine exports, so one set o
 | `vaani_audiosocket_frames_in_total` / `_frames_out_total` / `_bytes_in_total` / `_silence_sent_total` / `_send_errors_total` / `_malformed_total` | media |
 | `vaani_media_queue_dropped_total`, `vaani_media_inbound_dropped_total`, `vaani_media_watchdog_timeouts_total` | dropped frames, dead media |
 | `vaani_recording_truncated_total`, `vaani_ari_reconnects_total`, `vaani_ari_event_queue_length` | |
+| `vaani_recording_bytes` | call recordings held in memory right now (about 1.9 MB per call-minute) |
 | `vaani_cpu_load_ratio`, `vaani_overloaded`, `vaani_calls_rejected_total{reason,direction}`, `vaani_calls_setup_timeout_total`, `vaani_orphan_channels_hung_up_total` | CPU guard and call-setup safety nets |
 | `vaani_campaign_*` | outbound campaigns (see `OUTBOUND.md`) |
 

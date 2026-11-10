@@ -25,7 +25,6 @@ use crate::{
     agent::{
         calllog, extract,
         handler::{self, ConnectFn, TransferFn},
-        recorder,
     },
     callagent::{self, CallInfo},
     campaign::runner::Probe,
@@ -108,7 +107,7 @@ fn log_summary(id: &str, duration: Duration, s: &calllog::Summary, stats: &media
         disposition = s.end_reason.unwrap_or(calllog::USER_HANGUP), user_turns = s.user_turns, agent_replies = s.agent_replies,
         bargeins = s.barge_ins, pauses = s.pauses, false_interruptions = s.false_interruptions,
         held_speech = s.held_speech, held_delivered = s.held_delivered, nodes = ?s.nodes_visited,
-        recording_bytes = s.recording_pcm.len(), stt_audio_s = (s.stt_seconds * 10.0).round() / 10.0,
+        recording_bytes = s.recording.pcm_len(), stt_audio_s = (s.stt_seconds * 10.0).round() / 10.0,
         reply_latency_p50_ms = p50, reply_latency_p95_ms = p95, errors = ?s.errors,
         packets_in = stats.packets_in.load(Relaxed), packets_out = stats.packets_out.load(Relaxed),
         silence_out = stats.silence_out.load(Relaxed), inbound_dropped = stats.inbound_dropped.load(Relaxed), "call summary");
@@ -580,7 +579,7 @@ impl Manager {
         if end.summary.recording_truncated {
             tracing::warn!(call_id = %id, component = "media", event = "recording.truncated", "call recording hit its size cap; the end of the call is missing from it");
         }
-        let recording = if end.summary.recording_pcm.is_empty() { vec![] } else { recorder::wav(&end.summary.recording_pcm) };
+        let recording = std::mem::take(&mut end.summary.recording).into_wav();
         let recording_bytes = recording.len();
         let storage = self.cfg.storage();
         let run_end = RunEnd { summary: &end.summary, duration: end.duration, recording };

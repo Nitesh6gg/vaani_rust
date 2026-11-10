@@ -217,6 +217,8 @@ pub static MEDIA_INBOUND_DROPPED: AtomicU64 = AtomicU64::new(0);
 /// counts at 5 s and hangs up at the timeout; here the one event is the hangup).
 pub static MEDIA_WATCHDOG_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 pub static ARI_RECONNECTS: AtomicU64 = AtomicU64::new(0);
+/// Call recordings held in memory right now (calls in progress, and finished ones until their upload starts).
+pub static RECORDING_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// Received and transmitted bytes of every network interface, from /proc/self/net/dev, as the Go server's
 /// process collector reads them (the process's whole network namespace: loopback included).
@@ -353,7 +355,8 @@ pub fn render() -> String {
          # TYPE vaani_media_queue_dropped_total counter\nvaani_media_queue_dropped_total {}\n\
          # TYPE vaani_media_inbound_dropped_total counter\nvaani_media_inbound_dropped_total {}\n\
          # TYPE vaani_media_watchdog_timeouts_total counter\nvaani_media_watchdog_timeouts_total {}\n\
-         # TYPE vaani_ari_reconnects_total counter\nvaani_ari_reconnects_total {}\n",
+         # TYPE vaani_ari_reconnects_total counter\nvaani_ari_reconnects_total {}\n\
+         # TYPE vaani_recording_bytes gauge\nvaani_recording_bytes {}\n",
         c(&AGENT_BARGEIN),
         c(&AGENT_INTERRUPTION_PAUSES),
         c(&AGENT_FALSE_INTERRUPTIONS),
@@ -370,6 +373,7 @@ pub fn render() -> String {
         c(&MEDIA_INBOUND_DROPPED),
         c(&MEDIA_WATCHDOG_TIMEOUTS),
         c(&ARI_RECONNECTS),
+        c(&RECORDING_BYTES),
     ));
     out.push_str("# TYPE vaani_agent_errors_total counter\n");
     for (stage, n) in ERROR_STAGES.iter().zip(&AGENT_ERRORS) {
@@ -535,6 +539,7 @@ mod tests {
             "vaani_media_watchdog_timeouts_total",
             "vaani_recording_truncated_total",
             "vaani_ari_reconnects_total",
+            "vaani_recording_bytes",
             "process_network_receive_bytes_total",
             "process_network_transmit_bytes_total",
         ] {

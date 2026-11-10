@@ -28,6 +28,7 @@ Milestones 1-3 are done except QA analysis (below): a Rust call is a complete ca
 | **Variable extraction** (per node on leaving it, and at call end after teardown) feeding `gathered_context`, the disposition and call tags | done |
 | **STT speech-only gate** (pre-roll, hangover, keepalive) and **early flush** | done |
 | `/metrics` (Prometheus text) and `/healthz` | done |
+| **Load generator** (`loadgen`: fake Asterisk + mock providers; `docs/LOADTEST.md`) | done |
 | **OpenTelemetry**: logs and traces over OTLP/HTTP (`OTEL_EXPORTER_OTLP_ENDPOINT`), as in the Go server | done |
 
 Not ported yet (in rough priority order):
