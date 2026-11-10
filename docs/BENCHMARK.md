@@ -1,8 +1,8 @@
 # Benchmarking Vaani (Rust) against the Go server
 
-No measured results yet: this page is the method, so a Rust run is directly comparable to the Go
-server's `docs/BENCHMARK.md` (in `nitesh6gg/vaani`). **Never put an estimate in a table of measured
-numbers**; add a row only from a real run.
+This page is the method, so a Rust run is directly comparable to the Go server's `docs/BENCHMARK.md`
+(in `nitesh6gg/vaani`), and the measured Rust results (at the end). **Never put an estimate in a table
+of measured numbers**; add a row only from a real run. The Go-vs-Rust comparison is `GO_VS_RUST.md`.
 
 ## What `/metrics` exports
 
@@ -81,6 +81,39 @@ its log lines share a `trace_id`, so a slow reply in one engine can be followed 
 
 ## Results
 
-| Engine | Test | Peak talking | Peak CPU (cores) | **Core / talking call** | Peak RSS | Threads | Tasks |
-|---|---|---|---|---|---|---|---|
-| _none yet_ | | | | | | | |
+Box: 192.168.36.19 (16 vCPU Xeon Gold 6330, 32 GB, VMware), Vaani alone on it (the Go engine stopped),
+Asterisk, Postgres, Redis and Dograh on other servers. Source: SigNoz, `service.name = 'vaani-engine-rust'`,
+metrics scraped every 10 s. Release build.
+
+| Engine | Test | Answered | Talk time | Peak talking | Peak in flight | Peak CPU (cores) | **Core / talking call** | Peak RSS | Threads | Tasks |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Rust | idle (Nov 10, 11:25–11:38 UTC) | – | – | 0 | 0 | 0.0005 | – | 22.8 MB | 21 | 13 |
+| Rust | Nov 10 17:09 IST, campaign 22 retries, 266 dials in < 5 s | 118 | 3,039 s (51 min) | 55 (10-s max) | 265 | 0.42 (1-min avg) | **0.0144** | 229 MB | 25 | 556 |
+| Go (for comparison) | Nov 9 19:18 IST, campaign 22, 385 dials, after the event-loop fix | 173 | 4,792 s (80 min) | 72 | 227 | 1.78 (1-min avg) | **0.046** | 548 MB | ~23 | 1,107 goroutines |
+
+### Per-run detail
+
+**Nov 10, 2026 — campaign 22 retries (first Rust load test)**
+
+- Window 11:38–11:46 UTC (17:08–17:16 IST). The dialer placed all 266 calls in one 5-second bucket
+  (11:39:30–35 UTC, ~50 dials/s): they were the no-answer retries of campaign 22 (`retry_count` 1), so it was
+  a burst that used the list up, **not a sustained test**.
+- Outcomes: 118 answered and bridged (44%), 106 no-answer (cause 19), 41 rejected (cause 21), 1 failed (cause 1).
+  **0** `outbound.timeout`, **0** `call.setup_failed`, **0** `media.dead`, **0** agent errors, **0** setup
+  timeouts or orphans, **0** cause 34 (the Go engine's Nov 9 burst had 54 cause-34 rejects).
+- Calls: average 25.5 s; talking peaked at 55 (10-s samples, so a shorter spike can be missed).
+- CPU: 43.7 CPU-s over the window for 3,039 talk-s = **0.0144 core per talking call** (idle baseline
+  included: 0.0005 core × 480 s = 0.24 s). Peak 0.42 cores in a 1-minute average (2.6% of the box).
+- Memory: RSS 22.8 MB idle → 229 MB peak at 265 calls in flight (≈ 0.78 MB per call in flight), back to
+  150 MB after the run (the allocator keeps freed pages; it stayed flat, so not a leak). 25 OS threads,
+  556 tokio tasks at the peak, 208 open fds.
+- Network (whole window, all interfaces): received 178.8 MB, sent 314.2 MB = 58.8 kB/s received and
+  103 kB/s sent per talking call (audio to/from Asterisk, STT/TTS, recording upload, OTLP).
+- Latency (from `turn.agent` logs, 221 agent turns): LLM first token p50 312 ms / p95 515 ms; TTS first
+  audio p50 477 ms / p95 756 ms. Per-call reply latency (`call.summary`): median of the per-call p50 510 ms,
+  p95 of the per-call p95 1,028 ms. Pacer drift p99 ≤ 0.5 ms (the histogram's lowest bucket).
+- STT audio sent: 1,956 s for 3,008 s of calls (65%). No `stt.gate_open` lines, so `STT_SPEECH_ONLY` was
+  most likely off (the Go engine runs with it on).
+- Barge-in: 147 detected, 102 confirmed for 118 calls (0.86 confirmed per call; Go Nov 9 16:30 had 0.53).
+  Earshot is more eager than the Go engine's TEN VAD here; worth checking that these are real interruptions.
+- **What it does not show**: behaviour above 55 talking calls, a sustained dial rate, or a long run.
