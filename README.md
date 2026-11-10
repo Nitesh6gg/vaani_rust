@@ -28,11 +28,12 @@ Milestones 1-3 are done except QA analysis (below): a Rust call is a complete ca
 | **Variable extraction** (per node on leaving it, and at call end after teardown) feeding `gathered_context`, the disposition and call tags | done |
 | **STT speech-only gate** (pre-roll, hangover, keepalive) and **early flush** | done |
 | `/metrics` (Prometheus text) and `/healthz` | done |
+| **OpenTelemetry**: logs and traces over OTLP/HTTP (`OTEL_EXPORTER_OTLP_ENDPOINT`), as in the Go server | done |
 
 Not ported yet (in rough priority order):
 
 1. QA analysis nodes (their tokens aren't priced yet)
-2. Debug WAV recording, OpenTelemetry
+2. Debug WAV recording
 3. TLS to Dograh's Postgres (`tokio-postgres-rustls`)
 
 Needs on the server: **ffmpeg** on `PATH` (recorded clips) and Dograh's `MINIO_*` settings (see below).
@@ -86,6 +87,7 @@ Same names as the Go server.
 | `CAMPAIGN_DIAL_WORKERS` `OUTBOUND_MAX_SETUP` | `10` `30` | contacts of one campaign dialed at once; the dialer holds back while this many answered calls wait in setup (0 = no cap) |
 | `LOAD_SHED_CPU_PERCENT` `LOAD_SHED_RESUME_PERCENT` | `90` `80` | CPU guard: while the whole machine's CPU (5 s average) is at/over the first, new calls are refused (inbound hung up as congestion before answering, campaigns don't dial); calls in progress are never dropped. 0 = off. Linux only |
 | `ORPHAN_SWEEP_SECONDS` | `30` | every N s, hang up channels of this ARI app that Vaani lost track of (older than 90 s). Needs this Vaani to be the only one on its ARI app name. 0 = off |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` (or `_LOGS_ENDPOINT` / `_TRACES_ENDPOINT`) `OTEL_SERVICE_NAME` `DEPLOYMENT_ENVIRONMENT` | unset (off) `vaani-engine-rust` `development` | OTLP/HTTP, e.g. `http://<signoz-host>:4318`: every log line is also pushed there (a line with a `call_id` gets that call's `trace_id` and `run_id`), and each call is a trace: a `call` span with an `llm.request` child per LLM attempt (model, attempt, status, `llm.request_id`, `llm.completion_id`). Unset: nothing is built. See "Observability" |
 | `LOG_LEVEL` / `LOG_FORMAT` | `info` / text (`json`) | |
 
 Asterisk side: route calls into `Stasis(vaani)`; the externalMedia channel uses
@@ -119,3 +121,20 @@ completed with its conversation, usage, disposition, and the recording and trans
 First numbers (4 vCPU sandbox, mock providers in-process): 500 concurrent agents ≈ 515 KB RSS per
 call, ≈ 0.3% of a core per call, worst 20ms-tick lateness ≈ 1 ms. **Not a substitute for the
 Go-vs-Rust SIPp run against real Asterisk** — do that next and record it in `docs/BENCHMARK.md`.
+
+## Observability
+
+With `OTEL_EXPORTER_OTLP_ENDPOINT` set, logs and traces go to the collector (SigNoz) as the Go server's do, under
+`service.name = vaani-engine-rust` (the Go server reports `vaani-engine`), so the two engines can share one SigNoz and be
+told apart. Metrics are pulled the other way: SigNoz scrapes `/metrics`.
+
+- A log line about a call (it has a `call_id`) carries the call's `trace_id`, and its `run_id` once Dograh's run exists;
+  the OTLP record also carries the trace context, so a line finds the call's trace and a trace finds its lines.
+  The stderr output is unchanged (it does not carry `trace_id`).
+- Each call is one trace: a `call` span from the answer to teardown (attributes `call_id`, `direction`, `run.id`), and a child
+  `llm.request` span per LLM HTTP attempt (`llm.model`, `llm.attempt`, `http.status_code`, `llm.request_id`, `llm.completion_id`,
+  an error status when it failed).
+- The same ids are in the `llm.request` log line of every attempt (INFO when it took 3 s or more, WARN when it failed, DEBUG
+  otherwise): what a provider's support asks for.
+- Not in the Rust server (yet): the STT/TTS handshake request ids (`stt.connected` / `tts.connected` in Go).
+

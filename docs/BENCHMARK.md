@@ -52,6 +52,12 @@ Do not divide a one-minute CPU peak by the instantaneous peak call count (it und
 and query one window total, not summed hourly buckets. Idle first: record the idle baseline
 (RSS, threads, CPU/s) with no calls.
 
+## Logs and traces
+
+With `OTEL_EXPORTER_OTLP_ENDPOINT` set on both engines, one SigNoz holds both: filter on `service.name` (`vaani-engine` for
+Go, `vaani-engine-rust` for Rust; `OTEL_SERVICE_NAME` overrides). A call's trace (`call` span, `llm.request` children) and
+its log lines share a `trace_id`, so a slow reply in one engine can be followed to the LLM request that caused it.
+
 ## A fair comparison
 
 1. Same box, one engine at a time (stop the other), same Asterisk, same providers and LLM, same workflow, a different

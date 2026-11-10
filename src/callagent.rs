@@ -98,6 +98,7 @@ impl Prepared {
         let mut llm = LlmClient::new(&s.llm.base_url, &s.llm.api_key, &s.llm.model);
         llm.retries = cfg.llm_retries;
         llm.retry_max_wait = cfg.llm_retry_max_wait;
+        llm.call_id = call_id.to_string();
         let agent = AgentConfig {
             call_id: call_id.to_string(),
             workflow: Arc::new(wf.workflow),

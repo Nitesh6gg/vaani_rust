@@ -17,6 +17,8 @@ to-port list.
   `src/ari/outbound.rs` is `Manager::dial` (ARI only); `src/dograh/campaign.rs`/`outbound.rs` its tables
 - `src/load.rs` — CPU guard (`LOAD_SHED_CPU_PERCENT`): refuse *new* calls while the machine is over the limit; `src/ari/sweep.rs` —
   hangs up channels of our Stasis app that nothing tracks (`ORPHAN_SWEEP_SECONDS`)
+- `src/telemetry.rs` — OTLP logs and traces (`OTEL_EXPORTER_OTLP_ENDPOINT`): a `call` span per call (the call's trace id is the `trace_id`
+  on its log lines), `llm.request` child spans; no-op when unset
 - `src/callagent.rs` — builds a call's agent from Dograh; `src/testkit.rs` — mock Sarvam/LLM servers
 
 ## Invariants (from the Go repo; where they live here)

@@ -13,6 +13,7 @@ mod dograh;
 mod load;
 mod media;
 mod metrics;
+mod telemetry;
 #[cfg(test)]
 mod testkit;
 
@@ -21,23 +22,32 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-fn init_logging() {
-    use tracing_subscriber::{EnvFilter, fmt};
+/// Logs to stderr, and over OTLP too when `OTEL_EXPORTER_OTLP_ENDPOINT` is set (see `telemetry`).
+fn init_logging() -> telemetry::Telemetry {
+    use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
     let level = std::env::var("LOG_LEVEL").unwrap_or_else(|_| "info".into());
     let filter = EnvFilter::try_new(&level).unwrap_or_else(|_| EnvFilter::new("info"));
-    if std::env::var("LOG_FORMAT").is_ok_and(|f| f == "json") {
-        fmt().json().with_env_filter(filter).init();
-    } else {
-        fmt().with_env_filter(filter).init();
+    let (tel, otlp, failed) = match telemetry::start() {
+        Ok((tel, otlp)) => (tel, otlp, None),
+        Err(e) => (telemetry::Telemetry::off(), None, Some(format!("{e:#}"))),
+    };
+    let stderr = if std::env::var("LOG_FORMAT").is_ok_and(|f| f == "json") { fmt::layer().json().boxed() } else { fmt::layer().boxed() };
+    tracing_subscriber::registry().with(filter).with(stderr).with(otlp).init();
+    if let Some(e) = failed {
+        tracing::warn!(event = "telemetry.disabled", error = %e, "otlp export disabled; could not configure it");
+    } else if tel.enabled() {
+        tracing::info!(event = "telemetry.enabled", "otlp export on");
     }
+    tel
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     config::load_dotenv();
-    init_logging();
-    // reqwest and tokio-tungstenite both use rustls; pick the provider explicitly.
+    // reqwest and tokio-tungstenite both use rustls; pick the provider explicitly, before anything (the OTLP
+    // exporter's HTTP client, built by `init_logging`) builds a TLS config.
     rustls::crypto::ring::default_provider().install_default().map_err(|_| anyhow::anyhow!("rustls crypto provider already installed"))?;
+    let telemetry = init_logging();
 
     let cfg = Arc::new(config::Config::load()?);
     let cancel = CancellationToken::new();
@@ -123,6 +133,8 @@ async fn main() -> Result<()> {
     if let Some(r) = runner {
         r.await.context("campaign runner")?;
     }
+    // Flush the batched logs and spans: the last lines are the ones about the shutdown.
+    tokio::task::spawn_blocking(move || telemetry.shutdown()).await.context("telemetry shutdown")?;
     Ok(())
 }
 

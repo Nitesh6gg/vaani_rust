@@ -374,6 +374,9 @@ impl Manager {
             });
         }
 
+        // The call's trace (a no-op unless OTLP export is on): every line about it carries its trace id.
+        crate::telemetry::start_call(&call.info.id, &[("direction", call.info.direction.to_string())], call.info.run_id);
+
         // If the media channel never enters Stasis (its event lost, Asterisk wedged) nothing else would
         // ever end this call: hang it up after the setup timeout.
         {
@@ -468,6 +471,7 @@ impl Manager {
         if let Some(end) = ended {
             self.record_run(id, end).await;
         }
+        crate::telemetry::forget_call(id);
     }
 
     async fn run_media(self: &Arc<Self>, call: &Arc<Call>) -> Option<CallEnd> {
@@ -570,6 +574,7 @@ impl Manager {
             }
             Err(_) => return,
         };
+        crate::telemetry::set_run(id, run_id);
         tracing::info!(call_id = %id, component = "dograh", event = "run.created", run_id, workflow_id = end.meta.workflow_id, "dograh run created");
 
         if end.summary.recording_truncated {
@@ -628,6 +633,10 @@ impl Manager {
             metrics::CALL_DURATION_SECONDS.observe(call.started.elapsed().as_secs_f64());
         }
         if first {
+            crate::telemetry::end_call(&call.info.id);
+            if !active {
+                crate::telemetry::forget_call(&call.info.id); // never bridged: no run to record after it
+            }
             tracing::debug!(call_id = %call.info.id, event = "call.teardown", "tearing down call");
             if let Some(out) = &call.out {
                 self.finish_outbound(&call.info.id, out);

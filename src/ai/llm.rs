@@ -115,6 +115,8 @@ pub struct LlmClient {
     pub model: String,
     pub retries: u32,
     pub retry_max_wait: Duration,
+    /// The call this client works for, so each request's span and log line belong to it ("" = none).
+    pub call_id: String,
 }
 
 impl LlmClient {
@@ -125,6 +127,7 @@ impl LlmClient {
             model: model.into(),
             retries: 2,
             retry_max_wait: Duration::from_secs(2),
+            call_id: String::new(),
         }
     }
 
@@ -138,7 +141,7 @@ impl LlmClient {
         tools: &[FunctionDef],
         on_token: &mut (dyn FnMut(&str) + Send),
     ) -> Result<StreamOut, LlmError> {
-        let mut res = self.stream_once(cancel, messages, tools, on_token).await;
+        let mut res = self.stream_once(1, cancel, messages, tools, on_token).await;
         let mut attempt = 1;
         while let Err(e) = &res {
             if attempt > self.retries || !e.retryable() || cancel.is_cancelled() {
@@ -149,7 +152,7 @@ impl LlmClient {
                 _ = cancel.cancelled() => break,
                 _ = tokio::time::sleep(wait) => {}
             }
-            res = self.stream_once(cancel, messages, tools, on_token).await;
+            res = self.stream_once(attempt + 1, cancel, messages, tools, on_token).await;
             attempt += 1;
         }
         if attempt > 1 {
@@ -167,12 +170,94 @@ impl LlmClient {
         wait.min(self.retry_max_wait)
     }
 
+    /// One HTTP attempt, as a span of its call's trace and a `llm.request` log line (INFO when it took 3 s
+    /// or more, WARN when it failed, DEBUG otherwise): the ids are what a provider's support asks for.
     async fn stream_once(
+        &self,
+        attempt: u32,
+        cancel: &CancellationToken,
+        messages: &[Message],
+        tools: &[FunctionDef],
+        on_token: &mut (dyn FnMut(&str) + Send),
+    ) -> Result<StreamOut, LlmError> {
+        let span = crate::telemetry::llm_span(&self.call_id);
+        let (res, info, total) = self.measured(cancel, messages, tools, on_token).await;
+        let err = res.as_ref().err().filter(|e| !matches!(e, LlmError::Cancelled)).map(ToString::to_string);
+        if let Some(span) = span {
+            span.end(&self.model, attempt, info.status, &info.request_id, &info.completion_id, err.as_deref());
+        }
+        let (call_id, model, ms) = (self.call_id.as_str(), self.model.as_str(), total.as_millis() as u64);
+        let (status, rid, cid) = (info.status, info.request_id.as_str(), info.completion_id.as_str());
+        match request_level(total, err.is_some()) {
+            tracing::Level::WARN => {
+                let error = err.as_deref().unwrap_or_default();
+                tracing::warn!(
+                    call_id,
+                    event = "llm.request",
+                    component = "llm",
+                    attempt,
+                    status,
+                    request_id = rid,
+                    completion_id = cid,
+                    duration_ms = ms,
+                    model,
+                    error,
+                    "llm request failed"
+                );
+            }
+            tracing::Level::INFO => {
+                tracing::info!(
+                    call_id,
+                    event = "llm.request",
+                    component = "llm",
+                    attempt,
+                    status,
+                    request_id = rid,
+                    completion_id = cid,
+                    duration_ms = ms,
+                    model,
+                    "slow llm request"
+                );
+            }
+            _ => {
+                tracing::debug!(
+                    call_id,
+                    event = "llm.request",
+                    component = "llm",
+                    attempt,
+                    status,
+                    request_id = rid,
+                    completion_id = cid,
+                    duration_ms = ms,
+                    model,
+                    "llm request"
+                );
+            }
+        }
+        res
+    }
+
+    /// The attempt, timed, with the ids that name it.
+    async fn measured(
         &self,
         cancel: &CancellationToken,
         messages: &[Message],
         tools: &[FunctionDef],
         on_token: &mut (dyn FnMut(&str) + Send),
+    ) -> (Result<StreamOut, LlmError>, ReqInfo, Duration) {
+        let start = std::time::Instant::now();
+        let mut info = ReqInfo::default();
+        let res = self.stream_inner(cancel, messages, tools, on_token, &mut info).await;
+        (res, info, start.elapsed())
+    }
+
+    async fn stream_inner(
+        &self,
+        cancel: &CancellationToken,
+        messages: &[Message],
+        tools: &[FunctionDef],
+        on_token: &mut (dyn FnMut(&str) + Send),
+        info: &mut ReqInfo,
     ) -> Result<StreamOut, LlmError> {
         let mut body = json!({
             "model": self.model,
@@ -208,6 +293,8 @@ impl LlmClient {
         };
 
         let status = resp.status();
+        info.status = status.as_u16();
+        info.request_id = resp.headers().get("x-request-id").and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
         if !status.is_success() {
             let retry_after = resp
                 .headers()
@@ -242,6 +329,9 @@ impl LlmClient {
                 }
                 // A malformed line is skipped: providers interleave keepalives.
                 let Ok(c) = serde_json::from_str::<Chunk>(data) else { continue };
+                if info.completion_id.is_empty() {
+                    info.completion_id = c.id.clone().unwrap_or_default();
+                }
                 if let Some(err) = c.error.filter(|e| !e.is_null()) {
                     let mut s = err.to_string();
                     s.truncate(floor_boundary(&s, 500));
@@ -303,8 +393,29 @@ struct PromptDetails {
     cached_tokens: u64,
 }
 
+/// The level an attempt's log line is written at: WARN when it failed, INFO when it took 3 s or more, DEBUG otherwise.
+fn request_level(total: Duration, failed: bool) -> tracing::Level {
+    if failed {
+        tracing::Level::WARN
+    } else if total >= Duration::from_secs(3) {
+        tracing::Level::INFO
+    } else {
+        tracing::Level::DEBUG
+    }
+}
+
+/// What identifies one request: its HTTP status, the provider's request id header and the completion's id.
+#[derive(Default)]
+struct ReqInfo {
+    status: u16,
+    request_id: String,
+    completion_id: String,
+}
+
 #[derive(Deserialize)]
 struct Chunk {
+    #[serde(default)]
+    id: Option<String>,
     #[serde(default)]
     error: Option<Value>,
     #[serde(default)]
@@ -457,7 +568,7 @@ mod tests {
                 let mut buf = vec![0u8; 16384];
                 let _ = s.read(&mut buf).await;
                 let head = format!(
-                    "HTTP/1.1 {code} X\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    "HTTP/1.1 {code} X\r\nContent-Type: text/event-stream\r\nX-Request-Id: req-{code}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
                 );
                 s.write_all(head.as_bytes()).await.unwrap();
@@ -502,5 +613,30 @@ mod tests {
         let c = LlmClient::new(&url, "k", "m");
         let e = c.stream(&CancellationToken::new(), &[], &[], &mut |_| {}).await.unwrap_err();
         assert!(matches!(e, LlmError::Status { code: 400, .. }), "{e}");
+    }
+
+    /// Every HTTP attempt carries its ids: what a provider's support asks for when a request was slow or failed.
+    #[tokio::test]
+    async fn each_attempt_carries_its_request_ids() {
+        let sse = "data: {\"id\":\"chatcmpl-7\",\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\ndata: [DONE]\n\n";
+        let url = serve(vec![(429, "slow down".into()), (200, sse.into())]).await;
+        let c = LlmClient::new(&url, "k", "m1");
+        let msgs = [Message::new("user", "hi")];
+
+        let (res, info, _) = c.measured(&CancellationToken::new(), &msgs, &[], &mut |_| {}).await;
+        assert!(matches!(res, Err(LlmError::Status { code: 429, .. })));
+        assert_eq!((info.status, info.request_id.as_str(), info.completion_id.as_str()), (429, "req-429", ""));
+
+        let (res, info, _) = c.measured(&CancellationToken::new(), &msgs, &[], &mut |_| {}).await;
+        assert!(res.is_ok());
+        assert_eq!((info.status, info.request_id.as_str(), info.completion_id.as_str()), (200, "req-200", "chatcmpl-7"));
+    }
+
+    #[test]
+    fn a_requests_log_level_says_what_to_look_at() {
+        use tracing::Level;
+        assert_eq!(request_level(Duration::from_millis(200), true), Level::WARN, "failed, however fast");
+        assert_eq!(request_level(Duration::from_secs(3), false), Level::INFO, "slow: 3 s or more");
+        assert_eq!(request_level(Duration::from_millis(2999), false), Level::DEBUG);
     }
 }
