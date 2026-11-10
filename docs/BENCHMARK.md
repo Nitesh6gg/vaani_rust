@@ -112,8 +112,8 @@ metrics scraped every 10 s. Release build.
 - Latency (from `turn.agent` logs, 221 agent turns): LLM first token p50 312 ms / p95 515 ms; TTS first
   audio p50 477 ms / p95 756 ms. Per-call reply latency (`call.summary`): median of the per-call p50 510 ms,
   p95 of the per-call p95 1,028 ms. Pacer drift p99 ≤ 0.5 ms (the histogram's lowest bucket).
-- STT audio sent: 1,956 s for 3,008 s of calls (65%). No `stt.gate_open` lines, so `STT_SPEECH_ONLY` was
-  most likely off (the Go engine runs with it on).
+- STT audio sent: 1,956 s for 3,008 s of calls (65%). Rust never logs `stt.gate_open`, so the logs do not say
+  whether `STT_SPEECH_ONLY` was on; 65% points to **on**. Check the `.env`.
 - Barge-in: 147 detected, 102 confirmed for 118 calls (0.86 confirmed per call; Go Nov 9 16:30 had 0.53).
   Earshot is more eager than the Go engine's TEN VAD here; worth checking that these are real interruptions.
 - **What it does not show**: behaviour above 55 talking calls, a sustained dial rate, or a long run.

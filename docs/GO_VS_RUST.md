@@ -19,7 +19,7 @@ comes from a real run; extrapolations are marked as such.
 
 ## The comparison
 
-The fairest pair: both engines alone on the same box (192.168.36.19, 16 vCPU Xeon Gold 6330, 32 GB), both
+The pair used (not a perfect match: Rust dialed only no-answer retries, on a different day, in one 5-second burst): both engines alone on the same box (192.168.36.19, 16 vCPU Xeon Gold 6330, 32 GB), both
 dialing **campaign 22** as one burst with the parallel dialer, similar call length and load.
 
 | | **Go** (Nov 9, 19:18 IST) | **Rust** (Nov 10, 17:09 IST) | Rust vs Go |
@@ -65,8 +65,9 @@ Measured: the totals above. Not measured: how much each cause below contributes.
 3. **A different, lighter VAD (part of the gap is not the language).** Go runs **TEN VAD**, a neural model called
    through cgo on every frame; Rust runs **Earshot**, a small pure-Rust model. Part of the CPU gap is this choice.
    To separate the two, run the Go engine once with `VAD_MODE=energy`, or with the STT gate the same on both.
-4. **STT gate off on Rust in this run** (no `stt.gate_open` lines; Go had it on). That makes Rust do slightly
-   *more* work and send more audio to Sarvam (65% of call time), so it does not explain Rust's lower CPU.
+4. **The STT gate setting on Rust is unknown.** Rust never writes a `stt.gate_open` log line, so its absence
+   proves nothing. Rust sent 65% of call time to Sarvam, which points to the gate being **on**. Read
+   `STT_SPEECH_ONLY` in the Rust `.env` and make it the same on both engines before the next test.
 
 ## Which scales further
 
@@ -75,9 +76,12 @@ Per box, **Rust**. Extrapolated (NOT measured), linear, engine CPU only, at 70% 
 | | Core per talking call | Talking calls at 70% CPU | Basis |
 |---|---|---|---|
 | Go | 0.031 (measured at 141 talking) | ~360 | 2.6× beyond the largest test |
-| Rust | 0.0144 (measured at 55 talking) | ~780 | 14× beyond its only test: weak |
+| Rust | 0.0144 (measured at 55 talking) | ~780 | 14× beyond its only test: a guess, not a forecast |
 
-Memory limits neither: at ~2 MB (Go) or ~0.8 MB (Rust) per call, 1,000 calls fit in 2 GB of the 32 GB.
+Memory limits neither for short calls: at ~2 MB (Go) or ~0.8 MB (Rust) per call in flight, 1,000 calls of ~25 s
+fit in 2 GB of the 32 GB. **Long calls cost more**: the recording is held in RAM at about 1.9 MB per call-minute
+(Rust test call: 2.48 MB for 77 s), so 1,000 five-minute calls need roughly 10 GB. Writing recordings to disk
+would remove this.
 
 Rust's advantage grows with load: no GC pauses that grow with the heap, and a fixed per-call footprint. But the
 whole system's ceiling is set elsewhere today:
