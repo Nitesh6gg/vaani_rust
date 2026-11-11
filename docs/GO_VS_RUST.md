@@ -104,6 +104,36 @@ comparable with the Go figures above (real providers). Scaled to Rust's real-cam
 the box carries about 780 calls at 70% CPU; the mock-provider figure suggests more. Asterisk and the trunk remain
 the system's limit. The same test has not been run on the Go engine (the Go repo has no load generator).
 
+## Real campaign at ~150 talking calls (Rust Nov 11 vs Go Nov 9)
+
+The closest real-traffic pair: both engines alone on the same box, dialing a large campaign with the parallel
+dialer until paused, ~140–150 calls talking at once. Go's run was **before** its ARI event-loop fix, so its
+failure counts are not comparable; its CPU and load are.
+
+| | **Go** (Nov 9 16:59 IST, campaign 22) | **Rust** (Nov 11 17:39 IST, campaign 25) |
+|---|---|---|
+| Org limit / dial limit | 600 / 100 per s | 400 / 35 per s |
+| Dials / answered | 3,545 / 1,204 (34%) | 4,987 / 2,354 (47%) |
+| Peak in flight / talking | 602 / 141 | 400 / 149 |
+| Average call | 34 s | 14 s |
+| **Peak CPU (1-min)** | **4.23 cores** | **1.01 cores** (4.2× less at the same talking count) |
+| **Core per talking call** | **0.031** | **0.0101** (3.1× less, despite shorter calls) |
+| Peak memory | not pulled (696 MB at 94 talking on Nov 5) | 554 MB |
+| Setup failures / dead media / no-result | 80 / 325 / 1,272 (event loss, fixed since) | 4 / 0 / 0 |
+| Agent errors | 113 (all STT, at 120–140 talking) | 0 |
+| LLM first token p95 | 512 ms | 1,186 ms |
+| Trunk "no circuit" (cause 34) | not seen that run (54 on Nov 9 19:18) | 0 |
+| Asterisk main thread | 96% of a core | 74–86% of a core |
+
+What this adds to the comparison:
+- **The 3× CPU gap holds on real traffic at ~150 calls**, not only in the 55-call burst.
+- Rust's run was clean on the engine side (no lost events, dead media or agent errors), but it shows two problems
+  Go's logs would not reveal the same way: **caller audio dropped in 40% of calls** (0.9% of frames) and **Redis
+  timeouts in the dialer**. See `BENCHMARK.md`.
+- Latency p95 was worse on Rust's run (LLM 1.2 s, TTS 2.6 s); at 6% CPU the engine is unlikely to be the cause, so
+  provider latency under load is the first suspect.
+- At ~150 talking, **Asterisk's main thread is the component closest to its limit** with either engine.
+
 ## Where Go is still ahead
 
 | | Go | Rust |

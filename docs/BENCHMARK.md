@@ -91,6 +91,7 @@ metrics scraped every 10 s. Release build.
 | Rust | idle (Nov 10, 11:25–11:38 UTC) | – | – | 0 | 0 | 0.0005 | – | 22.8 MB | 21 | 13 |
 | Rust | Nov 10 17:09 IST, campaign 22 retries, 266 dials in < 5 s | 118 | 3,039 s (51 min) | 55 (10-s max) | 265 | 0.42 (1-min avg) | **0.0144** | 229 MB | 25 | 556 |
 | Rust (load generator, mocks) | Nov 11, 1,000 concurrent calls, engine alone, generator on a second machine (`LOADTEST.md`) | 7,101 | 425,860 s | 1,000 | – | 4.78 (1-min avg, 30% of the box) | **0.0048** | 2.71 GB | 17 | 7,576 |
+| Rust | **Nov 11 17:39 IST, campaign 25 (`test_R_4K`), 4,987 dials, org limit 400 / 35 per s** | 2,354 | 34,807 s (580 min) | **149** (1-min max) | **400** (= org limit) | **1.01** (1-min avg, 6.3% of the box) | **0.0101** | 554 MB | 40 | 1,359 |
 | Go (for comparison) | Nov 9 19:18 IST, campaign 22, 385 dials, after the event-loop fix | 173 | 4,792 s (80 min) | 72 | 227 | 1.78 (1-min avg) | **0.046** | 548 MB | ~23 | 1,107 goroutines |
 
 ### Per-run detail
@@ -119,3 +120,42 @@ metrics scraped every 10 s. Release build.
 - Barge-in: 147 detected, 102 confirmed for 118 calls (0.86 confirmed per call; Go Nov 9 16:30 had 0.53).
   Earshot is more eager than the Go engine's TEN VAD here; worth checking that these are real interruptions.
 - **What it does not show**: behaviour above 55 talking calls, a sustained dial rate, or a long run.
+
+**Nov 11, 2026 — campaign 25 (`test_R_4K`, 4,000 contacts), first sustained real campaign on Rust**
+
+- Org settings: `CONCURRENT_CALL_LIMIT` 400, `DIAL_RATE_LIMIT_PER_SECOND` 35. Dialed 12:09–12:15 UTC
+  (17:39–17:45 IST), paused by hand from Dograh. 4,987 dials (4,000 first attempts + retries; plus 3 dials of a
+  2-number test, campaign 24, at 12:07). The Go engine was stopped.
+- **The dial rate was set by the concurrency cap, not by the 35/s limit**: 738–875 dials per minute (12–15/s),
+  with calls in flight pinned at **400** for six minutes. Calls ring for up to 30 s, so 400 in flight allows
+  about 13/s.
+- Outcomes (logs): 2,354 answered and bridged (47%), 1,947 no-answer (cause 19), 659 rejected (cause 21), 14 failed
+  cause 38, 6 failed cause 0, 1 cause 1, 8 busy. **0 cause 34** (the trunk's "no circuit"), **0** `outbound.timeout`,
+  **0** `media.dead`, **0** agent errors, 0 media watchdog timeouts. Dispositions: 2,229 user hang-up (95%), 68
+  qualified, 56 idle / max duration. Average call **14 s** (Dograh's dashboard: 12 s): most people hung up during
+  the greeting; 1,206 caller turns in 2,353 calls.
+- **CPU**: 353 CPU-s for 34,807 talk-s = **0.0101 core per talking call**; peak 1.01 cores (1-min) at 125–149
+  talking. Short calls cost more per talk-second (the per-call setup is spread over 14 s, not 25–35 s).
+- **Memory**: RSS 14 MB idle → 554 MB peak (400 in flight, 149 talking) → 435 MB after (kept, flat). 40 threads
+  (17 in the load test: the extra are the blocking pool for Postgres/DNS/TLS), 1,359 tasks, 553 open files.
+- **Network** per talking call: 48.6 kB/s received, 98.8 kB/s sent (1.69 GB in, 3.44 GB out).
+- **Latency** (`turn.agent`, 1,405 turns with an LLM reply): LLM first token p50 284 ms / **p95 1,186 ms**; TTS first
+  audio p50 416 ms / **p95 2,572 ms**. Per-call reply latency: median of the per-call p50 454 ms, p95 of the
+  per-call p95 4.4 s. The p95s are 2–3× the 55-call run (515 ms / 756 ms): provider latency under load (Sarvam TTS
+  above all), not engine CPU (6% of the box), but not proven.
+- Pacer drift p99 ≤ 0.5 ms. 304 outbound frames dropped (agent audio queue full).
+- **New: 16,155 caller frames dropped** (`vaani_media_inbound_dropped_total`; 0 in every load-test step): 323 s of
+  caller audio, 0.9% of it, in **932 of 2,353 calls (40%)**, up to 192 frames (3.8 s) in one call. The counter
+  means the call's agent task was behind reading the caller's audio. Likely while the call starts (Dograh workflow
+  read, STT and TTS TLS handshakes), which the load test's local mocks make instant; not confirmed. Worth fixing:
+  a dropped first word is a worse call.
+- **New: Redis timeouts in the dialer**: 32 slot releases, 17 circuit-breaker writes and 17 rate/slot checks timed
+  out (`campaign.release_failed`, `campaign.breaker_failed`, `campaign.limit_failed`). An unreleased slot holds one
+  of the 400 until its stale timeout expires, so the effective cap was a little lower. Redis load or the client's
+  timeout; not investigated.
+- 4 setup failures: 3 `bind media port …: Address already in use` (a port handed out again while still in use) and
+  1 externalMedia 500 from Asterisk.
+- Asterisk (separate 4-core box, `htop` during the run): its main thread at 74–86% of one core, the box at
+  19–26%. Close to its limit at ~150 talking, as with the Go engine (96% at 141 talking on Nov 9).
+- STT audio sent: 20,672 s for 34,807 s of calls (59%).
+
