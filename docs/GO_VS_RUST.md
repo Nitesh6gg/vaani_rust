@@ -90,6 +90,20 @@ whole system's ceiling is set elsewhere today:
 - **SIP trunk**: 54 cause-34 ("no circuit/channel available") rejects in a 385-dial burst on Nov 9.
 - **Sarvam STT**: 113 STT errors at 120–140 talking calls on Nov 9 (Go); cause unconfirmed.
 
+## Load test: 1,000 concurrent calls (Rust, Nov 11)
+
+One Rust engine alone on the production box, with a load generator and mock providers on a second machine
+(`LOADTEST.md`). All 7,101 calls set up and kept their audio; there were no failures, no lost media and no engine
+hangups. At 1,000 calls: peak CPU 4.78 cores (30% of the 16-core box), **0.0048 core per call**, peak memory
+2.71 GB (levelled off, not growing), 3,078 open files, pacer drift p99 ≤ 0.5 ms, 171 audible gaps over 60 ms
+(0.02 per call-minute; the generator may be the cause). Cost per call fell with load: 0.0082 at 100, 0.0055 at 600,
+0.0048 at 1,000.
+
+This is the engine alone, with silence for audio, no TLS to providers and no recording upload: it is **not**
+comparable with the Go figures above (real providers). Scaled to Rust's real-campaign cost (0.0144 core per call),
+the box carries about 780 calls at 70% CPU; the mock-provider figure suggests more. Asterisk and the trunk remain
+the system's limit. The same test has not been run on the Go engine (the Go repo has no load generator).
+
 ## Where Go is still ahead
 
 | | Go | Rust |

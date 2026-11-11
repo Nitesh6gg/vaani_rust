@@ -90,6 +90,7 @@ metrics scraped every 10 s. Release build.
 |---|---|---|---|---|---|---|---|---|---|---|
 | Rust | idle (Nov 10, 11:25–11:38 UTC) | – | – | 0 | 0 | 0.0005 | – | 22.8 MB | 21 | 13 |
 | Rust | Nov 10 17:09 IST, campaign 22 retries, 266 dials in < 5 s | 118 | 3,039 s (51 min) | 55 (10-s max) | 265 | 0.42 (1-min avg) | **0.0144** | 229 MB | 25 | 556 |
+| Rust (load generator, mocks) | Nov 11, 1,000 concurrent calls, engine alone, generator on a second machine (`LOADTEST.md`) | 7,101 | 425,860 s | 1,000 | – | 4.78 (1-min avg, 30% of the box) | **0.0048** | 2.71 GB | 17 | 7,576 |
 | Go (for comparison) | Nov 9 19:18 IST, campaign 22, 385 dials, after the event-loop fix | 173 | 4,792 s (80 min) | 72 | 227 | 1.78 (1-min avg) | **0.046** | 548 MB | ~23 | 1,107 goroutines |
 
 ### Per-run detail
