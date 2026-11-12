@@ -286,9 +286,12 @@ pub fn render() -> String {
         CAMPAIGNS_COMPLETED.load(Relaxed),
         CAMPAIGN_CALLS_IN_FLIGHT.load(Relaxed),
     );
-    out.push_str(&format!("# TYPE vaani_redis_errors_total counter
+    out.push_str(&format!(
+        "# TYPE vaani_redis_errors_total counter
 vaani_redis_errors_total {}
-", REDIS_ERRORS.load(Relaxed)));
+",
+        REDIS_ERRORS.load(Relaxed)
+    ));
     let p = proc_stats();
     let open_fds = std::fs::read_dir("/proc/self/fd").map_or(0, |d| d.count());
     let tasks = tokio::runtime::Handle::try_current().map_or(0, |h| h.metrics().num_alive_tasks());

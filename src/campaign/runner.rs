@@ -137,7 +137,14 @@ fn retry_reason(status: &str) -> Option<&'static str> {
 fn slow_redis(op: &str, campaign: i32, since: Instant) {
     let ms = since.elapsed().as_millis();
     if ms >= 1000 {
-        tracing::warn!(component = "campaign", event = "campaign.redis_slow", campaign_id = campaign, op, ms = ms as u64, "campaign: a Redis step was slow");
+        tracing::warn!(
+            component = "campaign",
+            event = "campaign.redis_slow",
+            campaign_id = campaign,
+            op,
+            ms = ms as u64,
+            "campaign: a Redis step was slow"
+        );
     }
 }
 
