@@ -72,7 +72,7 @@ async fn rig_tuned(
     .await
     .unwrap();
 
-    let (in_tx, in_rx) = mpsc::channel(5);
+    let (in_tx, in_rx) = mpsc::channel(crate::media::call::INBOUND_QUEUE);
     let (out_tx, out_rx) = mpsc::channel(5);
     let media = MediaIo { inbound: in_rx, outbound: out_tx, closed: CancellationToken::new(), stats: Arc::new(MediaStats::default()) };
     let hangups = Arc::new(AtomicUsize::new(0));
@@ -722,4 +722,22 @@ async fn a_failed_transfer_tells_the_llm_and_the_call_carries_on() {
     r.cancel.cancel();
     let (s, _) = r.done.await.unwrap();
     assert_eq!(s.end_reason, None, "a failed transfer doesn't end the call");
+}
+
+/// Caller audio that arrives in a clump (the call starting up, Asterisk catching up after a stall) all
+/// reaches the STT: the agent takes every frame waiting on a tick, not one. Taking one per tick could
+/// never catch up, and what overflowed the queue was the caller's first words.
+#[tokio::test]
+async fn a_clump_of_caller_audio_all_reaches_the_stt() {
+    let r = rig(10, false, "ok").await;
+    tokio::time::sleep(Duration::from_millis(100)).await; // the agent is ticking
+    let before = r.stt_audio.load(SeqCst);
+    for _ in 0..30 {
+        r.inbound.try_send(crate::media::SILENCE).expect("the queue holds a second of audio");
+    }
+    // 30 frames are 600 ms of audio; at one frame per tick only ~5 would be through after 100 ms.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let got = r.stt_audio.load(SeqCst) - before;
+    assert!(got >= 30, "all 30 frames of the clump were heard at once, got {got}");
+    assert!(got <= 40, "and nothing was sent twice, got {got}");
 }

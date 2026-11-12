@@ -65,7 +65,8 @@ impl SttClient {
         let (ws, rid) = ws_connect(&url, "Api-Subscription-Key", &cfg.api_key, DIAL_TIMEOUT).await.context("stt: connect")?;
         tracing::info!(call_id, event = "stt.connected", request_id = rid.as_deref().unwrap_or(""), "stt connected");
 
-        let (cmd_tx, cmd_rx) = mpsc::channel(64);
+        // Room for the gate's pre-roll (1 s) and a clump of late caller frames (1 s) at once.
+        let (cmd_tx, cmd_rx) = mpsc::channel(128);
         let (ev_tx, ev_rx) = mpsc::unbounded_channel();
         tokio::spawn(run(call_id.to_string(), url, cfg.api_key, ws, cmd_rx, ev_tx, cancel));
         Ok((Self { tx: cmd_tx }, ev_rx))

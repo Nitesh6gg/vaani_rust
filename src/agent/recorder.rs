@@ -2,7 +2,10 @@
 //! recording (pipecat's AudioBufferProcessor, mono). Both directions meet once
 //! per 20ms tick, so they stay in step without timestamps.
 
-use crate::{media::Frame, metrics};
+use crate::{
+    media::{FRAME_SIZE, Frame},
+    metrics,
+};
 use std::sync::atomic::Ordering::Relaxed;
 
 /// Dograh's own in-memory recording limit: 100MB, ~54 minutes of 16kHz mono.
@@ -66,6 +69,26 @@ impl MixRecorder {
         }
     }
 
+    /// Caller frames that arrived late, in one clump just before the current tick's frame (oldest first).
+    /// They belong to the ticks that were recorded as silence while they were on their way: each is
+    /// mixed back into its own slot, so the recording keeps its length and the two sides stay in step.
+    /// A clump longer than what is recorded so far (the call's start-up) is simply added.
+    pub fn late(&mut self, frames: &[Frame]) {
+        let slots = self.rec.pcm_len() / FRAME_SIZE;
+        if frames.len() > slots {
+            for f in frames {
+                self.frame(f, None);
+            }
+            return;
+        }
+        let pcm = &mut self.rec.0;
+        let mut at = pcm.len() - frames.len() * FRAME_SIZE;
+        for f in frames {
+            mix_into(&mut pcm[at..at + FRAME_SIZE], f);
+            at += FRAME_SIZE;
+        }
+    }
+
     /// The recording as a WAV file (empty if no frame was recorded).
     pub fn finish(mut self) -> Recording {
         let pcm = self.rec.pcm_len();
@@ -111,7 +134,7 @@ pub fn wav(pcm: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::media::{FRAME_SIZE, SILENCE};
+    use crate::media::SILENCE;
 
     fn tone(v: i16) -> Frame {
         let mut f = SILENCE;
@@ -135,6 +158,39 @@ mod tests {
         let pcm = &file[WAV_HEADER..];
         let s = |i: usize| i16::from_le_bytes([pcm[i * FRAME_SIZE], pcm[i * FRAME_SIZE + 1]]);
         assert_eq!((s(0), s(1), s(2)), (1000, 1234, i16::MAX));
+    }
+
+    #[test]
+    fn late_caller_frames_go_back_into_the_ticks_they_missed() {
+        let s = |pcm: &[u8], i: usize| i16::from_le_bytes([pcm[i * FRAME_SIZE], pcm[i * FRAME_SIZE + 1]]);
+        // Three ticks recorded with no caller audio (the agent was speaking 100), then the caller's
+        // frames for the last two of them arrive together.
+        let mut r = MixRecorder::default();
+        for _ in 0..3 {
+            r.frame(&SILENCE, Some(&tone(100)));
+        }
+        r.late(&[tone(1000), tone(2000)]);
+        r.frame(&tone(3000), None);
+        let file = r.finish().into_wav();
+        let pcm = &file[WAV_HEADER..];
+        assert_eq!(pcm.len(), 4 * FRAME_SIZE, "the recording keeps its length: one slot per tick");
+        assert_eq!((s(pcm, 0), s(pcm, 1), s(pcm, 2), s(pcm, 3)), (100, 1100, 2100, 3000), "each late frame is mixed into its own tick");
+
+        // Before anything was recorded (the call's start-up), late frames open the recording.
+        let mut r = MixRecorder::default();
+        r.late(&[tone(7), tone(8)]);
+        r.frame(&tone(9), None);
+        let file = r.finish().into_wav();
+        let pcm = &file[WAV_HEADER..];
+        assert_eq!((pcm.len(), s(pcm, 0), s(pcm, 1), s(pcm, 2)), (3 * FRAME_SIZE, 7, 8, 9));
+
+        // A clump longer than the recording so far is added whole.
+        let mut r = MixRecorder::default();
+        r.frame(&SILENCE, None);
+        r.late(&[tone(1), tone(2), tone(3)]);
+        let file = r.finish().into_wav();
+        let pcm = &file[WAV_HEADER..];
+        assert_eq!((pcm.len(), s(pcm, 1), s(pcm, 2), s(pcm, 3)), (4 * FRAME_SIZE, 1, 2, 3));
     }
 
     #[test]

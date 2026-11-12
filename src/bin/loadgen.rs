@@ -44,6 +44,7 @@ struct Opts {
     duration: u64,
     turn_secs: u64,
     llm_ms: u64,
+    burst: u64,
     db: String,
 }
 
@@ -55,6 +56,8 @@ const HELP: &str = "loadgen: fake Asterisk + mock Sarvam/LLM to load-test one Va
   --duration D     seconds to hold the load before letting calls finish (default 120)
   --turn-secs T    the caller 'speaks' every T seconds, +-30% (default 8)
   --llm-ms M       the mock LLM's time to first token (default 200)
+  --burst N        send the caller's audio N frames at a time, every N x 20 ms, as an Asterisk that
+                   delivers in clumps does (default 1: one frame every 20 ms)
   --host H         address the engine reaches this generator at (default 127.0.0.1)
   --port P         first of four ports: ARI, STT, TTS, LLM (default 18088)
   --db URL         a Postgres to create the `vaani_loadgen` schema in (a minimal Dograh: one workflow).
@@ -72,6 +75,7 @@ fn opts() -> Opts {
         duration: 120,
         turn_secs: 8,
         llm_ms: 200,
+        burst: 1,
         db: String::new(),
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -93,6 +97,7 @@ fn opts() -> Opts {
             "--duration" => o.duration = num(val()) as u64,
             "--turn-secs" => o.turn_secs = (num(val()) as u64).max(1),
             "--llm-ms" => o.llm_ms = num(val()) as u64,
+            "--burst" => o.burst = (num(val()) as u64).clamp(1, 50),
             other => die(&format!("unknown option {other} (try --help)")),
         }
         i += 2;
@@ -193,7 +198,7 @@ async fn main() {
             tokio::time::sleep(Duration::from_secs_f64(slot as f64 / o.ramp)).await;
             let mut n = 0;
             while Instant::now() < deadline {
-                call(&ast, &format!("load-{slot}-{n}"), jitter(o.call_secs * 1000, 0.2)).await;
+                call(&ast, &format!("load-{slot}-{n}"), jitter(o.call_secs * 1000, 0.2), o.burst).await;
                 n += 1;
             }
         }));
@@ -215,7 +220,7 @@ fn jitter(ms: u64, spread: f64) -> Duration {
 // ------------------------------------------------------------------ calls ---
 
 /// One inbound call, from entering Stasis to the caller hanging up after `length`.
-async fn call(ast: &Arc<Asterisk>, id: &str, length: Duration) {
+async fn call(ast: &Arc<Asterisk>, id: &str, length: Duration, burst: u64) {
     let st = &ast.stats;
     let (tx, rx) = oneshot::channel();
     let hung = CancellationToken::new();
@@ -243,7 +248,7 @@ async fn call(ast: &Arc<Asterisk>, id: &str, length: Duration) {
                 st.setup_ms.lock().unwrap().push(entered.elapsed().as_millis() as u64);
                 st.connected.fetch_add(1, Relaxed);
                 st.active.fetch_add(1, Relaxed);
-                stream(sock, &m.uuid, length, &hung, st).await;
+                stream(sock, &m.uuid, length, burst, &hung, st).await;
                 st.active.fetch_sub(1, Relaxed);
             }
         },
@@ -257,7 +262,7 @@ async fn call(ast: &Arc<Asterisk>, id: &str, length: Duration) {
 }
 
 /// The call's audio: a frame of silence out every 20 ms, the agent's frames in.
-async fn stream(sock: TcpStream, uuid: &str, length: Duration, hung: &CancellationToken, st: &Stats) {
+async fn stream(sock: TcpStream, uuid: &str, length: Duration, burst: u64, hung: &CancellationToken, st: &Stats) {
     let _ = sock.set_nodelay(true);
     let (mut rd, mut wr) = sock.into_split();
     let id: Vec<u8> =
@@ -298,7 +303,7 @@ async fn stream(sock: TcpStream, uuid: &str, length: Duration, hung: &Cancellati
         }
     };
     let writer = async {
-        let mut tick = tokio::time::interval(Duration::from_millis(20));
+        let mut tick = tokio::time::interval(Duration::from_millis(20 * burst));
         tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let end = tokio::time::sleep(length);
         tokio::pin!(end);
@@ -308,8 +313,12 @@ async fn stream(sock: TcpStream, uuid: &str, length: Duration, hung: &Cancellati
                 _ = hung.cancelled() => break,
                 _ = closed.cancelled() => { st.media_lost.fetch_add(1, Relaxed); break }
                 _ = tick.tick() => {
-                    if wr.write_all(&frame).await.is_err() { st.media_lost.fetch_add(1, Relaxed); break }
-                    st.frames_out.fetch_add(1, Relaxed);
+                    let mut failed = false;
+                    for _ in 0..burst {
+                        failed |= wr.write_all(&frame).await.is_err();
+                    }
+                    if failed { st.media_lost.fetch_add(1, Relaxed); break }
+                    st.frames_out.fetch_add(burst, Relaxed);
                 }
             }
         }

@@ -27,7 +27,8 @@ to-port list.
    (coalesces after a stall). Never `sleep(20ms)` loops, never the default `Burst`.
 2. **Media = ARI externalMedia over AudioSocket** (`transport=tcp`, `slin16`). RTP is out of scope.
 3. **No allocation per frame**: frames are `Frame = [u8; 640]` moved by value.
-4. **Two tasks per call** (reader, writer) joined to the agent by bounded channels (cap 5); never a task per frame.
+4. **Two tasks per call** (reader, writer) joined to the agent by bounded channels (agent audio out: cap 5; caller audio in:
+   cap 50, and the agent's tick takes EVERY frame waiting, `Agent::hear_late`, never one per tick); never a task per frame.
 5. **One shared HTTP client** (`ai::llm::http()`, HTTP/2, 200 idle/host). No per-request clients.
 6. **One ARI WebSocket per process** (`ari::run_events`).
 7. **Barge-in = 5 cuts, only once CONFIRMED** (`Agent::confirm_interruption` → `cut_reply`): stop feeding

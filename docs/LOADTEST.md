@@ -15,6 +15,10 @@ fail. It says nothing about Asterisk, the SIP trunk or the real providers; those
 - `--concurrent` calls are kept up for `--duration` seconds: when a call ends (after `--call-secs`, +-20%), its
   slot starts the next one.
 
+`--burst N` sends the caller's audio N frames at a time (every N x 20 ms), as an Asterisk that delivers in
+clumps does; the engine must still hear every frame (`vaani_media_inbound_dropped_total` stays 0 and
+`vaani_media_inbound_late_total` counts the frames that arrived behind another).
+
 Not simulated: outbound dialing, transfers, barge-in (the caller's audio is silence), TLS to the providers,
 recording upload (leave `MINIO_ENDPOINT` empty), Dograh's real workflow (one node, no tools).
 

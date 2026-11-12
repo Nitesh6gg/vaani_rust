@@ -213,6 +213,9 @@ pub static AUDIOSOCKET_MALFORMED: AtomicU64 = AtomicU64::new(0);
 pub static MEDIA_QUEUE_DROPPED: AtomicU64 = AtomicU64::new(0);
 /// Caller frames dropped because the agent's tick was behind (the reader never blocks).
 pub static MEDIA_INBOUND_DROPPED: AtomicU64 = AtomicU64::new(0);
+/// Caller frames that arrived more than one to a tick (start-up, or a clump from Asterisk) and were
+/// still heard: they would have been dropped before the agent took every waiting frame.
+pub static MEDIA_INBOUND_LATE: AtomicU64 = AtomicU64::new(0);
 /// Calls whose media ended with no inbound audio for MEDIA_DEAD_TIMEOUT_SECONDS (the Go server's watchdog
 /// counts at 5 s and hangs up at the timeout; here the one event is the hangup).
 pub static MEDIA_WATCHDOG_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
@@ -354,6 +357,7 @@ pub fn render() -> String {
          # TYPE vaani_audiosocket_malformed_total counter\nvaani_audiosocket_malformed_total {}\n\
          # TYPE vaani_media_queue_dropped_total counter\nvaani_media_queue_dropped_total {}\n\
          # TYPE vaani_media_inbound_dropped_total counter\nvaani_media_inbound_dropped_total {}\n\
+         # TYPE vaani_media_inbound_late_total counter\nvaani_media_inbound_late_total {}\n\
          # TYPE vaani_media_watchdog_timeouts_total counter\nvaani_media_watchdog_timeouts_total {}\n\
          # TYPE vaani_ari_reconnects_total counter\nvaani_ari_reconnects_total {}\n\
          # TYPE vaani_recording_bytes gauge\nvaani_recording_bytes {}\n",
@@ -371,6 +375,7 @@ pub fn render() -> String {
         c(&AUDIOSOCKET_MALFORMED),
         c(&MEDIA_QUEUE_DROPPED),
         c(&MEDIA_INBOUND_DROPPED),
+        c(&MEDIA_INBOUND_LATE),
         c(&MEDIA_WATCHDOG_TIMEOUTS),
         c(&ARI_RECONNECTS),
         c(&RECORDING_BYTES),

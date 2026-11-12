@@ -1,7 +1,7 @@
 //! One call's media plane over an accepted AudioSocket TCP connection:
 //!
 //! ```text
-//! TCP read -> reader task -> inbound (cap 5) -> [agent's 20ms release tick]
+//! TCP read -> reader task -> inbound (cap 50) -> [agent's 20ms tick takes all that wait]
 //! [agent] -> outbound (cap 5) -> writer task (own 20ms tick) -> TCP write
 //! ```
 //!
@@ -28,8 +28,13 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-/// Queue depth between the tasks (~100ms of audio).
+/// Agent audio waiting for the writer (~100ms).
 const QUEUE: usize = 5;
+/// Caller audio waiting for the agent (1 s). The agent takes everything waiting on each tick, so this
+/// only fills while it can't: as the call starts (the workflow loading, the STT connecting) or when
+/// Asterisk delivers a clump of frames after a stall. With 5 slots here and one frame taken per tick,
+/// 40% of the calls of a real campaign lost caller audio, mostly their first words.
+pub const INBOUND_QUEUE: usize = 50;
 
 #[derive(Default)]
 pub struct MediaStats {
@@ -42,7 +47,7 @@ pub struct MediaStats {
 
 pub struct MediaIo {
     /// Caller audio, 20ms frames. Empty between arrivals: the consumer
-    /// substitutes silence on its own tick.
+    /// substitutes silence on its own tick, and takes every frame waiting when several are.
     pub inbound: mpsc::Receiver<Frame>,
     /// Agent audio to play. `try_send`: a full queue drops (never blocks the tick).
     pub outbound: mpsc::Sender<Frame>,
@@ -63,7 +68,7 @@ pub fn new_ticker() -> time::Interval {
 pub fn spawn(call_id: String, stream: TcpStream, dead_after: Duration, cancel: CancellationToken) -> MediaIo {
     let _ = stream.set_nodelay(true);
     let (rd, mut wr) = stream.into_split();
-    let (in_tx, in_rx) = mpsc::channel::<Frame>(QUEUE);
+    let (in_tx, in_rx) = mpsc::channel::<Frame>(INBOUND_QUEUE);
     let (out_tx, mut out_rx) = mpsc::channel::<Frame>(QUEUE);
     let closed = CancellationToken::new();
     let stats = Arc::new(MediaStats::default());

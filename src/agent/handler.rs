@@ -417,13 +417,30 @@ pub async fn run(cfg: AgentConfig, io: AgentIo, cancel: CancellationToken) -> (S
     a.start();
 
     let mut tick = new_ticker();
+    let mut backlog: Vec<Frame> = Vec::new(); // reused: allocates only the first time frames arrive late
     loop {
         tokio::select! {
             biased;
             _ = cancel.cancelled() => break,
             _ = media.closed.cancelled() => break,
             _ = tick.tick() => {
-                let pcm = media.inbound.try_recv().unwrap_or(SILENCE);
+                // Everything the caller sent since the last tick. Normally one frame; several after the
+                // call's start-up or a clump from Asterisk. The older ones are heard (STT, VAD, recording)
+                // and the newest takes the tick: taking one per tick could never catch up, and the queue's
+                // overflow was the caller's words.
+                let mut pcm = media.inbound.try_recv().unwrap_or(SILENCE);
+                let mut late = 0;
+                while let Ok(next) = media.inbound.try_recv() {
+                    a.hear_late(&pcm);
+                    backlog.push(pcm);
+                    pcm = next;
+                    late += 1;
+                }
+                if late > 0 {
+                    metrics::MEDIA_INBOUND_LATE.fetch_add(late, Relaxed);
+                    a.recorder.late(&backlog);
+                    backlog.clear();
+                }
                 let out = a.process_frame(&pcm);
                 a.recorder.frame(&pcm, out.as_ref());
                 if let Some(out) = out
@@ -586,6 +603,16 @@ impl Agent {
                 None
             }
         }
+    }
+
+    /// A caller frame that arrived behind others in one tick: it reaches the STT and the VAD like any
+    /// frame, but takes no tick of its own (nothing is played for it, and it decides no barge-in).
+    fn hear_late(&mut self, pcm: &Frame) {
+        if self.hold.is_some() {
+            return; // during a transfer nothing reaches the STT
+        }
+        self.feed_stt(pcm);
+        self.cfg.vad.detect(pcm);
     }
 
     fn process_hold_frame(&mut self) -> Option<Frame> {
