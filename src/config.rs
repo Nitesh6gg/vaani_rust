@@ -54,6 +54,16 @@ pub struct Config {
     /// How often Asterisk's channels are listed and those of this ARI app that Vaani lost track of are
     /// hung up (ORPHAN_SWEEP_SECONDS, default 30; 0 = off). Needs this Vaani to be the only one on its ARI app name.
     pub orphan_sweep: Duration,
+    /// How many ended calls finish their Dograh record at once (POST_CALL_WORKERS, default 32): the
+    /// last extraction, the run's completion, the recording and transcript uploads, the cost. The rest wait
+    /// (their recordings stay in memory), so a burst of hang-ups can't open hundreds of uploads and LLM calls at once.
+    pub post_call_workers: usize,
+    /// How long a shutdown (SIGTERM) waits for calls still cleaning up and records still being written before
+    /// giving up (SHUTDOWN_WAIT_SECONDS, default 60). It returns as soon as they are done.
+    pub shutdown_wait: Duration,
+    /// Connections to Redis for the campaign dialer (REDIS_POOL_SIZE, default 4, 1 to 64): commands are spread
+    /// over them, so one stalled reply doesn't hold up every dial worker.
+    pub redis_pool_size: usize,
     /// A staged call whose media channel doesn't enter Stasis within this long is hung up (15 s; not a setting).
     pub setup_timeout: Duration,
     /// While the machine's CPU (a 5-second average, Asterisk included) is at or over this percent, new
@@ -172,6 +182,9 @@ impl Config {
             campaign_dial_workers: get_num("CAMPAIGN_DIAL_WORKERS", 10)?,
             outbound_max_setup: get_num("OUTBOUND_MAX_SETUP", 30)?,
             orphan_sweep: secs("ORPHAN_SWEEP_SECONDS", 30)?,
+            post_call_workers: get_num("POST_CALL_WORKERS", 32)?,
+            shutdown_wait: secs("SHUTDOWN_WAIT_SECONDS", 60)?,
+            redis_pool_size: get_num("REDIS_POOL_SIZE", 4)?,
             setup_timeout: Duration::from_secs(15),
             load_shed_cpu_percent: get_num("LOAD_SHED_CPU_PERCENT", 90)?,
             load_resume_percent: get_num("LOAD_SHED_RESUME_PERCENT", 80)?,
@@ -227,6 +240,14 @@ impl Config {
         }
         if self.outbound_default_org_concurrency < 1 || self.campaign_poll.is_zero() {
             bail!("config: OUTBOUND_DEFAULT_ORG_CONCURRENCY and CAMPAIGN_POLL_SECONDS must be at least 1");
+        }
+        if self.post_call_workers < 1 || self.shutdown_wait.is_zero() || !(1..=64).contains(&self.redis_pool_size) {
+            bail!(
+                "config: POST_CALL_WORKERS and SHUTDOWN_WAIT_SECONDS must be at least 1, REDIS_POOL_SIZE 1 to 64, got {}, {}, {}",
+                self.post_call_workers,
+                self.shutdown_wait.as_secs(),
+                self.redis_pool_size
+            );
         }
         if self.campaign_dial_workers < 1 {
             bail!("config: CAMPAIGN_DIAL_WORKERS must be at least 1, got {}", self.campaign_dial_workers);
@@ -288,6 +309,9 @@ impl Config {
             campaign_dial_workers: 1,
             outbound_max_setup: 0,
             orphan_sweep: Duration::ZERO,
+            post_call_workers: 32,
+            shutdown_wait: Duration::from_secs(10),
+            redis_pool_size: 4,
             setup_timeout: Duration::from_secs(15),
             load_shed_cpu_percent: 0,
             load_resume_percent: 80,
@@ -340,5 +364,17 @@ mod tests {
         assert!(c.validate().is_ok());
         c.campaign_dial_workers = 0;
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn the_post_call_pool_shutdown_wait_and_redis_pool_are_validated() {
+        let mut c = valid();
+        assert!(c.validate().is_ok());
+        for (workers, wait, pool) in [(0, 60, 4), (32, 0, 4), (32, 60, 0), (32, 60, 65)] {
+            (c.post_call_workers, c.shutdown_wait, c.redis_pool_size) = (workers, Duration::from_secs(wait), pool);
+            assert!(c.validate().is_err(), "{workers}/{wait}/{pool}");
+        }
+        (c.post_call_workers, c.shutdown_wait, c.redis_pool_size) = (8, Duration::from_secs(120), 64);
+        assert!(c.validate().is_ok());
     }
 }

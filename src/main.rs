@@ -88,7 +88,7 @@ async fn main() -> Result<()> {
         manager.set_overloaded(f);
     }
     let runner = if cfg.campaigns_enabled {
-        let lim = campaign::limiter::Limiter::connect(&cfg.redis_url, cfg.outbound_max_calls).await?;
+        let lim = campaign::limiter::Limiter::connect_with(&cfg.redis_url, cfg.outbound_max_calls, cfg.redis_pool_size).await?;
         let rcfg = campaign::runner::RunnerConfig {
             poll: cfg.campaign_poll,
             default_org_limit: cfg.outbound_default_org_concurrency,

@@ -222,6 +222,25 @@ pub static MEDIA_INBOUND_LATE: AtomicU64 = AtomicU64::new(0);
 /// counts at 5 s and hangs up at the timeout; here the one event is the hangup).
 pub static MEDIA_WATCHDOG_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 pub static ARI_RECONNECTS: AtomicU64 = AtomicU64::new(0);
+/// Ended calls writing their Dograh record right now, and waiting for a worker to do so (`POST_CALL_WORKERS`).
+pub static POST_CALL_RUNNING: AtomicU64 = AtomicU64::new(0);
+pub static POST_CALL_WAITING: AtomicU64 = AtomicU64::new(0);
+
+/// Counts `gauge` up while it lives: right even when the task holding it is dropped mid-way.
+pub struct Counted(&'static AtomicU64);
+
+impl Counted {
+    pub fn new(gauge: &'static AtomicU64) -> Self {
+        gauge.fetch_add(1, Relaxed);
+        Self(gauge)
+    }
+}
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Relaxed);
+    }
+}
 /// Callers that gave up waiting for a free Postgres connection (`vaani_db_pool_timeouts_total`).
 pub static DB_POOL_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 
@@ -336,6 +355,12 @@ vaani_redis_errors_total {}
          # TYPE vaani_db_pool_max gauge\nvaani_db_pool_max {max}\n\
          # TYPE vaani_db_pool_timeouts_total counter\nvaani_db_pool_timeouts_total {}\n",
         DB_POOL_TIMEOUTS.load(Relaxed)
+    ));
+    out.push_str(&format!(
+        "# TYPE vaani_post_call_running gauge\nvaani_post_call_running {}\n\
+         # TYPE vaani_post_call_waiting gauge\nvaani_post_call_waiting {}\n",
+        POST_CALL_RUNNING.load(Relaxed),
+        POST_CALL_WAITING.load(Relaxed)
     ));
     out.push_str("# TYPE vaani_calls_rejected_total counter\n");
     for ((reason, direction), c) in REJECTED_LABELS.iter().zip(&CALLS_REJECTED) {
@@ -571,6 +596,8 @@ mod tests {
             "vaani_recording_truncated_total",
             "vaani_ari_reconnects_total",
             "vaani_recording_bytes",
+            "vaani_post_call_running",
+            "vaani_post_call_waiting",
             "vaani_db_pool_in_use",
             "vaani_db_pool_waiting",
             "vaani_db_pool_max",

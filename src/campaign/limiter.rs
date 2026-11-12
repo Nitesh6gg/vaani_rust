@@ -20,7 +20,8 @@ use std::{
 
 /// Connections to Redis: one multiplexed connection shared by every dial worker lets a single stalled reply
 /// hold up all of them, so the commands are spread over a few.
-const POOL_SIZE: usize = 4;
+#[cfg(test)]
+const DEFAULT_POOL_SIZE: usize = 4;
 /// How long a command may wait for its reply, and a connection for being made: as long as the Go engine's
 /// Redis client (go-redis) waits, so a stall of a few seconds is not reported as an error.
 const REDIS_TIMEOUT: Duration = Duration::from_secs(5);
@@ -210,11 +211,17 @@ pub struct Limiter {
 }
 
 impl Limiter {
+    #[cfg(test)]
     pub async fn connect(url: &str, max_calls: u32) -> Result<Self> {
+        Self::connect_with(url, max_calls, DEFAULT_POOL_SIZE).await
+    }
+
+    /// Connects `pool_size` connections (REDIS_POOL_SIZE).
+    pub async fn connect_with(url: &str, max_calls: u32, pool_size: usize) -> Result<Self> {
         let client = redis::Client::open(url).context("campaign: redis url")?;
         let cfg = || ConnectionManagerConfig::new().set_response_timeout(Some(REDIS_TIMEOUT)).set_connection_timeout(Some(REDIS_TIMEOUT));
-        let mut conns = Vec::with_capacity(POOL_SIZE);
-        for _ in 0..POOL_SIZE {
+        let mut conns = Vec::with_capacity(pool_size);
+        for _ in 0..pool_size {
             conns.push(ConnectionManager::new_with_config(client.clone(), cfg()).await.context("campaign: connect to redis")?);
         }
         Ok(Self {
@@ -411,6 +418,19 @@ mod tests {
         l.advance(Duration::from_millis(1100));
         assert!(l.acquire_token(org, 2).await.unwrap(), "the window moved on");
         assert_eq!(l.next_token_wait(org + 1).await, Duration::ZERO, "an untouched organization never waits");
+    }
+
+    #[tokio::test]
+    async fn the_redis_pool_has_the_configured_size_and_works() {
+        let Ok(url) = std::env::var("REDIS_TEST_URL") else { return eprintln!("skipped: REDIS_TEST_URL not set") };
+        let org = (rand::random::<u32>() >> 2) as i32;
+        for size in [1, 7] {
+            let l = Limiter::connect_with(&url, 0, size).await.unwrap();
+            assert_eq!(l.pool.conns.len(), size);
+            for _ in 0..size * 2 {
+                assert!(l.acquire_token(org, 1000).await.unwrap(), "every connection of the pool answers");
+            }
+        }
     }
 
     #[tokio::test]

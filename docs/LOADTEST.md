@@ -132,3 +132,12 @@ The uploads no longer need a connection; the pool is touched for statements only
 `loading_workflows_with_clips_never_needs_a_second_connection_while_holding_one`): both failed before the fix.
 Uploads now overlap freely (120 in flight here): bound them (Phase 2) before running at production size.
 
+### Uploads bounded (Phase 2, same scenario, `POST_CALL_WORKERS=8`)
+
+With the post-call pool the 4 s MinIO is no longer hit by every ending call at once: the same run (120 concurrent,
+12 s calls, 4 s uploads) had **at most 8 uploads in flight** (120 before), 457 calls all with an agent (1.00, 0 media
+lost, 0 engine errors). The calls ending faster than 8 workers can upload (10 a second against 2) wait, recordings in
+memory, and `vaani_post_call_waiting` shows the backlog; a SIGTERM waits `SHUTDOWN_WAIT_SECONDS` (60 s) for it, so a
+backlog beyond that is lost at a restart (a persistent queue is not built). Size `POST_CALL_WORKERS` to MinIO and Postgres:
+workers = end rate per second x seconds one record takes (30 s calls, 500 calls a node: 17 a second x about 1 s = 17).
+

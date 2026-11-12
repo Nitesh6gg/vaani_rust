@@ -25,6 +25,7 @@ The same names, labels and histogram buckets the Go engine exports, so one set o
 | `vaani_media_inbound_late_total` | caller frames that arrived more than one to a tick (call start-up, a clump from Asterisk) and were still heard |
 | `vaani_recording_truncated_total`, `vaani_ari_reconnects_total`, `vaani_ari_event_queue_length` | |
 | `vaani_recording_bytes` | call recordings held in memory right now (about 1.9 MB per call-minute) |
+| `vaani_post_call_running`, `vaani_post_call_waiting` | ended calls writing their Dograh record (`POST_CALL_WORKERS` at most), and waiting for a worker. Waiting that keeps growing means MinIO or Postgres is slower than calls end: recordings pile up in memory |
 | `vaani_db_pool_in_use`, `vaani_db_pool_waiting`, `vaani_db_pool_max`, `vaani_db_pool_timeouts_total` | the Dograh Postgres pool: connections in use, callers waiting, its size, callers that gave up waiting. Waiting above 0 for more than a moment means the pool is too small or something holds connections |
 | `vaani_cpu_load_ratio`, `vaani_overloaded`, `vaani_calls_rejected_total{reason,direction}`, `vaani_calls_setup_timeout_total`, `vaani_orphan_channels_hung_up_total` | CPU guard and call-setup safety nets |
 | `vaani_campaign_*` | outbound campaigns (see `OUTBOUND.md`) |

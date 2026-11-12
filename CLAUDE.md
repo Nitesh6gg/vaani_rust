@@ -44,6 +44,8 @@ to-port list.
 - **A pooled Postgres connection (`Store::db()`) is held for statements only**: never across a MinIO transfer, an LLM call, a clip
   download, or while asking for a second connection (`finish_run` releases it before uploads; `workflow` before loading clips).
   A pool whose connections are all held by tasks that want another never recovers; `for_test_pool` (pool of 1-2) reproduces it.
+- **Post-call work is bounded** (`Manager::record_run`, `POST_CALL_WORKERS`): at most that many ended calls write their Dograh
+  record at once; shutdown waits `SHUTDOWN_WAIT_SECONDS` for them. New per-call work after teardown goes through the same pool.
 - Errors: `anyhow` with `.context()`, never panic in the request path. Logging: `tracing`, `call_id` on
   every call line, an `event` field (`turn.user`, `call.summary`, …). INFO tells the call's story; detail is DEBUG.
 - Edition 2024: `gen` is reserved — use `generation`.

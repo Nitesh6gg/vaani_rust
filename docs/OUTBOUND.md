@@ -25,6 +25,7 @@ An organization's **media engine** decides. A superadmin sets it per organizatio
 | `OUTBOUND_DEFAULT_ORG_CONCURRENCY` | 2 | Limit of an organization with none set (Dograh's default). |
 | `CAMPAIGN_POLL_SECONDS` | 5 | How often Dograh's database is scanned. A call ending wakes the scan at once. |
 | `CAMPAIGN_DIAL_WORKERS` | 10 | Contacts of one campaign dialed at the same time (see "How fast it dials"). 1 = one at a time. |
+| `REDIS_POOL_SIZE` | 4 | Redis connections of the dialer (1-64); commands are spread over them so one stalled reply doesn't hold up every dial worker. |
 | `OUTBOUND_MAX_SETUP` | 30 | The dialer places no call while this many answered calls are still being set up (staged, not yet bridged). 0 = no cap. |
 | `OUTBOUND_RING_TIMEOUT_SECONDS` | 30 | Ring time before a call counts as unanswered (5-300). |
 | `OUTBOUND_TEST_CALL` | | `"<number>,<org id>,<workflow id>"`: dial once at startup, outside any campaign. |

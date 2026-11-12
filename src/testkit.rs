@@ -183,6 +183,14 @@ pub(crate) async fn mock_minio() -> (String, Arc<Mutex<Vec<(String, Vec<u8>)>>>)
 
 /// `mock_minio` that takes `delay` to answer each PUT (a MinIO under load).
 pub(crate) async fn mock_minio_slow(delay: std::time::Duration) -> (String, Arc<Mutex<Vec<(String, Vec<u8>)>>>) {
+    let (addr, puts, _) = mock_minio_peak(delay).await;
+    (addr, puts)
+}
+
+/// `mock_minio_slow` that also reports the most uploads it ever had in flight at once.
+pub(crate) async fn mock_minio_peak(delay: std::time::Duration) -> (String, Arc<Mutex<Vec<(String, Vec<u8>)>>>, Arc<AtomicUsize>) {
+    let (now, peak) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let peak_out = peak.clone();
     let lis = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = lis.local_addr().unwrap().to_string();
     let puts = Arc::new(Mutex::new(vec![]));
@@ -190,7 +198,7 @@ pub(crate) async fn mock_minio_slow(delay: std::time::Duration) -> (String, Arc<
     tokio::spawn(async move {
         loop {
             let (mut s, _) = lis.accept().await.unwrap();
-            let p = p.clone();
+            let (p, now, peak) = (p.clone(), now.clone(), peak.clone());
             tokio::spawn(async move {
                 let mut buf = vec![];
                 loop {
@@ -212,14 +220,17 @@ pub(crate) async fn mock_minio_slow(delay: std::time::Duration) -> (String, Arc<
                     }
                     let path = head.lines().next().unwrap().split_whitespace().nth(1).unwrap().to_string();
                     p.lock().unwrap().push((path, buf[split + 4..split + 4 + len].to_vec()));
+                    let n = now.fetch_add(1, SeqCst) + 1;
+                    peak.fetch_max(n, SeqCst);
                     tokio::time::sleep(delay).await;
+                    now.fetch_sub(1, SeqCst);
                     let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
                     return;
                 }
             });
         }
     });
-    (addr, puts)
+    (addr, puts, peak_out)
 }
 
 /// Mock MinIO serving GET for the given objects ("/bucket/key" -> bytes); 404 otherwise.

@@ -139,6 +139,8 @@ pub struct Manager {
     /// Says the machine is too busy for another call (the CPU guard); set once, before `run`.
     overloaded: OnceLock<Probe<bool>>,
     setup_sem: Arc<Semaphore>,
+    /// Ended calls finishing their Dograh record at once (`POST_CALL_WORKERS`).
+    post_call_sem: Arc<Semaphore>,
 }
 
 /// What happened to a ringing transfer destination.
@@ -151,6 +153,7 @@ enum TransferSignal {
 impl Manager {
     pub fn new(ari: Ari, cfg: Arc<Config>, store: Store) -> Arc<Self> {
         let ports = PortAllocator::new(cfg.media_port_base, cfg.media_port_count);
+        let cfg_post_call_workers = cfg.post_call_workers;
         Arc::new(Self {
             ari,
             cfg,
@@ -162,6 +165,7 @@ impl Manager {
             tracker: TaskTracker::new(),
             overloaded: OnceLock::new(),
             setup_sem: Arc::new(Semaphore::new(MAX_CONCURRENT_SETUPS)),
+            post_call_sem: Arc::new(Semaphore::new(cfg_post_call_workers)),
         })
     }
 
@@ -231,8 +235,17 @@ impl Manager {
         self.hangup_ringing_outbound();
         self.teardown_all();
         self.tracker.close();
-        if tokio::time::timeout(Duration::from_secs(10), self.tracker.wait()).await.is_err() {
-            tracing::warn!("shutdown: calls still cleaning up after 10s");
+        // Calls ending now are still writing their Dograh records (recordings upload, costs): wait for them, as
+        // long as SHUTDOWN_WAIT_SECONDS allows, and no longer than they need.
+        let wait = self.cfg.shutdown_wait;
+        if tokio::time::timeout(wait, self.tracker.wait()).await.is_err() {
+            tracing::warn!(
+                event = "shutdown.incomplete",
+                waited_s = wait.as_secs(),
+                records_running = metrics::POST_CALL_RUNNING.load(Relaxed),
+                records_waiting = metrics::POST_CALL_WAITING.load(Relaxed),
+                "shutdown: calls and records still being written after the wait; giving up on them"
+            );
         }
     }
 
@@ -578,7 +591,22 @@ impl Manager {
     /// Completes the call's run in Dograh: conversation, usage, disposition, and
     /// the recording and transcript uploaded to MinIO. Failures are logged; the
     /// call itself is never affected. Runs AFTER teardown, so a slow upload never holds the call's port.
-    async fn record_run(&self, id: &str, mut end: CallEnd) {
+    /// Writes the ended call's Dograh record, at most `POST_CALL_WORKERS` calls at a time: a burst of hang-ups
+    /// would otherwise open an extraction, a pair of uploads and several statements for every one of them at
+    /// once. A call waiting for a worker keeps its recording in memory (`vaani_post_call_waiting`).
+    async fn record_run(&self, id: &str, end: CallEnd) {
+        let waiting = metrics::Counted::new(&metrics::POST_CALL_WAITING);
+        let queued = std::time::Instant::now();
+        let Ok(_permit) = self.post_call_sem.acquire().await else { return };
+        drop(waiting);
+        let _running = metrics::Counted::new(&metrics::POST_CALL_RUNNING);
+        if queued.elapsed() >= Duration::from_secs(5) {
+            tracing::info!(call_id = %id, event = "post_call.queued", waited_ms = queued.elapsed().as_millis() as u64, "this call's record waited for a post-call worker");
+        }
+        self.record_run_now(id, end).await;
+    }
+
+    async fn record_run_now(&self, id: &str, mut end: CallEnd) {
         // Dograh's end-of-call extraction, now that the call is torn down.
         end.finisher.finish(&mut end.summary).await;
         let run_id = match end.run.await {
@@ -1455,5 +1483,126 @@ mod tests {
         mgr.calls.lock().unwrap().extend([("b".to_string(), bridged.clone()), ("b-ext".to_string(), bridged.clone())]);
         mgr.teardown(&bridged);
         assert!(metrics::CALL_DURATION_SECONDS.count() > before);
+    }
+
+    /// A manager with a slow mock MinIO and Dograh's run tables holding runs 1..=8, for the post-call tests.
+    async fn post_call_mgr(
+        schema: &str,
+        upload_ms: u64,
+        tweak: impl FnOnce(&mut Config),
+    ) -> Option<(Arc<Manager>, Arc<Mutex<Vec<(String, Vec<u8>)>>>, Arc<std::sync::atomic::AtomicUsize>)> {
+        let (ari_url, _log, _ext) = mock_ari().await;
+        let (minio, puts, peak) = crate::testkit::mock_minio_peak(Duration::from_millis(upload_ms)).await;
+        let (store, _) = Store::for_test(
+            schema,
+            &format!(
+                "{}
+                 INSERT INTO workflow_runs (id, name, workflow_id, state, is_completed, usage_info, cost_info, gathered_context, logs)
+                   SELECT g, 'r', 42, 'running', false, '{{}}', '{{}}', '{{}}', '{{}}' FROM generate_series(1, 8) g;",
+                crate::testkit::CAMPAIGN_SCHEMA
+            ),
+        )
+        .await?;
+        let mut cfg = Config::for_test("");
+        (cfg.minio_endpoint, cfg.minio_access_key, cfg.minio_secret_key) = (minio, "a".into(), "b".into());
+        tweak(&mut cfg);
+        Some((Manager::new(Ari::new(&ari_url, "u", "p", "vaani"), Arc::new(cfg), store), puts, peak))
+    }
+
+    /// An ended call whose run is `run_id`, with a recording to upload.
+    fn call_end(run_id: i64) -> CallEnd {
+        let mut rec = crate::agent::recorder::MixRecorder::default();
+        rec.frame(&crate::media::SILENCE, None);
+        CallEnd {
+            meta: RunMeta { workflow_id: 42, definition_id: 1, org_id: None, stt_model: "m".into(), tts_model: "m".into() },
+            run: tokio::spawn(async move { Ok(run_id) }),
+            summary: calllog::Summary { recording: rec.finish(), ..Default::default() },
+            finisher: extract::Finisher {
+                call_id: format!("c{run_id}"),
+                llm: crate::ai::llm::LlmClient::new("http://127.0.0.1:1", "k", "m"),
+                pending: vec![],
+                last: None,
+            },
+            duration: Duration::from_secs(5),
+        }
+    }
+
+    /// A burst of hang-ups must not open an upload (and an extraction, and a cost update) per call: at most
+    /// `POST_CALL_WORKERS` ended calls finish their record at once, the rest wait their turn, and all finish.
+    #[tokio::test]
+    async fn post_call_work_is_bounded_and_all_of_it_gets_done() {
+        let Some((mgr, puts, peak)) = post_call_mgr("t_post_call_bounded", 400, |c| c.post_call_workers = 2).await else {
+            return eprintln!("skipped: DOGRAH_TEST_DB_URL not set");
+        };
+        let started = std::time::Instant::now();
+        let jobs: Vec<_> = (1..=6)
+            .map(|i| {
+                let m = mgr.clone();
+                tokio::spawn(async move { m.record_run(&format!("c{i}"), call_end(i)).await })
+            })
+            .collect();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(mgr.post_call_sem.available_permits(), 0, "both workers are busy while four calls wait");
+        for j in jobs {
+            j.await.unwrap();
+        }
+        assert_eq!(puts.lock().unwrap().len(), 6, "every call's recording was uploaded");
+        assert!(peak.load(Relaxed) <= 2, "at most 2 uploads at once, saw {}", peak.load(Relaxed));
+        assert!(started.elapsed() >= Duration::from_millis(1100), "six 400 ms uploads, two at a time: {:?}", started.elapsed());
+        assert_eq!(mgr.post_call_sem.available_permits(), 2, "the workers are free again");
+        let rows = mgr
+            .store
+            .db()
+            .await
+            .unwrap()
+            .query_one("SELECT count(*) FROM workflow_runs WHERE recording_url IS NOT NULL", &[])
+            .await
+            .unwrap();
+        assert_eq!(rows.get::<_, i64>(0), 6, "and every run has its recording attached");
+    }
+
+    /// Shutdown waits for the records being written, as long as SHUTDOWN_WAIT_SECONDS allows, and returns as soon as they are done.
+    #[tokio::test]
+    async fn shutdown_waits_for_the_records_being_written() {
+        let Some((mgr, _puts, _)) = post_call_mgr("t_shutdown_waits", 700, |c| c.shutdown_wait = Duration::from_secs(5)).await else {
+            return eprintln!("skipped: DOGRAH_TEST_DB_URL not set");
+        };
+        let (_ev_tx, ev_rx) = mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        let run = tokio::spawn(mgr.clone().run(ev_rx, cancel.clone()));
+        let m = mgr.clone();
+        mgr.tracker.spawn(async move { m.record_run("c1", call_end(1)).await });
+        tokio::time::sleep(Duration::from_millis(150)).await; // the upload is under way
+        cancel.cancel();
+        run.await.unwrap();
+        let row = mgr.store.db().await.unwrap().query_one("SELECT recording_url FROM workflow_runs WHERE id = 1", &[]).await.unwrap();
+        assert_eq!(
+            row.get::<_, Option<String>>(0).as_deref(),
+            Some("recordings/1.wav"),
+            "shutdown did not return before the upload finished"
+        );
+    }
+
+    /// ... and gives up after SHUTDOWN_WAIT_SECONDS, not a fixed 10 s.
+    #[tokio::test]
+    async fn shutdown_gives_up_after_the_configured_wait() {
+        let Some((mgr, _puts, _)) = post_call_mgr("t_shutdown_gives_up", 3000, |c| c.shutdown_wait = Duration::from_millis(300)).await
+        else {
+            return eprintln!("skipped: DOGRAH_TEST_DB_URL not set");
+        };
+        let (_ev_tx, ev_rx) = mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        let run = tokio::spawn(mgr.clone().run(ev_rx, cancel.clone()));
+        let m = mgr.clone();
+        mgr.tracker.spawn(async move { m.record_run("c1", call_end(1)).await });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let started = std::time::Instant::now();
+        cancel.cancel();
+        run.await.unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "returned after the configured wait, not when the 3 s upload finished: {:?}",
+            started.elapsed()
+        );
     }
 }
