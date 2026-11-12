@@ -15,12 +15,17 @@ fail. It says nothing about Asterisk, the SIP trunk or the real providers; those
 - `--concurrent` calls are kept up for `--duration` seconds: when a call ends (after `--call-secs`, +-20%), its
   slot starts the next one.
 
+`--minio-ms M` makes the mock MinIO answer each upload in M ms (default 50), and `--metrics URL` (the engine's
+`/metrics`) reports its Postgres pool every 5 s and its peak in the summary: with `--minio-ms 4000` and a small
+`DOGRAH_DB_MAX_CONNS` it shows whether a slow MinIO starves Postgres (it printed the engine's recordings upload too:
+the generator no longer needs `MINIO_ENDPOINT` left empty; the printed environment points the engine at the mock).
+
 `--burst N` sends the caller's audio N frames at a time (every N x 20 ms), as an Asterisk that delivers in
 clumps does; the engine must still hear every frame (`vaani_media_inbound_dropped_total` stays 0 and
 `vaani_media_inbound_late_total` counts the frames that arrived behind another).
 
 Not simulated: outbound dialing, transfers, barge-in (the caller's audio is silence), TLS to the providers,
-recording upload (leave `MINIO_ENDPOINT` empty), Dograh's real workflow (one node, no tools).
+Dograh's real workflow (one node, no tools, no recorded clips: the clip-loading path is covered by a unit test).
 
 ## Running it
 
@@ -109,3 +114,21 @@ no TLS, no recording upload, `LOG_LEVEL=warn`, OTLP off, `ulimit -n 65536` on bo
 - **What it shows**: one Rust engine carries 1,000 concurrent calls on this box with room to spare. **What it does
   not show**: real per-call CPU (a real run cost 0.0144 core per call, about 3× this), Asterisk, the trunk and the
   providers. Scaling this figure to the real cost: 0.0144 core per call gives about 780 calls at 70% CPU.
+
+## Pool starvation by slow uploads (Nov 12, 2026, sandbox, before and after the fix)
+
+The first production-box run left uploads out (`MINIO_ENDPOINT` empty), so it could not show that `finish_run` held a
+Postgres connection through the MinIO uploads, nor that `workflow()` held one while loading clips. Reproduced with
+`--concurrent 120 --call-secs 12 --duration 40 --minio-ms 4000` and an engine with `DOGRAH_DB_MAX_CONNS=6`
+(about 10 calls end a second, each pinning a connection for its 4 s upload: 40 needed, 6 available):
+
+| Engine | Calls started | Calls with an agent (STT connections) | Agent audio | Media lost | Engine errors | Uploads done |
+|---|---|---|---|---|---|---|
+| before (`4e0582c`) | 477 | **240** (half got no agent: "workflow load timed out") | **0.46** | 31 | **237** | 66 (at most 6 at once: the pool size) |
+| after | 458 | **458** | **1.00** | 0 | **0** | 896 (up to 120 at once) |
+
+The uploads no longer need a connection; the pool is touched for statements only. Two unit tests keep it that way
+(`finish_run_does_not_hold_a_connection_while_the_recording_uploads`,
+`loading_workflows_with_clips_never_needs_a_second_connection_while_holding_one`): both failed before the fix.
+Uploads now overlap freely (120 in flight here): bound them (Phase 2) before running at production size.
+

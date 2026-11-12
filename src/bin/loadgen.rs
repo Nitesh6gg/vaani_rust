@@ -45,6 +45,8 @@ struct Opts {
     turn_secs: u64,
     llm_ms: u64,
     burst: u64,
+    minio_ms: u64,
+    metrics: String,
     db: String,
 }
 
@@ -56,6 +58,10 @@ const HELP: &str = "loadgen: fake Asterisk + mock Sarvam/LLM to load-test one Va
   --duration D     seconds to hold the load before letting calls finish (default 120)
   --turn-secs T    the caller 'speaks' every T seconds, +-30% (default 8)
   --llm-ms M       the mock LLM's time to first token (default 200)
+  --minio-ms M     the mock MinIO takes M ms to answer each upload (default 50). Raise it (e.g. 4000) to see
+                   whether a slow MinIO starves the engine's Postgres pool
+  --metrics URL    the engine's /metrics (e.g. http://127.0.0.1:9091/metrics): its Postgres pool is
+                   reported every 5 s and its peak in the summary
   --burst N        send the caller's audio N frames at a time, every N x 20 ms, as an Asterisk that
                    delivers in clumps does (default 1: one frame every 20 ms)
   --host H         address the engine reaches this generator at (default 127.0.0.1)
@@ -76,6 +82,8 @@ fn opts() -> Opts {
         turn_secs: 8,
         llm_ms: 200,
         burst: 1,
+        minio_ms: 50,
+        metrics: String::new(),
         db: String::new(),
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -90,6 +98,8 @@ fn opts() -> Opts {
             }
             "--host" => o.host = val(),
             "--db" => o.db = val(),
+            "--metrics" => o.metrics = val(),
+            "--minio-ms" => o.minio_ms = num(val()) as u64,
             "--port" => o.port = num(val()) as u16,
             "--concurrent" => o.concurrent = num(val()) as usize,
             "--ramp" => o.ramp = num(val()).max(0.1),
@@ -128,6 +138,13 @@ struct Stats {
     llm_requests: AtomicU64,
     ari_requests: AtomicU64,
     setup_ms: Mutex<Vec<u64>>,
+    minio_puts: AtomicU64,
+    minio_bytes: AtomicU64,
+    minio_now: AtomicU64,
+    minio_peak: AtomicU64,
+    pool_in_use_peak: AtomicU64,
+    pool_waiting_peak: AtomicU64,
+    pool_timeouts: AtomicU64,
 }
 
 /// Where the engine asked the externalMedia channel to connect, and the UUID to announce.
@@ -163,11 +180,13 @@ async fn main() {
     let ast = Arc::new(Asterisk::default());
 
     let bind = |p: u16| async move { TcpListener::bind(("0.0.0.0", p)).await.unwrap_or_else(|e| die(&format!("bind port {p}: {e}"))) };
-    let (ari, stt, tts, llm) = (bind(o.port).await, bind(o.port + 1).await, bind(o.port + 2).await, bind(o.port + 3).await);
+    let (ari, stt, tts, llm, minio) =
+        (bind(o.port).await, bind(o.port + 1).await, bind(o.port + 2).await, bind(o.port + 3).await, bind(o.port + 4).await);
     tokio::spawn(serve_ari(ari, ast.clone()));
     tokio::spawn(serve_stt(stt, ast.clone(), o.turn_secs));
     tokio::spawn(serve_tts(tts, ast.clone()));
     tokio::spawn(serve_llm(llm, ast.clone(), o.llm_ms));
+    tokio::spawn(serve_minio(minio, ast.clone(), o.minio_ms));
 
     let llm_url = format!("http://{}:{}", o.host, o.port + 3);
     let db_url = if o.db.is_empty() {
@@ -176,11 +195,13 @@ async fn main() {
         setup_db(&o.db, &llm_url).await.unwrap_or_else(|e| die(&format!("database setup: {e}")))
     };
     println!(
-        "Start the engine (release build) with:\n\n  ARI_URL=http://{h}:{p}/ari ARI_USER=load ARI_PASS=load ARI_APP=loadgen \\\n  SARVAM_STT_WS_URL=ws://{h}:{p1}/ws SARVAM_TTS_WS_URL=ws://{h}:{p2}/ws \\\n  DOGRAH_DB_URL='{db_url}' DOGRAH_WORKFLOW_ID=42 \\\n  MEDIA_IP=<the engine's address, as this generator reaches it> MEDIA_PORT_COUNT={ports} \\\n  CAMPAIGNS_ENABLED=0 ORPHAN_SWEEP_SECONDS=0 MINIO_ENDPOINT= OTEL_EXPORTER_OTLP_ENDPOINT= \\\n  ./target/release/vaani\n\n(mock LLM: {llm_url})\nWaiting for the engine's events WebSocket...",
+        "Start the engine (release build) with:\n\n  ARI_URL=http://{h}:{p}/ari ARI_USER=load ARI_PASS=load ARI_APP=loadgen \\\n  SARVAM_STT_WS_URL=ws://{h}:{p1}/ws SARVAM_TTS_WS_URL=ws://{h}:{p2}/ws \\\n  DOGRAH_DB_URL='{db_url}' DOGRAH_WORKFLOW_ID=42 \\\n  MEDIA_IP=<the engine's address, as this generator reaches it> MEDIA_PORT_COUNT={ports} \\\n  CAMPAIGNS_ENABLED=0 ORPHAN_SWEEP_SECONDS=0 OTEL_EXPORTER_OTLP_ENDPOINT= \\\n  MINIO_ENDPOINT={h}:{p4} MINIO_ACCESS_KEY=load MINIO_SECRET_KEY=loadloadload MINIO_BUCKET=voice-audio \\\n  ./target/release/vaani\n\n(mock LLM: {llm_url}; mock MinIO answers uploads in {minio_ms} ms)\nWaiting for the engine's events WebSocket...",
         h = o.host,
         p = o.port,
         p1 = o.port + 1,
         p2 = o.port + 2,
+        p4 = o.port + 4,
+        minio_ms = o.minio_ms,
         ports = (o.concurrent + 64).max(256),
     );
     while ast.events.lock().unwrap().is_none() {
@@ -190,7 +211,7 @@ async fn main() {
 
     let begun = Instant::now();
     let deadline = begun + Duration::from_secs(o.duration);
-    let reporter = tokio::spawn(report(ast.clone(), begun));
+    let reporter = tokio::spawn(report(ast.clone(), begun, o.metrics.clone()));
     let mut slots = vec![];
     for slot in 0..o.concurrent {
         let (ast, o) = (ast.clone(), o.clone());
@@ -529,6 +550,64 @@ async fn serve_llm(lis: TcpListener, ast: Arc<Asterisk>, first_token_ms: u64) {
     }
 }
 
+/// Mock MinIO: takes every upload (counting its bytes), answers 200 after `delay`; keep-alive.
+async fn serve_minio(lis: TcpListener, ast: Arc<Asterisk>, delay_ms: u64) {
+    loop {
+        let Ok((mut sock, _)) = lis.accept().await else { continue };
+        let ast = ast.clone();
+        tokio::spawn(async move {
+            let mut buf = Vec::<u8>::new();
+            loop {
+                let (head_end, len) = loop {
+                    if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&buf[..end]).to_lowercase();
+                        break (
+                            end + 4,
+                            head.split("content-length:")
+                                .nth(1)
+                                .and_then(|v| v.split("\r\n").next()?.trim().parse::<usize>().ok())
+                                .unwrap_or(0),
+                        );
+                    }
+                    let mut chunk = [0u8; 65536];
+                    match sock.read(&mut chunk).await {
+                        Ok(n) if n > 0 => buf.extend_from_slice(&chunk[..n]),
+                        _ => return,
+                    }
+                };
+                // The body is counted, not kept.
+                let mut have = buf.len() - head_end;
+                buf.clear();
+                while have < len {
+                    let mut chunk = [0u8; 65536];
+                    match sock.read(&mut chunk).await {
+                        Ok(n) if n > 0 => have += n,
+                        _ => return,
+                    }
+                }
+                buf.clear();
+                let st = &ast.stats;
+                st.minio_puts.fetch_add(1, Relaxed);
+                st.minio_bytes.fetch_add(len as u64, Relaxed);
+                let now = st.minio_now.fetch_add(1, Relaxed) + 1;
+                st.minio_peak.fetch_max(now, Relaxed);
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                st.minio_now.fetch_sub(1, Relaxed);
+                if sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await.is_err() {
+                    return;
+                }
+            }
+        });
+    }
+}
+
+/// The engine's Postgres pool, from its /metrics: (in use, waiting, max, timeouts so far).
+async fn pool_reading(url: &str) -> Option<(u64, u64, u64, u64)> {
+    let text = reqwest::Client::new().get(url).timeout(Duration::from_secs(2)).send().await.ok()?.text().await.ok()?;
+    let v = |name: &str| text.lines().find_map(|l| l.strip_prefix(name)?.trim().parse::<f64>().ok()).map(|x| x as u64);
+    Some((v("vaani_db_pool_in_use ")?, v("vaani_db_pool_waiting ")?, v("vaani_db_pool_max ")?, v("vaani_db_pool_timeouts_total ")?))
+}
+
 // --------------------------------------------------------------- database ---
 
 /// A minimal Dograh in schema `vaani_loadgen`: one workflow (id 42) whose LLM is the mock. Returns the
@@ -569,7 +648,7 @@ async fn setup_db(url: &str, llm_url: &str) -> Result<String, tokio_postgres::Er
 
 // ---------------------------------------------------------------- reports ---
 
-async fn report(ast: Arc<Asterisk>, begun: Instant) {
+async fn report(ast: Arc<Asterisk>, begun: Instant, metrics: String) {
     let st = &ast.stats;
     let mut tick = tokio::time::interval(Duration::from_secs(5));
     tick.tick().await;
@@ -593,6 +672,18 @@ async fn report(ast: Arc<Asterisk>, begun: Instant) {
             st.tts_requests.load(Relaxed),
         );
         (last_in, last_out, last_gaps) = (fin, fout, gaps);
+        if !metrics.is_empty() {
+            let uploads = format!("uploads {} (in flight {})", st.minio_puts.load(Relaxed), st.minio_now.load(Relaxed));
+            match pool_reading(&metrics).await {
+                Some((in_use, waiting, max, timeouts)) => {
+                    st.pool_in_use_peak.fetch_max(in_use, Relaxed);
+                    st.pool_waiting_peak.fetch_max(waiting, Relaxed);
+                    st.pool_timeouts.store(timeouts, Relaxed);
+                    println!("       postgres pool {in_use}/{max} in use, {waiting} waiting, {timeouts} timeouts   {uploads}");
+                }
+                None => println!("       (the engine's metrics could not be read)   {uploads}"),
+            }
+        }
     }
 }
 
@@ -628,6 +719,17 @@ fn summary(st: &Stats, ran: Duration) {
         c(&st.tts_requests),
         c(&st.ari_requests),
     );
+    if c(&st.minio_puts) > 0 {
+        println!(
+            "uploads: {} ({:.1} MB), at most {} in flight; engine Postgres pool peak {} in use, {} waiting, {} timeouts (needs --metrics)",
+            c(&st.minio_puts),
+            c(&st.minio_bytes) as f64 / 1e6,
+            c(&st.minio_peak),
+            c(&st.pool_in_use_peak),
+            c(&st.pool_waiting_peak),
+            c(&st.pool_timeouts)
+        );
+    }
     let bad = c(&st.setup_failed) + c(&st.media_lost);
     println!(
         "{}",

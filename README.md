@@ -70,7 +70,7 @@ Same names as the Go server.
 | `MEDIA_PORT_BASE` / `MEDIA_PORT_COUNT` | `20000` / `256` | one TCP port per call |
 | `DOGRAH_DB_URL` | **required** | |
 | `DOGRAH_WORKFLOW_ID` | `0` | workflow run by inbound calls |
-| `DOGRAH_DB_MAX_CONNS` | `80` | shared by the campaign dial workers and the calls being set up |
+| `DOGRAH_DB_MAX_CONNS` `DOGRAH_DB_WAIT_MS` | `40` `5000` | Postgres pool per engine process, shared by the campaign dial workers and the calls being set up; a caller waits at most the second for a free connection, then fails (`vaani_db_pool_timeouts_total`) |
 | `BARGE_IN_ENABLED` | `1` | `0` = observe only |
 | `BARGE_IN_MIN_SPEECH_MS` / `BARGE_IN_GUARD_MS` | `200` / `300` | |
 | `BARGE_IN_POST_CUT_SILENCE_MS` | `1200` | |

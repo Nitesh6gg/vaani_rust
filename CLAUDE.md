@@ -41,6 +41,9 @@ to-port list.
 ## Conventions
 - Dograh queries: `use super::store::Cached` wherever `db.query(...)` is called, so statements are prepared once per
   connection (tokio-postgres's own `query(&str)` is two round trips). The dialer's pre-dial read is one query, `Store::dial_check`.
+- **A pooled Postgres connection (`Store::db()`) is held for statements only**: never across a MinIO transfer, an LLM call, a clip
+  download, or while asking for a second connection (`finish_run` releases it before uploads; `workflow` before loading clips).
+  A pool whose connections are all held by tasks that want another never recovers; `for_test_pool` (pool of 1-2) reproduces it.
 - Errors: `anyhow` with `.context()`, never panic in the request path. Logging: `tracing`, `call_id` on
   every call line, an `event` field (`turn.user`, `call.summary`, …). INFO tells the call's story; detail is DEBUG.
 - Edition 2024: `gen` is reserved — use `generation`.

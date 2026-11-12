@@ -16,6 +16,8 @@ pub struct Config {
     pub media_port_count: u16,
     pub dograh_db_url: String,
     pub dograh_db_max_conns: usize,
+    /// How long a caller waits for a free Postgres connection before failing (DOGRAH_DB_WAIT_MS, default 5000).
+    pub dograh_db_wait: Duration,
     pub dograh_workflow_id: i32,
     pub barge_in_enabled: bool,
     pub barge_in_min_speech: Duration,
@@ -152,7 +154,8 @@ impl Config {
             media_port_base: get_num("MEDIA_PORT_BASE", 20000)?,
             media_port_count: get_num("MEDIA_PORT_COUNT", 256)?,
             dograh_db_url: get("DOGRAH_DB_URL", ""),
-            dograh_db_max_conns: get_num("DOGRAH_DB_MAX_CONNS", 80)?,
+            dograh_db_max_conns: get_num("DOGRAH_DB_MAX_CONNS", 40)?,
+            dograh_db_wait: ms("DOGRAH_DB_WAIT_MS", 5000)?,
             dograh_workflow_id: get_num("DOGRAH_WORKFLOW_ID", 0)?,
             barge_in_enabled: get("BARGE_IN_ENABLED", "1") == "1",
             barge_in_min_speech: ms("BARGE_IN_MIN_SPEECH_MS", 200)?,
@@ -243,6 +246,9 @@ impl Config {
         if self.dograh_db_url.is_empty() {
             bail!("config: DOGRAH_DB_URL is required (agent config is read from Dograh's Postgres)");
         }
+        if self.dograh_db_wait.is_zero() {
+            bail!("config: DOGRAH_DB_WAIT_MS must be at least 1");
+        }
         if self.dograh_db_max_conns == 0 {
             bail!("config: DOGRAH_DB_MAX_CONNS must be at least 1");
         }
@@ -265,6 +271,7 @@ impl Config {
             media_port_count: 8,
             dograh_db_url: db_url.into(),
             dograh_db_max_conns: 4,
+            dograh_db_wait: Duration::from_secs(5),
             dograh_workflow_id: 42,
             barge_in_enabled: true,
             barge_in_min_speech: Duration::from_millis(200),

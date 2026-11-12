@@ -52,7 +52,7 @@ async fn main() -> Result<()> {
     let cfg = Arc::new(config::Config::load()?);
     let cancel = CancellationToken::new();
 
-    let mut store = dograh::Store::open(&cfg.dograh_db_url, cfg.dograh_db_max_conns).await?;
+    let mut store = dograh::Store::open_with(&cfg.dograh_db_url, cfg.dograh_db_max_conns, cfg.dograh_db_wait).await?;
     match cfg.storage() {
         Some(storage) => store.use_storage(storage),
         None => tracing::warn!("MINIO_ENDPOINT not set: recordings and transcripts won't be uploaded and recorded clips can't be played"),

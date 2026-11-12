@@ -7,16 +7,21 @@ use super::{
     tools::{Credential, ToolRow},
     workflow::{self as wfjson, WorkflowJson},
 };
-use crate::agent::workflow::Workflow;
+use crate::{agent::workflow::Workflow, metrics};
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
 use deadpool_postgres::{Pool, Runtime};
 use serde_json::{Map, Value};
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 use tokio_postgres::{NoTls, Row, types::ToSql};
 
 /// Dograh's backend defaults (api/services/pipecat/run_pipeline.py), used when
 /// the workflow's settings were never saved.
+/// How long a caller waits for a free Postgres connection by default (DOGRAH_DB_WAIT_MS).
+#[cfg(test)]
+pub const DB_WAIT: Duration = Duration::from_secs(5);
+/// Connections opened at start.
+const WARM: usize = 4;
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_MAX_DURATION: Duration = Duration::from_secs(300);
 
@@ -84,18 +89,46 @@ impl Store {
         self.clips = Some(super::recordings::ClipCache::new(storage));
     }
 
+    /// A pooled connection. Hold it only for statements: never across a MinIO transfer, an LLM call or any
+    /// other wait, and never while asking for a second one (see `finish_run`, `workflow`): a pool whose
+    /// connections are all held by tasks that want another one never recovers.
     pub(crate) async fn db(&self) -> Result<deadpool_postgres::Object> {
-        self.pool.get().await.context("dograh: get connection")
+        self.pool.get().await.map_err(|e| {
+            if matches!(e, deadpool_postgres::PoolError::Timeout(_)) {
+                metrics::DB_POOL_TIMEOUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            anyhow::Error::new(e).context("dograh: get connection")
+        })
     }
 
-    /// Connects and verifies the connection. ponytail: no TLS to Postgres
-    /// (Dograh's DB is on the private network); add tokio-postgres-rustls if not.
+    /// Connects and verifies the connection, with the default wait for a free connection (`DB_WAIT`).
+    #[cfg(test)]
     pub async fn open(url: &str, max_conns: usize) -> Result<Self> {
+        Self::open_with(url, max_conns, DB_WAIT).await
+    }
+
+    /// Connects and verifies the connection. A caller waits at most `wait` for a free connection (and a new
+    /// one is made, or an old one checked, in at most `wait`): an exhausted pool fails the caller fast
+    /// instead of queueing it for ever. TCP keepalive every 30 s, so a firewall or PgBouncer that drops idle
+    /// connections is noticed. A few connections are opened up front. ponytail: no TLS to Postgres
+    /// (Dograh's DB is on the private network); add tokio-postgres-rustls if not.
+    pub async fn open_with(url: &str, max_conns: usize, wait: Duration) -> Result<Self> {
         let mut cfg = deadpool_postgres::Config::new();
         cfg.url = Some(url.to_string());
-        cfg.pool = Some(deadpool_postgres::PoolConfig::new(max_conns));
+        cfg.keepalives_idle = Some(Duration::from_secs(30));
+        let mut pool_cfg = deadpool_postgres::PoolConfig::new(max_conns);
+        pool_cfg.timeouts = deadpool_postgres::Timeouts { wait: Some(wait), create: Some(wait), recycle: Some(wait) };
+        cfg.pool = Some(pool_cfg);
         let pool = cfg.create_pool(Some(Runtime::Tokio1), NoTls).context("dograh: connect")?;
         pool.get().await.context("dograh: ping")?.simple_query("SELECT 1").await.context("dograh: ping")?;
+        // Warm: the first calls after a start don't each pay for a connection.
+        let warm = futures_util::future::join_all((0..WARM.min(max_conns)).map(|_| pool.get())).await;
+        drop(warm);
+        let gauge = pool.clone();
+        metrics::set_db_pool(Arc::new(move || {
+            let s = gauge.status();
+            (s.size.saturating_sub(s.available), s.waiting, s.max_size)
+        }));
         Ok(Self { pool, clips: None })
     }
 
@@ -108,7 +141,7 @@ impl Store {
     /// workflow owner's user_configurations (ari_manager.py: workflow.user_id).
     /// Tools are scoped to the workflow's organization and must be active.
     pub async fn workflow(&self, workflow_id: i32, call_vars: &Map<String, Value>) -> Result<LoadedWorkflow> {
-        let db = self.pool.get().await.context("dograh: get connection")?;
+        let db = self.db().await?;
         let row = db
             .query_opt(
                 "SELECT d.id::bigint, d.workflow_json::text, COALESCE(d.template_context_variables::text, ''),
@@ -140,6 +173,9 @@ impl Store {
         vars.extend(call_vars.clone());
 
         let tool_rows = self.tools(&db, &wf.tool_uuids(), org_id).await?;
+        // The connection goes back before the clips load: `load_clips` takes its own for the recordings query,
+        // and downloads and converts clips (up to 30 s on a cold cache) that must not pin one.
+        drop(db);
         let (pks, by_id) = wf.recording_needs(&tool_rows);
         let (clips, mut warnings) = self.load_clips(org_id, &pks, by_id).await;
         let (workflow, build_warnings) =
@@ -159,12 +195,19 @@ impl Store {
     /// `None` when the variable is unset. `sql` creates and fills the fixtures.
     #[cfg(test)]
     pub async fn for_test(schema: &str, sql: &str) -> Option<(Self, String)> {
+        Self::for_test_pool(schema, sql, 4, DB_WAIT).await
+    }
+
+    /// `for_test` with a pool of `max_conns` connections and a `wait` for a free one: a small pool makes a
+    /// connection held too long, or two held at once, show up at once.
+    #[cfg(test)]
+    pub async fn for_test_pool(schema: &str, sql: &str, max_conns: usize, wait: Duration) -> Option<(Self, String)> {
         let url = std::env::var("DOGRAH_TEST_DB_URL").ok()?;
         let admin = Self::open(&url, 1).await.unwrap();
         let db = admin.pool.get().await.unwrap();
         db.batch_execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema};")).await.unwrap();
         let scoped = format!("{url}?options=-csearch_path%3D{schema}");
-        let store = Self::open(&scoped, 4).await.unwrap();
+        let store = Self::open_with(&scoped, max_conns, wait).await.unwrap();
         store.pool.get().await.unwrap().batch_execute(sql).await.unwrap();
         Some((store, scoped))
     }
@@ -393,5 +436,73 @@ mod tests {
             w.warnings,
             ["recording 7 not found or not active", r#"edge "Back": transition recording unavailable; nothing is said"#]
         );
+    }
+
+    /// A workflow load must never hold a connection while it loads the clips, or wait for a second one while
+    /// holding the first: with every connection held by a load that wants another, nothing moves until the wait
+    /// runs out. Pool of 2, six calls starting at once, a cold clip cache (a slow download): all six get their clips.
+    #[tokio::test]
+    async fn loading_workflows_with_clips_never_needs_a_second_connection_while_holding_one() {
+        use crate::{agent::recorder::wav, testkit::mock_minio_objects_slow};
+        let tone = |ms: usize, v: i16| -> Vec<u8> { (0..16 * ms).flat_map(|_| v.to_le_bytes()).collect() };
+        let file = wav(&[tone(100, 0), tone(200, 5000), tone(100, 0)].concat());
+        // Keys no earlier run cached on disk: the clips are downloaded now, slowly.
+        let tag = format!("{:x}", rand::random::<u64>());
+        let (greet, offer) = (format!("recordings/greet-{tag}.wav"), format!("recordings/offer-{tag}.wav"));
+        let endpoint = mock_minio_objects_slow(
+            vec![(format!("/voice-audio/{greet}"), file.clone()), (format!("/voice-audio/{offer}"), file)],
+            Duration::from_millis(300),
+        )
+        .await;
+
+        let Some((mut store, _)) = Store::for_test_pool(
+            "t_pool_nesting",
+            &format!(
+                r#"
+            CREATE TABLE workflows (id serial PRIMARY KEY, user_id int, organization_id int, released_definition_id int, template_context_variables jsonb);
+            CREATE TABLE workflow_definitions (id serial PRIMARY KEY, workflow_id int, workflow_json jsonb, template_context_variables jsonb, workflow_configurations jsonb, is_current bool);
+            CREATE TABLE user_configurations (id serial PRIMARY KEY, user_id int, configuration jsonb);
+            CREATE TABLE tools (tool_uuid uuid, organization_id int, name text, description text, category text, status text, definition jsonb);
+            CREATE TABLE external_credentials (credential_uuid varchar, organization_id int, credential_type text, credential_data jsonb, is_active bool);
+            CREATE TABLE workflow_recordings (id serial PRIMARY KEY, organization_id int, recording_id text, transcript text, storage_key text, storage_backend text, is_active bool);
+            INSERT INTO workflow_recordings (id, organization_id, recording_id, transcript, storage_key, storage_backend, is_active) VALUES
+              (5, 3, 'greet', 'Namaste!', '{greet}', 'minio', true), (6, 3, 'offer', 'Our offer.', '{offer}', 'minio', true);
+            INSERT INTO user_configurations (user_id, configuration) VALUES (7, '{{
+              "llm": {{"provider":"openai","api_key":"sk","model":"m"}},
+              "stt": {{"provider":"sarvam","api_key":"k"}}, "tts": {{"provider":"sarvam","api_key":"k"}}}}');
+            INSERT INTO workflows (id, user_id, organization_id) VALUES (42, 7, 3);
+            INSERT INTO workflow_definitions (workflow_id, workflow_json, is_current) VALUES (42, '{{"nodes":[
+                {{"id":"1","type":"startCall","data":{{"name":"Start","prompt":"Reply with RECORDING_ID: offer when asked.","is_start":true,
+                   "greeting_type":"audio","greeting_recording_id":"5"}}}}]}}', true);
+            "#
+            ),
+            2,
+            Duration::from_secs(2),
+        )
+        .await
+        else {
+            return eprintln!("skipped: DOGRAH_TEST_DB_URL not set");
+        };
+        store.use_storage(crate::dograh::storage::Storage {
+            endpoint,
+            access_key: "a".into(),
+            secret_key: "b".into(),
+            bucket: "voice-audio".into(),
+            secure: false,
+        });
+
+        let started = std::time::Instant::now();
+        let loads: Vec<_> = (0..6)
+            .map(|_| {
+                let store = store.clone();
+                tokio::spawn(async move { store.workflow(42, &Map::new()).await })
+            })
+            .collect();
+        for l in loads {
+            let w = l.await.unwrap().expect("the workflow loads");
+            assert!(w.warnings.iter().all(|x| !x.contains("recordings unavailable")), "{:?}", w.warnings);
+            assert!(w.workflow.nodes[w.workflow.start].greeting_clip.is_some(), "the clip was loaded");
+        }
+        assert!(started.elapsed() < Duration::from_millis(1800), "no load waited for the pool: {:?}", started.elapsed());
     }
 }

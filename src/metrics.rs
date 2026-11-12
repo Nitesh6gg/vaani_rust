@@ -222,6 +222,16 @@ pub static MEDIA_INBOUND_LATE: AtomicU64 = AtomicU64::new(0);
 /// counts at 5 s and hangs up at the timeout; here the one event is the hangup).
 pub static MEDIA_WATCHDOG_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 pub static ARI_RECONNECTS: AtomicU64 = AtomicU64::new(0);
+/// Callers that gave up waiting for a free Postgres connection (`vaani_db_pool_timeouts_total`).
+pub static DB_POOL_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+
+/// (connections in use, callers waiting for one, pool size) of the Dograh Postgres pool.
+type PoolReading = std::sync::Arc<dyn Fn() -> (usize, usize, usize) + Send + Sync>;
+static DB_POOL: std::sync::RwLock<Option<PoolReading>> = std::sync::RwLock::new(None);
+
+pub fn set_db_pool(reading: PoolReading) {
+    *DB_POOL.write().unwrap() = Some(reading);
+}
 /// Call recordings held in memory right now (calls in progress, and finished ones until their upload starts).
 pub static RECORDING_BYTES: AtomicU64 = AtomicU64::new(0);
 
@@ -318,6 +328,14 @@ vaani_redis_errors_total {}
         CALLS_SETUP_TIMEOUT.load(Relaxed),
         ORPHAN_CHANNELS.load(Relaxed),
         ARI_EVENT_QUEUE.load(Relaxed),
+    ));
+    let (in_use, waiting, max) = DB_POOL.read().unwrap().as_ref().map_or((0, 0, 0), |f| f());
+    out.push_str(&format!(
+        "# TYPE vaani_db_pool_in_use gauge\nvaani_db_pool_in_use {in_use}\n\
+         # TYPE vaani_db_pool_waiting gauge\nvaani_db_pool_waiting {waiting}\n\
+         # TYPE vaani_db_pool_max gauge\nvaani_db_pool_max {max}\n\
+         # TYPE vaani_db_pool_timeouts_total counter\nvaani_db_pool_timeouts_total {}\n",
+        DB_POOL_TIMEOUTS.load(Relaxed)
     ));
     out.push_str("# TYPE vaani_calls_rejected_total counter\n");
     for ((reason, direction), c) in REJECTED_LABELS.iter().zip(&CALLS_REJECTED) {
@@ -553,6 +571,10 @@ mod tests {
             "vaani_recording_truncated_total",
             "vaani_ari_reconnects_total",
             "vaani_recording_bytes",
+            "vaani_db_pool_in_use",
+            "vaani_db_pool_waiting",
+            "vaani_db_pool_max",
+            "vaani_db_pool_timeouts_total",
             "process_network_receive_bytes_total",
             "process_network_transmit_bytes_total",
         ] {

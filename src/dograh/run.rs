@@ -136,42 +136,45 @@ impl Store {
             Err(_) => Some(format!("dograh: {what}: timed out")),
         };
 
-        let db = self.db().await?;
-        errs.extend(step(
-            "complete run",
-            tokio::time::timeout(
-                DB_TIMEOUT,
-                db.execute(
-                    "UPDATE workflow_runs SET
-                        usage_info = $2::text::json,
-                        cost_info = (cost_info::jsonb || $3::text::jsonb)::json,
-                        gathered_context = (gathered_context::jsonb || $4::text::jsonb)::json,
-                        logs = $5::text::json,
-                        is_completed = true,
-                        state = 'completed'
-                     WHERE id = $1::bigint",
-                    &[&run_id, &usage.to_string(), &cost.to_string(), &Value::Object(g).to_string(), &logs],
-                ),
-            )
-            .await,
-        ));
-
-        // Lets Dograh's call list filter by this disposition code.
-        if !mapped.is_empty() {
+        // The statements hold one connection; it goes back before any upload starts (below).
+        {
+            let db = self.db().await?;
             errs.extend(step(
-                "add disposition code",
+                "complete run",
                 tokio::time::timeout(
                     DB_TIMEOUT,
                     db.execute(
-                        "UPDATE workflows SET call_disposition_codes = jsonb_build_object('disposition_codes',
-                            COALESCE(call_disposition_codes::jsonb->'disposition_codes', '[]'::jsonb) || to_jsonb($2::text))::json
-                         WHERE id = $1::int
-                           AND NOT COALESCE(call_disposition_codes::jsonb->'disposition_codes', '[]'::jsonb) ? $2::text",
-                        &[&m.workflow_id, &mapped],
+                        "UPDATE workflow_runs SET
+                            usage_info = $2::text::json,
+                            cost_info = (cost_info::jsonb || $3::text::jsonb)::json,
+                            gathered_context = (gathered_context::jsonb || $4::text::jsonb)::json,
+                            logs = $5::text::json,
+                            is_completed = true,
+                            state = 'completed'
+                         WHERE id = $1::bigint",
+                        &[&run_id, &usage.to_string(), &cost.to_string(), &Value::Object(g).to_string(), &logs],
                     ),
                 )
                 .await,
             ));
+
+            // Lets Dograh's call list filter by this disposition code.
+            if !mapped.is_empty() {
+                errs.extend(step(
+                    "add disposition code",
+                    tokio::time::timeout(
+                        DB_TIMEOUT,
+                        db.execute(
+                            "UPDATE workflows SET call_disposition_codes = jsonb_build_object('disposition_codes',
+                                COALESCE(call_disposition_codes::jsonb->'disposition_codes', '[]'::jsonb) || to_jsonb($2::text))::json
+                             WHERE id = $1::int
+                               AND NOT COALESCE(call_disposition_codes::jsonb->'disposition_codes', '[]'::jsonb) ? $2::text",
+                            &[&m.workflow_id, &mapped],
+                        ),
+                    )
+                    .await,
+                ));
+            }
         }
 
         if let Some(storage) = storage {
@@ -197,21 +200,25 @@ impl Store {
                 (transcript_url, errs) = (k, errs.into_iter().chain(e).collect());
             }
             if recording_url.is_some() || transcript_url.is_some() {
-                errs.extend(step(
-                    "attach files to run",
-                    tokio::time::timeout(
-                        DB_TIMEOUT,
-                        db.execute(
-                            "UPDATE workflow_runs SET
-                                recording_url = COALESCE($2::text, recording_url),
-                                transcript_url = COALESCE($3::text, transcript_url),
-                                storage_backend = 'minio'
-                             WHERE id = $1::bigint",
-                            &[&run_id, &recording_url, &transcript_url],
-                        ),
-                    )
-                    .await,
-                ));
+                // A connection again, only for this statement: the uploads above held none.
+                match self.db().await {
+                    Ok(db) => errs.extend(step(
+                        "attach files to run",
+                        tokio::time::timeout(
+                            DB_TIMEOUT,
+                            db.execute(
+                                "UPDATE workflow_runs SET
+                                    recording_url = COALESCE($2::text, recording_url),
+                                    transcript_url = COALESCE($3::text, transcript_url),
+                                    storage_backend = 'minio'
+                                 WHERE id = $1::bigint",
+                                &[&run_id, &recording_url, &transcript_url],
+                            ),
+                        )
+                        .await,
+                    )),
+                    Err(e) => errs.push(format!("dograh: attach files to run: {e:#}")),
+                }
             }
         }
 
@@ -512,5 +519,56 @@ mod tests {
         assert_eq!(u["tts"]["SarvamTTSService|||bulbul:v3"], 120);
         assert_eq!(u["llm"]["LLM|||gpt"]["cache_read_input_tokens"], 2);
         assert_eq!(usage_info(&m, &Summary::default(), Duration::ZERO)["tts"], json!({}));
+    }
+
+    /// `finish_run` must give its connection back while a recording uploads: a slow MinIO would otherwise pin
+    /// one connection per ending call and starve everything else. Pool of 1, an upload that takes 1.2 s: another
+    /// caller gets a connection (waiting at most 300 ms) while the upload is under way.
+    #[tokio::test]
+    async fn finish_run_does_not_hold_a_connection_while_the_recording_uploads() {
+        use crate::{
+            agent::recorder::MixRecorder,
+            media::SILENCE,
+            testkit::{CAMPAIGN_SCHEMA, mock_minio_slow},
+        };
+        let Some((store, _)) = Store::for_test_pool(
+            "t_finish_pool",
+            &format!(
+                "{CAMPAIGN_SCHEMA}
+                 INSERT INTO workflow_runs (id, name, workflow_id, state, is_completed, usage_info, cost_info, gathered_context, logs)
+                   VALUES (1, 'r', 42, 'running', false, '{{}}', '{{}}', '{{}}', '{{}}');"
+            ),
+            1,
+            Duration::from_millis(300),
+        )
+        .await
+        else {
+            return eprintln!("skipped: DOGRAH_TEST_DB_URL not set");
+        };
+        let (minio, puts) = mock_minio_slow(Duration::from_millis(1200)).await;
+        let storage =
+            Storage { endpoint: minio, access_key: "a".into(), secret_key: "b".into(), bucket: "voice-audio".into(), secure: false };
+
+        let mut rec = MixRecorder::default();
+        rec.frame(&SILENCE, None);
+        let wav = rec.finish().into_wav();
+        let meta = RunMeta { workflow_id: 42, definition_id: 1, org_id: None, stt_model: "m".into(), tts_model: "m".into() };
+        let finishing = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                let sum = Summary::default();
+                store.finish_run(&meta, 1, RunEnd { summary: &sum, duration: Duration::from_secs(5), recording: wav }, Some(&storage)).await
+            })
+        };
+
+        tokio::time::sleep(Duration::from_millis(400)).await; // the run is complete; the upload is under way
+        assert_eq!(puts.lock().unwrap().len(), 1, "the upload has started");
+        let other = store.db().await;
+        assert!(other.is_ok(), "a connection was free during the upload: {:?}", other.err());
+        drop(other);
+
+        finishing.await.unwrap().expect("the run finishes");
+        let row = store.db().await.unwrap().query_one("SELECT recording_url, state FROM workflow_runs WHERE id = 1", &[]).await.unwrap();
+        assert_eq!((row.get::<_, Option<String>>(0).as_deref(), row.get::<_, String>(1).as_str()), (Some("recordings/1.wav"), "completed"));
     }
 }

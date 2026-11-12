@@ -178,6 +178,11 @@ pub(crate) async fn mock_stt_multi() -> (String, Arc<AtomicUsize>) {
 
 /// Mock MinIO: records every PUT as (path, body) and answers 200.
 pub(crate) async fn mock_minio() -> (String, Arc<Mutex<Vec<(String, Vec<u8>)>>>) {
+    mock_minio_slow(std::time::Duration::ZERO).await
+}
+
+/// `mock_minio` that takes `delay` to answer each PUT (a MinIO under load).
+pub(crate) async fn mock_minio_slow(delay: std::time::Duration) -> (String, Arc<Mutex<Vec<(String, Vec<u8>)>>>) {
     let lis = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = lis.local_addr().unwrap().to_string();
     let puts = Arc::new(Mutex::new(vec![]));
@@ -207,6 +212,7 @@ pub(crate) async fn mock_minio() -> (String, Arc<Mutex<Vec<(String, Vec<u8>)>>>)
                     }
                     let path = head.lines().next().unwrap().split_whitespace().nth(1).unwrap().to_string();
                     p.lock().unwrap().push((path, buf[split + 4..split + 4 + len].to_vec()));
+                    tokio::time::sleep(delay).await;
                     let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
                     return;
                 }
@@ -218,6 +224,11 @@ pub(crate) async fn mock_minio() -> (String, Arc<Mutex<Vec<(String, Vec<u8>)>>>)
 
 /// Mock MinIO serving GET for the given objects ("/bucket/key" -> bytes); 404 otherwise.
 pub(crate) async fn mock_minio_objects(objects: Vec<(String, Vec<u8>)>) -> String {
+    mock_minio_objects_slow(objects, std::time::Duration::ZERO).await
+}
+
+/// `mock_minio_objects` that takes `delay` to serve each GET (a cold clip download).
+pub(crate) async fn mock_minio_objects_slow(objects: Vec<(String, Vec<u8>)>, delay: std::time::Duration) -> String {
     let lis = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = lis.local_addr().unwrap().to_string();
     let objects = Arc::new(objects);
@@ -233,6 +244,7 @@ pub(crate) async fn mock_minio_objects(objects: Vec<(String, Vec<u8>)>) -> Strin
                     .next()
                     .and_then(|l| l.split_whitespace().nth(1).map(String::from))
                     .unwrap_or_default();
+                tokio::time::sleep(delay).await;
                 match objects.iter().find(|(p, _)| *p == path) {
                     Some((_, body)) => {
                         let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
