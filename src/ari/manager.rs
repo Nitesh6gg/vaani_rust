@@ -3,13 +3,13 @@
 //! tears everything down on hangup.
 //!
 //! Per-call flow:
-//! 1. `StasisStart` (caller) -> answer; take a port from the pool; BIND and
+//! 1. `StasisStart` (caller) -> load its Dograh workflow and open the STT FIRST, then answer (the caller
+//!    rings meanwhile, and is hung up as congestion past `ANSWER_WAIT_SECONDS`); take a port from the pool; BIND and
 //!    LISTEN on it (invariant #9: before Asterisk is told the address -- an
 //!    address with nothing listening broke production once); create the
 //!    externalMedia channel pointed at `MEDIA_IP:port`.
 //! 2. That channel's own `StasisStart` -> create a mixing bridge, add both.
-//! 3. Accept Asterisk's TCP connection while loading the Dograh workflow and
-//!    opening the STT; run the agent until the call ends.
+//! 3. Accept Asterisk's TCP connection; run the agent (already prepared) until the call ends.
 //! 4. `StasisEnd` on either leg -> teardown (idempotent: resources are taken
 //!    exactly once, so a double StasisEnd can't double-free a port).
 //!
@@ -61,6 +61,28 @@ const ACCEPT_TIMEOUT: Duration = Duration::from_secs(10);
 /// turn here, in Vaani, instead of piling onto Asterisk.
 const MAX_CONCURRENT_SETUPS: usize = 16;
 
+/// The workflow loads and STT handshakes running for callers not yet answered at once; the rest of a burst
+/// waits (inside its answer deadline) instead of hitting Postgres and Sarvam all together.
+const MAX_CONCURRENT_PREPARES: usize = 32;
+
+/// `f`, or `AnswerWaitExpired` if `deadline` (when there is one) comes first.
+async fn within<T>(deadline: Option<tokio::time::Instant>, f: impl Future<Output = anyhow::Result<T>>) -> anyhow::Result<T> {
+    match deadline {
+        Some(d) => tokio::time::timeout_at(d, f).await.map_err(|_| anyhow::Error::new(AnswerWaitExpired))?,
+        None => f.await,
+    }
+}
+
+/// A caller who waited longer than `ANSWER_WAIT_SECONDS` to be answered.
+#[derive(Debug)]
+struct AnswerWaitExpired;
+impl std::fmt::Display for AnswerWaitExpired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("waited too long to be answered")
+    }
+}
+impl std::error::Error for AnswerWaitExpired {}
+
 #[derive(Default)]
 struct Res {
     port: Option<u16>,
@@ -68,6 +90,10 @@ struct Res {
     bridge: Option<String>,
     external_requested: bool,
     counted_active: bool,
+    /// The caller has been answered (an unanswered caller is refused with a SIP reason, not just hung up).
+    answered: bool,
+    /// An inbound call's workflow and open STT, ready before it was answered; `run_media` takes it.
+    prepared: Option<callagent::Prepared>,
     ended: bool,
     /// The transfer destination's channel once a transfer has connected: from then
     /// on the call is caller <-> destination, and teardown hangs that channel up too.
@@ -139,6 +165,7 @@ pub struct Manager {
     /// Says the machine is too busy for another call (the CPU guard); set once, before `run`.
     overloaded: OnceLock<Probe<bool>>,
     setup_sem: Arc<Semaphore>,
+    prepare_sem: Arc<Semaphore>,
     /// Ended calls finishing their Dograh record at once (`POST_CALL_WORKERS`).
     post_call_sem: Arc<Semaphore>,
 }
@@ -165,6 +192,7 @@ impl Manager {
             tracker: TaskTracker::new(),
             overloaded: OnceLock::new(),
             setup_sem: Arc::new(Semaphore::new(MAX_CONCURRENT_SETUPS)),
+            prepare_sem: Arc::new(Semaphore::new(MAX_CONCURRENT_PREPARES)),
             post_call_sem: Arc::new(Semaphore::new(cfg_post_call_workers)),
         })
     }
@@ -410,7 +438,17 @@ impl Manager {
         let m = self.clone();
         self.tracker.spawn(async move {
             if let Err(e) = m.setup(&call).await {
-                tracing::error!(call_id = %call.info.id, event = "call.setup_failed", error = %format!("{e:#}"), "call setup failed");
+                if e.is::<AnswerWaitExpired>() {
+                    metrics::call_rejected("answer_wait", "inbound");
+                    tracing::warn!(call_id = %call.info.id, event = "call.answer_wait_expired", after_s = m.cfg.answer_wait.as_secs(),
+                        "caller not answered within the answer wait; hanging up as congestion");
+                } else if !call.cancel.is_cancelled() {
+                    tracing::error!(call_id = %call.info.id, event = "call.setup_failed", error = %format!("{e:#}"), "call setup failed");
+                }
+                // A caller never answered is refused as congestion (SIP 503): the trunk can try another server.
+                if call.out.is_none() && !call.res.lock().unwrap().answered {
+                    let _ = m.ari.hangup_reason(&call.info.id, "congestion").await;
+                }
                 m.teardown(&call);
             } else if call.cancel.is_cancelled() {
                 m.teardown(&call); // hung up while we were setting up: free what setup created since
@@ -421,10 +459,23 @@ impl Manager {
     async fn setup(&self, call: &Arc<Call>) -> anyhow::Result<()> {
         use anyhow::Context;
         let id = &call.info.id;
+        // An inbound caller is answered only once the agent is ready to talk (workflow loaded, STT open), so
+        // they hear the greeting, not silence; they ring meanwhile. How long they wait is bounded.
+        let deadline = (call.out.is_none() && !self.cfg.answer_wait.is_zero())
+            .then(|| tokio::time::Instant::from_std(call.started + self.cfg.answer_wait));
+        if call.out.is_none() {
+            let prepared = within(deadline, async {
+                let _turn = self.prepare_sem.acquire().await.context("prepare limiter closed")?;
+                callagent::prepare(&self.cfg, &self.store, &call.info, &call.cancel).await
+            })
+            .await?;
+            call.res.lock().unwrap().prepared = Some(prepared);
+        }
         // Only so many setups run against Asterisk at once; a burst waits here.
-        let _permit = self.setup_sem.acquire().await.context("setup limiter closed")?;
+        let _permit = within(deadline, async { self.setup_sem.acquire().await.context("setup limiter closed") }).await?;
         if call.out.is_none() {
             self.ari.answer(id).await.context("answer")?;
+            call.res.lock().unwrap().answered = true;
         }
 
         // Listen BEFORE telling Asterisk where to connect (invariant #9). A port whose previous call is
@@ -506,12 +557,15 @@ impl Manager {
         let id = call.info.id.clone();
         let listener = call.res.lock().unwrap().listener.take()?;
 
-        // Accept Asterisk's connection WHILE loading the workflow and opening the
-        // STT: the database read and the Sarvam handshake overlap with it.
-        let (conn, prepared) = tokio::join!(
-            async { tokio::time::timeout(ACCEPT_TIMEOUT, listener.accept()).await },
-            callagent::prepare(&self.cfg, &self.store, &call.info, &call.cancel),
-        );
+        // An inbound call was prepared before it was answered. A call we placed is already answered: accept
+        // Asterisk's connection WHILE loading its workflow and opening the STT, so the two overlap.
+        let ready = call.res.lock().unwrap().prepared.take();
+        let (conn, prepared) = tokio::join!(async { tokio::time::timeout(ACCEPT_TIMEOUT, listener.accept()).await }, async {
+            match ready {
+                Some(p) => Ok(p),
+                None => callagent::prepare(&self.cfg, &self.store, &call.info, &call.cancel).await,
+            }
+        },);
         drop(listener); // one connection is all a call needs
         let stream = match conn {
             Ok(Ok((s, _))) => s,
@@ -907,17 +961,9 @@ mod tests {
         panic!("timed out waiting for {what}");
     }
 
-    #[tokio::test]
-    async fn a_call_from_stasis_start_to_agent_audio_to_teardown() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-
-        let (tts_url, _tts) = mock_tts(10).await;
-        let (stt_url, _stt_tx, stt_audio, _) = mock_stt().await;
-        let (llm_url, llm_reqs) = mock_llm(|_| sse("Namaste, how can I help?")).await;
-        let (ari_url, ari_log, mut ext_req) = mock_ari().await;
-        let (minio_addr, minio_puts) = mock_minio().await;
-
-        let Some((store, db_url)) = Store::for_test("t_manager", &format!(
+    /// Dograh's tables holding workflow 42 (one start node) for a user whose models are the mock LLM and Sarvam.
+    fn workflow_sql(llm_url: &str) -> String {
+        format!(
             r#"
                 CREATE TABLE workflows (id serial PRIMARY KEY, user_id int, organization_id int, released_definition_id int, template_context_variables jsonb, call_disposition_codes json);
                 CREATE TABLE workflow_runs (id bigserial PRIMARY KEY, name text, workflow_id int, definition_id bigint, mode text, call_type text, state text,
@@ -943,7 +989,21 @@ mod tests {
                 INSERT INTO workflows (id, user_id, organization_id) VALUES (42, 7, 3);
                 INSERT INTO workflow_definitions (workflow_id, workflow_json, is_current)
                   VALUES (42, '{{"nodes":[{{"id":"1","type":"startCall","data":{{"name":"Start","prompt":"Greet {{{{caller_number}}}}","is_start":true}}}}]}}', true);
-                "#)).await else {
+                "#
+        )
+    }
+
+    #[tokio::test]
+    async fn a_call_from_stasis_start_to_agent_audio_to_teardown() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let (tts_url, _tts) = mock_tts(10).await;
+        let (stt_url, _stt_tx, stt_audio, _) = mock_stt().await;
+        let (llm_url, llm_reqs) = mock_llm(|_| sse("Namaste, how can I help?")).await;
+        let (ari_url, ari_log, mut ext_req) = mock_ari().await;
+        let (minio_addr, minio_puts) = mock_minio().await;
+
+        let Some((store, db_url)) = Store::for_test("t_manager", &workflow_sql(&llm_url)).await else {
             eprintln!("skipped: DOGRAH_TEST_DB_URL not set");
             return;
         };
@@ -1383,6 +1443,19 @@ mod tests {
         Some((Manager::new(Ari::new(&ari_url, "u", "p", "vaani"), Arc::new(cfg), store), log))
     }
 
+    /// `guard_mgr` with a workflow in the database and a mock STT, so an inbound caller can get ready (and be answered).
+    async fn ready_mgr(schema: &str, tweak: impl FnOnce(&mut Config)) -> Option<(Arc<Manager>, Arc<Mutex<Vec<String>>>)> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (stt_url, _stt_audio) = mock_stt_multi().await;
+        let (llm_url, _) = mock_llm(|_| sse("hi")).await;
+        let (ari_url, log, _ext) = mock_ari().await;
+        let (store, db_url) = Store::for_test(schema, &workflow_sql(&llm_url)).await?;
+        let mut cfg = Config::for_test(&db_url);
+        cfg.stt_ws_url = stt_url;
+        tweak(&mut cfg);
+        Some((Manager::new(Ari::new(&ari_url, "u", "p", "vaani"), Arc::new(cfg), store), log))
+    }
+
     fn logged(log: &Arc<Mutex<Vec<String>>>, needle: &str) -> bool {
         log.lock().unwrap().iter().any(|l| l.contains(needle))
     }
@@ -1400,10 +1473,56 @@ mod tests {
         assert_eq!(mgr.ports.in_use(), 0, "nothing was allocated for it");
     }
 
+    /// A caller rings until the agent is ready (workflow loaded, STT handshake done); only then is it answered.
+    #[tokio::test]
+    async fn a_caller_is_answered_only_once_the_agent_is_ready() {
+        let slow = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stt_url = format!("ws://{}/ws", slow.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let (s, _) = slow.accept().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(700)).await; // the Sarvam handshake is slow
+                tokio::spawn(async move {
+                    let _ws = tokio_tungstenite::accept_async(s).await;
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                });
+            }
+        });
+        let Some((mgr, log)) = ready_mgr("t_mgr_ready_first", |c| c.stt_ws_url = stt_url).await else {
+            return eprintln!("skipped: DOGRAH_TEST_DB_URL not set");
+        };
+
+        mgr.on_event(Event::StasisStart { channel: channel("caller-1"), args: vec![] });
+
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        assert!(!logged(&log, "/answer"), "still ringing while the STT connects: {:?}", log.lock().unwrap());
+        assert_eq!(mgr.ports.in_use(), 0, "and nothing is staged yet");
+        wait_for("the answer", || logged(&log, "POST /ari/channels/caller-1/answer")).await;
+        wait_for("externalMedia", || logged(&log, "/channels/externalMedia")).await;
+        assert!(mgr.calls.lock().unwrap().get("caller-1").unwrap().res.lock().unwrap().prepared.is_some(), "run_media takes it from here");
+    }
+
+    /// A burst that cannot get its turn at Asterisk within the answer wait is refused as congestion, never answered.
+    #[tokio::test]
+    async fn a_caller_who_waits_too_long_is_refused_without_being_answered() {
+        let Some((mgr, log)) = ready_mgr("t_mgr_answer_wait", |c| c.answer_wait = Duration::from_millis(400)).await else {
+            return eprintln!("skipped: DOGRAH_TEST_DB_URL not set");
+        };
+        let _all_turns = mgr.setup_sem.clone().acquire_many_owned(MAX_CONCURRENT_SETUPS as u32).await.unwrap(); // Asterisk is saturated
+
+        mgr.on_event(Event::StasisStart { channel: channel("caller-1"), args: vec![] });
+
+        wait_for("the refusal", || logged(&log, "DELETE /ari/channels/caller-1?reason=congestion")).await;
+        assert!(!logged(&log, "/answer"), "never answered: {:?}", log.lock().unwrap());
+        assert!(!logged(&log, "externalMedia"));
+        assert!(mgr.calls.lock().unwrap().is_empty());
+        assert_eq!(mgr.ports.in_use(), 0);
+    }
+
     /// An answered call whose externalMedia channel never enters Stasis is hung up, its port freed.
     #[tokio::test]
     async fn setup_times_out_when_the_media_channel_never_arrives() {
-        let Some((mgr, log)) = guard_mgr("t_mgr_setup_timeout", |c| c.setup_timeout = Duration::from_millis(600)).await else {
+        let Some((mgr, log)) = ready_mgr("t_mgr_setup_timeout", |c| c.setup_timeout = Duration::from_millis(600)).await else {
             return eprintln!("skipped: DOGRAH_TEST_DB_URL not set");
         };
         mgr.on_event(Event::StasisStart { channel: channel("caller-1"), args: vec![] });
@@ -1419,7 +1538,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_media_channel_arriving_stops_the_setup_timer() {
-        let Some((mgr, log)) = guard_mgr("t_mgr_setup_arrived", |c| c.setup_timeout = Duration::from_millis(600)).await else {
+        let Some((mgr, log)) = ready_mgr("t_mgr_setup_arrived", |c| c.setup_timeout = Duration::from_millis(600)).await else {
             return eprintln!("skipped: DOGRAH_TEST_DB_URL not set");
         };
         mgr.on_event(Event::StasisStart { channel: channel("caller-1"), args: vec![] });

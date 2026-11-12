@@ -51,8 +51,8 @@ pub fn campaign_pause(reason: &str) {
 pub static CPU_LOAD_PERMILLE: AtomicU64 = AtomicU64::new(0);
 pub static OVERLOADED: AtomicBool = AtomicBool::new(false);
 /// `vaani_calls_rejected_total{reason,direction}`: calls refused or held back.
-pub static CALLS_REJECTED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
-const REJECTED_LABELS: [(&str, &str); 3] = [("cpu", "inbound"), ("cpu", "outbound"), ("setup", "outbound")];
+pub static CALLS_REJECTED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+const REJECTED_LABELS: [(&str, &str); 4] = [("cpu", "inbound"), ("cpu", "outbound"), ("setup", "outbound"), ("answer_wait", "inbound")];
 /// Answered calls staged and not yet bridged.
 pub static CALLS_SETTING_UP: AtomicU64 = AtomicU64::new(0);
 pub static CALLS_SETUP_TIMEOUT: AtomicU64 = AtomicU64::new(0);

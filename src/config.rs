@@ -64,6 +64,10 @@ pub struct Config {
     /// Connections to Redis for the campaign dialer (REDIS_POOL_SIZE, default 4, 1 to 64): commands are spread
     /// over them, so one stalled reply doesn't hold up every dial worker.
     pub redis_pool_size: usize,
+    /// How long an inbound caller may wait to be answered (ANSWER_WAIT_SECONDS, default 10, 0 = no limit): the time
+    /// to load its workflow, open its STT and get a turn at Asterisk. Past it the caller is hung up as congestion
+    /// (SIP 503, so the trunk can try another server) instead of being answered late -- by then they have often gone.
+    pub answer_wait: Duration,
     /// A staged call whose media channel doesn't enter Stasis within this long is hung up (15 s; not a setting).
     pub setup_timeout: Duration,
     /// While the machine's CPU (a 5-second average, Asterisk included) is at or over this percent, new
@@ -186,6 +190,7 @@ impl Config {
             shutdown_wait: secs("SHUTDOWN_WAIT_SECONDS", 60)?,
             redis_pool_size: get_num("REDIS_POOL_SIZE", 4)?,
             setup_timeout: Duration::from_secs(15),
+            answer_wait: secs("ANSWER_WAIT_SECONDS", 10)?,
             load_shed_cpu_percent: get_num("LOAD_SHED_CPU_PERCENT", 90)?,
             load_resume_percent: get_num("LOAD_SHED_RESUME_PERCENT", 80)?,
             outbound_ring_timeout: secs("OUTBOUND_RING_TIMEOUT_SECONDS", 30)?,
@@ -313,6 +318,7 @@ impl Config {
             shutdown_wait: Duration::from_secs(10),
             redis_pool_size: 4,
             setup_timeout: Duration::from_secs(15),
+            answer_wait: Duration::from_secs(10),
             load_shed_cpu_percent: 0,
             load_resume_percent: 80,
             outbound_ring_timeout: Duration::from_secs(30),
