@@ -22,6 +22,8 @@ pub static ARI_CONNECTED: AtomicBool = AtomicBool::new(false);
 
 // Outbound campaigns.
 pub static CAMPAIGN_DIALS: AtomicU64 = AtomicU64::new(0);
+/// Redis commands of the dialer that failed (after a timeout), by the step that issued them.
+pub static REDIS_ERRORS: AtomicU64 = AtomicU64::new(0);
 pub static CAMPAIGN_RETRIES: AtomicU64 = AtomicU64::new(0);
 pub static CAMPAIGNS_COMPLETED: AtomicU64 = AtomicU64::new(0);
 pub static CAMPAIGN_CALLS_IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
@@ -284,6 +286,9 @@ pub fn render() -> String {
         CAMPAIGNS_COMPLETED.load(Relaxed),
         CAMPAIGN_CALLS_IN_FLIGHT.load(Relaxed),
     );
+    out.push_str(&format!("# TYPE vaani_redis_errors_total counter
+vaani_redis_errors_total {}
+", REDIS_ERRORS.load(Relaxed)));
     let p = proc_stats();
     let open_fds = std::fs::read_dir("/proc/self/fd").map_or(0, |d| d.count());
     let tasks = tokio::runtime::Handle::try_current().map_or(0, |h| h.metrics().num_alive_tasks());

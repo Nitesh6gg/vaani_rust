@@ -20,7 +20,7 @@ use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex, atomic::Ordering::Relaxed},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
@@ -129,6 +129,15 @@ fn retry_reason(status: &str) -> Option<&'static str> {
         STATUS_BUSY => Some("busy"),
         STATUS_NO_ANSWER => Some("no_answer"),
         _ => None,
+    }
+}
+
+/// Warns when a Redis step of the dialer took a second or more, so a stall shows up as a slow step before it
+/// is a failure (`ms` is how long it took).
+fn slow_redis(op: &str, campaign: i32, since: Instant) {
+    let ms = since.elapsed().as_millis();
+    if ms >= 1000 {
+        tracing::warn!(component = "campaign", event = "campaign.redis_slow", campaign_id = campaign, op, ms = ms as u64, "campaign: a Redis step was slow");
     }
 }
 
@@ -302,12 +311,18 @@ impl Runner {
             return Step::Stop;
         }
         let (limit, rate) = (self.org_limit(c, &chk), dial_rate(c, &chk));
-        match self.lim.acquire_token(c.organization_id, rate).await {
+        let t = Instant::now();
+        let token = self.lim.acquire_token(c.organization_id, rate).await;
+        slow_redis("rate limiter", c.id, t);
+        match token {
             Ok(true) => {}
             Ok(false) => return Step::Wait(self.lim.next_token_wait(c.organization_id).await),
             Err(e) => return self.limit_failed(c, "rate limiter", e),
         }
-        let slot = match self.lim.acquire_slot(c.organization_id, limit).await {
+        let t = Instant::now();
+        let slot = self.lim.acquire_slot(c.organization_id, limit).await;
+        slow_redis("slot limiter", c.id, t);
+        let slot = match slot {
             Ok(Some(s)) => s,
             Ok(None) => return Step::Stop, // full: a call ending wakes the next scan
             Err(e) => return self.limit_failed(c, "slot limiter", e),
@@ -329,13 +344,29 @@ impl Runner {
     }
 
     fn limit_failed(&self, c: &Campaign, what: &str, e: anyhow::Error) -> Step {
+        metrics::REDIS_ERRORS.fetch_add(1, Relaxed);
         tracing::error!(component = "campaign", event = "campaign.limit_failed", campaign_id = c.id, error = %format!("{e:#}"), "campaign: {what} failed");
         Step::Stop
     }
 
+    /// Gives the slot back. A slot that is not released keeps one of the organization's calls busy until
+    /// it expires (20 minutes), so a failed release is tried again (releasing twice is not an error).
     async fn release(&self, slot: &Slot) {
-        if let Err(e) = self.lim.release_slot(slot).await {
-            tracing::error!(component = "campaign", event = "campaign.release_failed", slot = %slot.id, error = %format!("{e:#}"), "campaign: releasing a slot failed");
+        for attempt in 1..=3u64 {
+            let t = Instant::now();
+            let res = self.lim.release_slot(slot).await;
+            slow_redis("slot release", 0, t);
+            match res {
+                Ok(()) => return,
+                Err(e) => {
+                    metrics::REDIS_ERRORS.fetch_add(1, Relaxed);
+                    if attempt == 3 {
+                        tracing::error!(component = "campaign", event = "campaign.release_failed", slot = %slot.id, error = %format!("{e:#}"), "campaign: releasing a slot failed");
+                    } else {
+                        tokio::time::sleep(Duration::from_millis(200 * attempt)).await;
+                    }
+                }
+            }
         }
     }
 
@@ -434,6 +465,7 @@ impl Runner {
             }
             Ok(_) => {}
             Err(e) => {
+                metrics::REDIS_ERRORS.fetch_add(1, Relaxed);
                 tracing::error!(component = "campaign", event = "campaign.breaker_failed", campaign_id = c.id, error = %format!("{e:#}"), "campaign: circuit breaker failed")
             }
         }

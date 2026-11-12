@@ -6,11 +6,30 @@
 
 use crate::dograh::campaign::BreakerConfig;
 use anyhow::{Context, Result};
-use redis::{Script, aio::ConnectionManager};
+use redis::{
+    Script,
+    aio::{ConnectionManager, ConnectionManagerConfig},
+};
 use std::{
-    sync::LazyLock,
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+/// Connections to Redis: one multiplexed connection shared by every dial worker lets a single stalled reply
+/// hold up all of them, so the commands are spread over a few.
+const POOL_SIZE: usize = 4;
+/// How long a command may wait for its reply, and a connection for being made: as long as the Go engine's
+/// Redis client (go-redis) waits, so a stall of a few seconds is not reported as an error.
+const REDIS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A few Redis connections, used in turn.
+struct Pool {
+    conns: Vec<ConnectionManager>,
+    next: AtomicUsize,
+}
 
 /// Dograh's stale_call_timeout: a slot older than this is dropped the next time anyone
 /// acquires one. A call running longer than this stops counting toward its
@@ -183,7 +202,7 @@ impl BreakerStats {
 /// Counts outbound calls in Redis.
 #[derive(Clone)]
 pub struct Limiter {
-    rdb: ConnectionManager,
+    pool: Arc<Pool>,
     /// Vaani's own cap on calls at once; 0 = only the organizations' limits apply.
     max_calls: u32,
     #[cfg(test)]
@@ -193,13 +212,22 @@ pub struct Limiter {
 impl Limiter {
     pub async fn connect(url: &str, max_calls: u32) -> Result<Self> {
         let client = redis::Client::open(url).context("campaign: redis url")?;
-        let rdb = ConnectionManager::new(client).await.context("campaign: connect to redis")?;
+        let cfg = || ConnectionManagerConfig::new().set_response_timeout(Some(REDIS_TIMEOUT)).set_connection_timeout(Some(REDIS_TIMEOUT));
+        let mut conns = Vec::with_capacity(POOL_SIZE);
+        for _ in 0..POOL_SIZE {
+            conns.push(ConnectionManager::new_with_config(client.clone(), cfg()).await.context("campaign: connect to redis")?);
+        }
         Ok(Self {
-            rdb,
+            pool: Arc::new(Pool { conns, next: AtomicUsize::new(0) }),
             max_calls,
             #[cfg(test)]
             skew_ms: Default::default(),
         })
+    }
+
+    /// The next connection of the pool (a cheap handle to it).
+    fn rdb(&self) -> ConnectionManager {
+        self.pool.conns[self.pool.next.fetch_add(1, Ordering::Relaxed) % self.pool.conns.len()].clone()
     }
 
     /// Seconds since the epoch, as Redis scores.
@@ -222,7 +250,7 @@ impl Limiter {
             .arg(now)
             .arg(now - 1.0)
             .arg(per_second)
-            .invoke_async(&mut self.rdb.clone())
+            .invoke_async(&mut self.rdb())
             .await
             .context("campaign: rate limit")?;
         Ok(n == 1)
@@ -231,7 +259,7 @@ impl Limiter {
     /// How long until the organization's window has room again.
     pub async fn next_token_wait(&self, org: i32) -> Duration {
         let oldest: Result<Vec<(String, f64)>, _> =
-            redis::cmd("ZRANGE").arg(rate_key(org)).arg(0).arg(0).arg("WITHSCORES").query_async(&mut self.rdb.clone()).await;
+            redis::cmd("ZRANGE").arg(rate_key(org)).arg(0).arg(0).arg("WITHSCORES").query_async(&mut self.rdb()).await;
         match oldest {
             Ok(v) => v.first().map_or(Duration::ZERO, |(_, score)| Duration::from_secs_f64((score + 1.0 - self.now()).max(0.0))),
             Err(_) => Duration::from_secs(1),
@@ -263,7 +291,7 @@ impl Limiter {
             .arg(limit)
             .arg(cutoff)
             .arg(id)
-            .invoke_async(&mut self.rdb.clone())
+            .invoke_async(&mut self.rdb())
             .await
             .with_context(|| format!("campaign: slot on {key}"))?;
         Ok(got.is_some())
@@ -271,7 +299,7 @@ impl Limiter {
 
     async fn drop_capacity(&self, id: &str) {
         if self.max_calls > 0 {
-            let _: Result<i64, _> = redis::cmd("ZREM").arg(CAPACITY_KEY).arg(id).query_async(&mut self.rdb.clone()).await;
+            let _: Result<i64, _> = redis::cmd("ZREM").arg(CAPACITY_KEY).arg(id).query_async(&mut self.rdb()).await;
         }
     }
 
@@ -282,7 +310,7 @@ impl Limiter {
         let _: i64 = redis::cmd("ZREM")
             .arg(concurrent_key(s.org))
             .arg(&s.id)
-            .query_async(&mut self.rdb.clone())
+            .query_async(&mut self.rdb())
             .await
             .with_context(|| format!("campaign: release slot {}", s.id))?;
         Ok(())
@@ -292,7 +320,7 @@ impl Limiter {
     /// until the next acquire trims them).
     #[cfg(test)]
     pub async fn active_slots(&self, org: i32) -> Result<i64> {
-        redis::cmd("ZCARD").arg(concurrent_key(org)).query_async(&mut self.rdb.clone()).await.context("campaign: active slots")
+        redis::cmd("ZCARD").arg(concurrent_key(org)).query_async(&mut self.rdb()).await.context("campaign: active slots")
     }
 
     /// Adds a finished call to the campaign's window and says whether the breaker is now tripped.
@@ -312,7 +340,7 @@ impl Limiter {
             .arg(cfg.threshold)
             .arg(cfg.min_calls)
             .arg(cfg.window.as_secs() + 60)
-            .invoke_async(&mut self.rdb.clone())
+            .invoke_async(&mut self.rdb())
             .await
             .context("campaign: circuit breaker")?;
         breaker_result(&res)
@@ -330,7 +358,7 @@ impl Limiter {
             .arg(self.now() - cfg.window.as_secs_f64())
             .arg(cfg.threshold)
             .arg(cfg.min_calls)
-            .invoke_async(&mut self.rdb.clone())
+            .invoke_async(&mut self.rdb())
             .await
             .context("campaign: circuit breaker")?;
         breaker_result(&res)
@@ -340,7 +368,7 @@ impl Limiter {
     #[cfg(test)]
     pub async fn reset_breaker(&self, campaign: i32) -> Result<()> {
         let (f, s) = breaker_keys(campaign);
-        let _: i64 = redis::cmd("DEL").arg(f).arg(s).query_async(&mut self.rdb.clone()).await.context("campaign: reset breaker")?;
+        let _: i64 = redis::cmd("DEL").arg(f).arg(s).query_async(&mut self.rdb()).await.context("campaign: reset breaker")?;
         Ok(())
     }
 
@@ -410,7 +438,7 @@ mod tests {
     async fn vaanis_own_cap_holds_across_organizations_and_is_given_back() {
         let Some((l, org)) = limiter(2).await else { return eprintln!("skipped: REDIS_TEST_URL not set") };
         // The cap key is shared by every test using one: start from a clean slate.
-        let _: i64 = redis::cmd("DEL").arg(CAPACITY_KEY).query_async(&mut l.rdb.clone()).await.unwrap();
+        let _: i64 = redis::cmd("DEL").arg(CAPACITY_KEY).query_async(&mut l.rdb()).await.unwrap();
         let a = l.acquire_slot(org, 10).await.unwrap().expect("1 of 2");
         let _b = l.acquire_slot(org + 1, 10).await.unwrap().expect("2 of 2");
         assert!(l.acquire_slot(org + 2, 10).await.unwrap().is_none(), "Vaani's cap of 2 is full");
@@ -418,14 +446,14 @@ mod tests {
         l.release_slot(&a).await.unwrap();
         assert!(l.acquire_slot(org + 2, 10).await.unwrap().is_some(), "releasing gave the capacity back");
         // An organization that is full doesn't leak capacity either.
-        let _: i64 = redis::cmd("DEL").arg(CAPACITY_KEY).query_async(&mut l.rdb.clone()).await.unwrap();
+        let _: i64 = redis::cmd("DEL").arg(CAPACITY_KEY).query_async(&mut l.rdb()).await.unwrap();
         let _x = l.acquire_slot(org + 3, 1).await.unwrap().unwrap();
         assert!(l.acquire_slot(org + 3, 1).await.unwrap().is_none());
         assert!(
             l.acquire_slot(org + 4, 1).await.unwrap().is_some() && l.acquire_slot(org + 5, 1).await.unwrap().is_none(),
             "2 slots in use, not 3"
         );
-        let _: i64 = redis::cmd("DEL").arg(CAPACITY_KEY).query_async(&mut l.rdb.clone()).await.unwrap();
+        let _: i64 = redis::cmd("DEL").arg(CAPACITY_KEY).query_async(&mut l.rdb()).await.unwrap();
     }
 
     #[tokio::test]
