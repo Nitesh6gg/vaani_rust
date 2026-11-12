@@ -152,8 +152,9 @@ metrics scraped every 10 s. Release build.
   a dropped first word is a worse call.
 - **New: Redis timeouts in the dialer**: 32 slot releases, 17 circuit-breaker writes and 17 rate/slot checks timed
   out (`campaign.release_failed`, `campaign.breaker_failed`, `campaign.limit_failed`). An unreleased slot holds one
-  of the 400 until its stale timeout expires, so the effective cap was a little lower. Redis load or the client's
-  timeout; not investigated.
+  of the 400 until its stale timeout expires, so the effective cap was a little lower. Three bursts (17:41:10,
+  17:44:15-20, 17:45:25-30 IST), each with a dip in the dial rate and in caller transcripts. The Go engine logged
+  none, but go-redis waits 5 s and retries 3 times, which hides a short stall; see `CAMPAIGN_25_REPORT.md`.
 - 4 setup failures: 3 `bind media port …: Address already in use` (a port handed out again while still in use) and
   1 externalMedia 500 from Asterisk.
 - Asterisk (separate 4-core box, `htop` during the run): its main thread at 74–86% of one core, the box at

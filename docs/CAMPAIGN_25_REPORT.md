@@ -89,8 +89,12 @@ over few seconds.
   requests took 3 s or more. No retries, no fallback lines.
 - TTS p95 was 1.0-2.1 s while the campaign was busy and 0.6-0.8 s after it slowed down: the provider under load is
   the first suspect (the engine was at 6% CPU), not proven.
-- The Redis timeouts fell in the same minutes as two of the LLM bursts (17:41, 17:44): a short network or host
-  hiccup on the engine's box is possible; not proven.
+- The Redis timeouts (17:41:10, 17:44:15-20, 17:45:25-30 IST) fell in the same minutes as two of the three LLM
+  bursts (17:44 and 17:45; the LLM's p95 spiked at 17:42, 17:44 and 17:45), not 17:41 and 17:44 as an earlier
+  version of this report said. At each Redis burst the dial rate dipped (10-29 per 5 s against ~60) and caller
+  transcripts almost stopped for a few seconds, then dialing caught up (145-150 per 5 s): the whole campaign
+  paused, not only Redis. Dograh's own logs show a burst in the same 5-second bucket as the 17:44 one, so something
+  shared (Redis, Postgres or the network) is a suspect as much as the engine's Redis client. Not proven.
 
 ## Agent behaviour
 
@@ -107,7 +111,11 @@ recording that is not available (`34bk399q`) and the agent spoke the text instea
    tick from a 5-frame (100 ms) queue, so any delay or burst overflows it. The load test (even audio, instant fake
    providers) showed 0 drops; the real Asterisk (main thread at 86%) and real providers did not.
 2. **Redis timeouts in the dialer**: 32 slot releases, 17 circuit-breaker writes and 17 rate or slot checks timed
-   out. A slot that is not released keeps one of the 400 busy until its 20-minute stale timeout.
+   out, in three bursts. A slot that is not released keeps one of the 400 busy until its 20-minute stale timeout.
+   The Go engine logged none in 7 days, but that does not show Redis is healthy: go-redis waits 5 s per command and
+   retries 3 times (verified in its source), which hides a stall of a few seconds; the Rust dialer shares ONE
+   multiplexed connection (verified in the redis crate's docs) and its default timeout is not documented, so it
+   reports the same stall as errors. Cause of the stall itself: open.
 3. **4 calls failed to start**: 3 `bind media port ...: Address already in use`, 1 externalMedia 500 from Asterisk.
 4. **Asterisk's main thread at 74-86% of one core** (box 19-26%), the component closest to its limit.
 
