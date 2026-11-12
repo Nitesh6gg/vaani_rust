@@ -15,6 +15,7 @@ pub fn http() -> &'static reqwest::Client {
     static C: OnceLock<reqwest::Client> = OnceLock::new();
     C.get_or_init(|| {
         reqwest::Client::builder()
+            .user_agent(super::USER_AGENT)
             .pool_max_idle_per_host(200)
             .pool_idle_timeout(Duration::from_secs(90))
             .connect_timeout(Duration::from_secs(5))
@@ -638,5 +639,22 @@ mod tests {
         assert_eq!(request_level(Duration::from_millis(200), true), Level::WARN, "failed, however fast");
         assert_eq!(request_level(Duration::from_secs(3), false), Level::INFO, "slow: 3 s or more");
         assert_eq!(request_level(Duration::from_millis(2999), false), Level::DEBUG);
+    }
+
+    /// Gateways such as Bifrost name the app from the User-Agent; reqwest sends none unless told to.
+    #[tokio::test]
+    async fn requests_carry_the_user_agent() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let lis = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = lis.local_addr().unwrap().port();
+        let seen = tokio::spawn(async move {
+            let (mut s, _) = lis.accept().await.unwrap();
+            let mut b = [0u8; 4096];
+            let n = s.read(&mut b).await.unwrap();
+            let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await;
+            String::from_utf8_lossy(&b[..n]).to_lowercase()
+        });
+        let _ = http().post(format!("http://127.0.0.1:{port}/v1/chat/completions")).body("{}").send().await;
+        assert!(seen.await.unwrap().contains("user-agent: rust-http-client/1.1\r\n"));
     }
 }

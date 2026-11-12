@@ -117,7 +117,12 @@ const ARI_TCP_KEEPALIVE: Duration = Duration::from_secs(30);
 pub(crate) fn http() -> &'static reqwest::Client {
     static C: OnceLock<reqwest::Client> = OnceLock::new();
     C.get_or_init(|| {
-        reqwest::Client::builder().timeout(Duration::from_secs(10)).tcp_keepalive(ARI_TCP_KEEPALIVE).build().expect("ari http client")
+        reqwest::Client::builder()
+            .user_agent(crate::ai::USER_AGENT)
+            .timeout(Duration::from_secs(10))
+            .tcp_keepalive(ARI_TCP_KEEPALIVE)
+            .build()
+            .expect("ari http client")
     })
 }
 
