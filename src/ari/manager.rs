@@ -414,12 +414,28 @@ impl Manager {
             self.ari.answer(id).await.context("answer")?;
         }
 
-        let port = self.ports.alloc().context("no free media port")?;
+        // Listen BEFORE telling Asterisk where to connect (invariant #9). A port whose previous call is
+        // still closing it is busy: put it back at the end of the line and take the next one.
+        let (port, listener) = {
+            let mut tries = 0;
+            loop {
+                let port = self.ports.alloc().context("no free media port")?;
+                metrics::MEDIA_PORTS_IN_USE.store(self.ports.in_use() as u64, Relaxed);
+                match TcpListener::bind(("0.0.0.0", port)).await {
+                    Ok(l) => break (port, l),
+                    Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && tries < 2 => {
+                        tries += 1;
+                        tracing::warn!(call_id = %id, port, event = "media.port_busy", "media port still in use; trying the next one");
+                        self.ports.free(port);
+                    }
+                    Err(e) => {
+                        call.res.lock().unwrap().port = Some(port); // teardown frees it
+                        return Err(e).with_context(|| format!("bind media port {port}"));
+                    }
+                }
+            }
+        };
         call.res.lock().unwrap().port = Some(port);
-        metrics::MEDIA_PORTS_IN_USE.store(self.ports.in_use() as u64, Relaxed);
-
-        // Listen BEFORE telling Asterisk where to connect (invariant #9).
-        let listener = TcpListener::bind(("0.0.0.0", port)).await.with_context(|| format!("bind media port {port}"))?;
         call.res.lock().unwrap().listener = Some(listener);
 
         call.res.lock().unwrap().external_requested = true;
