@@ -17,7 +17,7 @@ use tokio_tungstenite::tungstenite::Message as Ws;
 use tokio_util::sync::CancellationToken;
 
 const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
-const MAX_BACKOFF: Duration = Duration::from_secs(30);
+const MAX_BACKOFF: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct Channel {
@@ -105,12 +105,20 @@ pub fn events_url(base: &str, app: &str, user: &str, pass: &str) -> Result<Strin
     Ok(format!("{scheme}://{}/events?app={}&api_key={}:{}", rest.trim_end_matches('/'), urlenc(app), urlenc(user), urlenc(pass)))
 }
 
+/// Idle time before the first keepalive probe on an ARI REST connection.
+const ARI_TCP_KEEPALIVE: Duration = Duration::from_secs(30);
+
 /// Dedicated to the ARI REST calls, with a bounded timeout so a hung Asterisk
 /// can't block call setup forever. This isn't the "shared client for hot-path
 /// provider calls" of invariant #5: it fires a handful of times per call.
+///
+/// TCP keepalive: a pooled connection to Asterisk that its host lost without a FIN (reboot, firewall state
+/// dropped) is noticed within about `ARI_TCP_KEEPALIVE` + 3 probes, instead of failing the next hangup.
 pub(crate) fn http() -> &'static reqwest::Client {
     static C: OnceLock<reqwest::Client> = OnceLock::new();
-    C.get_or_init(|| reqwest::Client::builder().timeout(Duration::from_secs(10)).build().expect("ari http client"))
+    C.get_or_init(|| {
+        reqwest::Client::builder().timeout(Duration::from_secs(10)).tcp_keepalive(ARI_TCP_KEEPALIVE).build().expect("ari http client")
+    })
 }
 
 #[derive(Clone)]
@@ -294,5 +302,44 @@ mod tests {
         assert_eq!(u.len(), 36);
         assert_eq!(&u[14..15], "4");
         assert!(matches!(&u[19..20], "8" | "9" | "a" | "b"));
+    }
+
+    /// The ARI REST connections carry TCP keepalive (every 30 s), so a connection whose peer vanished without a
+    /// goodbye (Asterisk's host restarted or was frozen, a firewall dropped an idle flow) is noticed by the
+    /// kernel instead of at the next request, ten seconds late. Linux shows it in /proc/net/tcp: the timer
+    /// field of an established connection is 02 while its keepalive timer runs.
+    #[tokio::test]
+    async fn ari_connections_have_tcp_keepalive() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let Ok(table) = std::fs::read_to_string("/proc/net/tcp") else { return eprintln!("skipped: no /proc/net/tcp") };
+        drop(table);
+        let lis = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = lis.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut s, _) = lis.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf).await;
+            let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}").await;
+            tokio::time::sleep(Duration::from_secs(5)).await; // keeps the connection open, as Asterisk does
+        });
+
+        let resp = http().get(format!("http://127.0.0.1:{port}/ari/channels")).send().await.unwrap();
+        assert_eq!(resp.text().await.unwrap(), "{}");
+
+        // The client's end: remote 127.0.0.1:port (little-endian hex), ESTABLISHED (01).
+        let remote = format!("0100007F:{port:04X}");
+        let table = std::fs::read_to_string("/proc/net/tcp").unwrap();
+        let timer = table
+            .lines()
+            .skip(1)
+            .map(|l| l.split_whitespace().collect::<Vec<_>>())
+            .find(|f| f.get(2) == Some(&remote.as_str()) && f.get(3) == Some(&"01"))
+            .map(|f| f[5].to_string())
+            .expect("the connection to the listener is established and pooled");
+        // "02:<hex>" = keepalive timer, time left in USER_HZ (100) ticks: 30 s is 3000, reqwest's own default (15 s) is 1500.
+        let (kind, left) = timer.split_once(':').unwrap();
+        let left = u64::from_str_radix(left, 16).unwrap();
+        assert_eq!(kind, "02", "keepalive timer running on the connection (tr:tm->when = {timer})");
+        assert!((2000..=3000).contains(&left), "first probe due in about 30 s, not {left} ticks");
     }
 }
