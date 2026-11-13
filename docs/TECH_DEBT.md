@@ -14,7 +14,7 @@ Audit of the Rust engine. Priority = (Impact + Risk) x (6 - Effort), each scored
 | 8 | **Hard-coded limits** (16 setups, 32 prepares, 15 s setup timeout). | Code | 2 | 2 | 1 | 20 | **Done**: `SETUP_CONCURRENCY`, `PREPARE_CONCURRENCY`, `SETUP_TIMEOUT_SECONDS` |
 | 9 | **Mutex poisoning can cascade**: ~73 `.lock().unwrap()` on std mutexes in `manager.rs`; one panic under a lock makes every later user of it panic. | Code | 3 | 3 | 3 | 18 | Open |
 | 10 | **Stale leftovers.** | Code | 2 | 1 | 1 | 15 | **Done**: the `dead_code` allow on `LoadedWorkflow.org_id` is gone. The `#[ignore]`d `bench_concurrent_agents` (a capacity probe) and the `unused_mut` allow (test-only skew) are intentional |
-| 11 | **Duplicate dependency versions** (reqwest 0.12 and 0.13, base64, rand, getrandom). | Dependency | 2 | 2 | 3 | 12 | Open |
+| 11 | **Duplicate dependency versions** in the lockfile. | Dependency | 2 | 2 | 3 | 12 | **Partly done**: our `reqwest` is now 0.13 (features `rustls`, `query`), the same as OpenTelemetry's, so one copy, 2 fewer packages and a 1.2 MB smaller binary. It uses the system trust store through `rustls-platform-verifier` (0.12 bundled roots; the WebSocket clients already needed the system store) and our ring provider (installed at startup). What remains is upstream: `base64` 0.22 (tokio-postgres) vs 0.23 (hyper-util), `rand` 0.9 (opentelemetry_sdk) vs 0.10 (tokio-postgres), and `getrandom`, `phf`, `syn`, which no direct dependency choice can merge |
 | 12 | **Go/Rust drift**: the Go repo lacks answer-when-ready, the User-Agent and other fixes. | Architecture | 3 | 3 | 4 | 12 | Open |
 | 13 | **Large files**: `handler.rs` (~1.9k lines) and `manager.rs` (~1.8k, about half tests). | Code | 3 | 2 | 4 | 10 | Open |
 

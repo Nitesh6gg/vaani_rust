@@ -20,7 +20,7 @@ opentelemetry_sdk = "0.33"
 rand = "0.10"
 redis = { version = "1.8.1", features = ["tokio-comp", "connection-manager", "script"] }
 regex = "1"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "json", "stream"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "json", "query", "stream"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
