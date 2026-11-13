@@ -141,3 +141,7 @@ memory, and `vaani_post_call_waiting` shows the backlog; a SIGTERM waits `SHUTDO
 backlog beyond that is lost at a restart (a persistent queue is not built). Size `POST_CALL_WORKERS` to MinIO and Postgres:
 workers = end rate per second x seconds one record takes (30 s calls, 500 calls a node: 17 a second x about 1 s = 17).
 
+
+## Burst runs (Nov 13, 2026)
+
+See `TECH_DEBT.md` ("Burst runs"): 300 at 150 calls/s and 800 at 20 calls/s kept audio at 1.00; 1,000 started at once on the shared 4-core sandbox did not (0.66), with the cause not isolated. Re-run with the generator on another machine.
