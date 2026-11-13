@@ -6,7 +6,7 @@ OpenAI-compatible LLM + Earshot VAD, config from Dograh's Postgres. `README.md` 
 to-port list.
 
 ## Layout
-- `src/ari/` — events WebSocket + REST (`mod.rs`), per-call lifecycle (`manager.rs`)
+- `src/ari/` — events WebSocket + REST (`mod.rs`; its client has a 30 s TCP keepalive), per-call lifecycle (`manager.rs`)
 - `src/media/` — AudioSocket codec, per-call reader/writer tasks + pacer (`call.rs`), port pool
 - `src/ai/` — `stt.rs`, `tts.rs`, `llm.rs`, `chunker.rs`
 - `src/agent/` — `handler.rs` (the per-call state machine), `vad.rs` (Earshot), `workflow.rs`, `backchannel.rs`,
@@ -39,6 +39,11 @@ to-port list.
 10. n/a (RTP). 11. **AudioSocket frame = ONE write** (`audiosocket::write_frame`, 643-byte buffer).
 
 ## Conventions
+- **An inbound caller is answered only when the agent is ready** (`Manager::setup`): workflow loaded and STT open first (the caller rings),
+  then a setup turn at Asterisk (`MAX_CONCURRENT_SETUPS`), then `answer`. The whole wait is bounded by `ANSWER_WAIT_SECONDS`; past it, or on
+  any failure before the answer, the caller is refused with `hangup_reason("congestion")`, never answered late. Outbound calls are already answered.
+- **Every HTTP client and provider WebSocket sends `ai::USER_AGENT`** (`Rust-http-client/1.1`): reqwest sends none, and Bifrost names the app from it.
+  A new client gets `.user_agent(crate::ai::USER_AGENT)`.
 - Dograh queries: `use super::store::Cached` wherever `db.query(...)` is called, so statements are prepared once per
   connection (tokio-postgres's own `query(&str)` is two round trips). The dialer's pre-dial read is one query, `Store::dial_check`.
 - **A pooled Postgres connection (`Store::db()`) is held for statements only**: never across a MinIO transfer, an LLM call, a clip

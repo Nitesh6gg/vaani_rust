@@ -29,6 +29,8 @@ Milestones 1-3 are done except QA analysis (below): a Rust call is a complete ca
 | **STT speech-only gate** (pre-roll, hangover, keepalive) and **early flush** | done |
 | `/metrics` (Prometheus text) and `/healthz` | done |
 | **Load generator** (`loadgen`: fake Asterisk + mock providers; `docs/LOADTEST.md`) | done |
+| **Call setup under bursts**: an inbound caller rings until its workflow is loaded and its STT is open, then is answered (`ANSWER_WAIT_SECONDS`, else hung up as congestion); 16 setups at once against Asterisk, 32 prepares at once, CPU guard (`LOAD_SHED_CPU_PERCENT`), bounded post-call work | done |
+| **Outbound HTTP identity and liveness**: every HTTP client and provider WebSocket sends `User-Agent: Rust-http-client/1.1` (gateways such as Bifrost name the app from it); the ARI REST client uses a 30 s TCP keepalive | done |
 | **OpenTelemetry**: logs and traces over OTLP/HTTP (`OTEL_EXPORTER_OTLP_ENDPOINT`), as in the Go server | done |
 
 Not ported yet (in rough priority order):
