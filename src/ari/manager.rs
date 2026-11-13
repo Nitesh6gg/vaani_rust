@@ -57,14 +57,6 @@ const TRANSFER_ANSWER_SLACK: Duration = Duration::from_secs(5);
 /// How long to wait for Asterisk to open the AudioSocket TCP connection after the bridge is up.
 const ACCEPT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The call setups (answer, externalMedia, bridge) running against Asterisk at once; a burst waits its
-/// turn here, in Vaani, instead of piling onto Asterisk.
-const MAX_CONCURRENT_SETUPS: usize = 16;
-
-/// The workflow loads and STT handshakes running for callers not yet answered at once; the rest of a burst
-/// waits (inside its answer deadline) instead of hitting Postgres and Sarvam all together.
-const MAX_CONCURRENT_PREPARES: usize = 32;
-
 /// `f`, or `AnswerWaitExpired` if `deadline` (when there is one) comes first.
 async fn within<T>(deadline: Option<tokio::time::Instant>, f: impl Future<Output = anyhow::Result<T>>) -> anyhow::Result<T> {
     match deadline {
@@ -180,7 +172,8 @@ enum TransferSignal {
 impl Manager {
     pub fn new(ari: Ari, cfg: Arc<Config>, store: Store) -> Arc<Self> {
         let ports = PortAllocator::new(cfg.media_port_base, cfg.media_port_count);
-        let cfg_post_call_workers = cfg.post_call_workers;
+        let (post_call_workers, setup_concurrency, prepare_concurrency) =
+            (cfg.post_call_workers, cfg.setup_concurrency, cfg.prepare_concurrency);
         Arc::new(Self {
             ari,
             cfg,
@@ -191,9 +184,9 @@ impl Manager {
             outbound: Mutex::new(HashMap::new()),
             tracker: TaskTracker::new(),
             overloaded: OnceLock::new(),
-            setup_sem: Arc::new(Semaphore::new(MAX_CONCURRENT_SETUPS)),
-            prepare_sem: Arc::new(Semaphore::new(MAX_CONCURRENT_PREPARES)),
-            post_call_sem: Arc::new(Semaphore::new(cfg_post_call_workers)),
+            setup_sem: Arc::new(Semaphore::new(setup_concurrency)),
+            prepare_sem: Arc::new(Semaphore::new(prepare_concurrency)),
+            post_call_sem: Arc::new(Semaphore::new(post_call_workers)),
         })
     }
 
@@ -1144,10 +1137,21 @@ mod tests {
         assert!(cost["cost_breakdown"]["tts_cost"].as_f64().unwrap() > 0.0);
         let secs = cost["call_duration_seconds"].as_i64().unwrap();
         assert!((cost["charge_usd"].as_f64().unwrap() - secs as f64 * 0.001).abs() < 1e-9, "{cost}");
-        let cyc = db
-            .query_one("SELECT total_duration_seconds, used_amount_usd, used_dograh_tokens FROM organization_usage_cycles", &[])
-            .await
-            .unwrap();
+        // The usage cycle is charged in its own statement, a moment after cost_info: poll for it.
+        let mut cyc = None;
+        for _ in 0..200 {
+            let r = db
+                .query_one("SELECT total_duration_seconds, used_amount_usd, used_dograh_tokens FROM organization_usage_cycles", &[])
+                .await
+                .unwrap();
+            let charged = r.get::<_, f64>(2) > 0.0;
+            cyc = Some(r);
+            if charged {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let cyc = cyc.unwrap();
         assert_eq!(cyc.get::<_, i64>(0), secs);
         assert!((cyc.get::<_, f64>(1) - (1.0 + secs as f64 * 0.001)).abs() < 1e-9);
         assert!(cyc.get::<_, f64>(2) > 0.0, "Dograh tokens were charged");
@@ -1508,7 +1512,7 @@ mod tests {
         let Some((mgr, log)) = ready_mgr("t_mgr_answer_wait", |c| c.answer_wait = Duration::from_millis(400)).await else {
             return eprintln!("skipped: DOGRAH_TEST_DB_URL not set");
         };
-        let _all_turns = mgr.setup_sem.clone().acquire_many_owned(MAX_CONCURRENT_SETUPS as u32).await.unwrap(); // Asterisk is saturated
+        let _all_turns = mgr.setup_sem.clone().acquire_many_owned(mgr.cfg.setup_concurrency as u32).await.unwrap(); // Asterisk is saturated
 
         mgr.on_event(Event::StasisStart { channel: channel("caller-1"), args: vec![] });
 

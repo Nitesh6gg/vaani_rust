@@ -6,7 +6,7 @@ OpenAI-compatible LLM + Earshot VAD, config from Dograh's Postgres. `README.md` 
 to-port list.
 
 ## Layout
-- `src/ari/` — events WebSocket + REST (`mod.rs`; its client has a 30 s TCP keepalive), per-call lifecycle (`manager.rs`)
+- `src/ari/` — events WebSocket + REST (`mod.rs`; its REST client has a 30 s TCP keepalive, its events WebSocket a 30 s ping), per-call lifecycle (`manager.rs`)
 - `src/media/` — AudioSocket codec, per-call reader/writer tasks + pacer (`call.rs`), port pool
 - `src/ai/` — `stt.rs`, `tts.rs`, `llm.rs`, `chunker.rs`
 - `src/agent/` — `handler.rs` (the per-call state machine), `vad.rs` (Earshot), `workflow.rs`, `backchannel.rs`,
@@ -55,5 +55,6 @@ to-port list.
   every call line, an `event` field (`turn.user`, `call.summary`, …). INFO tells the call's story; detail is DEBUG.
 - Edition 2024: `gen` is reserved — use `generation`.
 - Tests: a behaviour that matters gets a test that fails if it breaks. Provider behaviour is tested against
-  `testkit` mocks speaking the real protocol; Postgres tests are gated on `DOGRAH_TEST_DB_URL`.
+  `testkit` mocks speaking the real protocol; Postgres tests are gated on `DOGRAH_TEST_DB_URL`, Redis ones on `REDIS_TEST_URL`;
+  they skip when unset unless `REQUIRE_TEST_SERVICES` is set (CI), when a missing URL fails the run. Wait for results by polling, never a fixed sleep.
 - `cargo fmt` (140 cols), `cargo clippy --all-targets` clean before committing.

@@ -400,7 +400,7 @@ mod tests {
     /// A limiter on the Redis named by `REDIS_TEST_URL` (these tests skip without it), and
     /// organization/campaign ids no other test run uses, so nothing needs flushing.
     async fn limiter(max_calls: u32) -> Option<(Limiter, i32)> {
-        let url = std::env::var("REDIS_TEST_URL").ok()?;
+        let url = crate::dograh::store::test_service_url("REDIS_TEST_URL")?;
         Some((Limiter::connect(&url, max_calls).await.unwrap(), (rand::random::<u32>() >> 2) as i32))
     }
 
@@ -422,7 +422,9 @@ mod tests {
 
     #[tokio::test]
     async fn the_redis_pool_has_the_configured_size_and_works() {
-        let Ok(url) = std::env::var("REDIS_TEST_URL") else { return eprintln!("skipped: REDIS_TEST_URL not set") };
+        let Some(url) = crate::dograh::store::test_service_url("REDIS_TEST_URL") else {
+            return eprintln!("skipped: REDIS_TEST_URL not set");
+        };
         let org = (rand::random::<u32>() >> 2) as i32;
         for size in [1, 7] {
             let l = Limiter::connect_with(&url, 0, size).await.unwrap();

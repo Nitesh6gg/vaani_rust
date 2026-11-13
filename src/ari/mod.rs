@@ -8,7 +8,7 @@ pub mod sweep;
 
 use crate::ai::urlenc;
 use anyhow::{Context, Result, bail};
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::json;
 use std::{sync::OnceLock, time::Duration};
@@ -228,9 +228,25 @@ pub fn uuid_v4() -> String {
     format!("{}-{}-{}-{}-{}", h(0..4), h(4..6), h(6..8), h(8..10), h(10..16))
 }
 
+/// How often the events WebSocket is pinged, and how long it may be silent (no frame of any kind, a pong included)
+/// before it is taken for dead. Asterisk's idle app sends no events, so without a ping a dead host looks the same as a quiet one.
+const WS_PING_EVERY: Duration = Duration::from_secs(30);
+const WS_DEAD_AFTER: Duration = Duration::from_secs(75);
+
 /// Runs the events WebSocket for the life of the process: connects with
 /// exponential backoff, forwards parsed events, and reports connectivity.
 pub async fn run_events(url: String, tx: mpsc::UnboundedSender<Event>, connected: watch::Sender<bool>, cancel: CancellationToken) {
+    run_events_with(url, tx, connected, cancel, WS_PING_EVERY, WS_DEAD_AFTER).await
+}
+
+async fn run_events_with(
+    url: String,
+    tx: mpsc::UnboundedSender<Event>,
+    connected: watch::Sender<bool>,
+    cancel: CancellationToken,
+    ping_every: Duration,
+    dead_after: Duration,
+) {
     let mut backoff = INITIAL_BACKOFF;
     let mut ever_connected = false;
     loop {
@@ -245,8 +261,25 @@ pub async fn run_events(url: String, tx: mpsc::UnboundedSender<Event>, connected
                     let _ = tx.send(Event::Reconnected);
                 }
                 ever_connected = true;
+                let mut ping = tokio::time::interval(ping_every);
+                ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                let mut last_heard = tokio::time::Instant::now();
                 loop {
-                    let msg = tokio::select! { _ = cancel.cancelled() => return, m = ws.next() => m };
+                    let msg = tokio::select! {
+                        _ = cancel.cancelled() => return,
+                        _ = ping.tick() => {
+                            if last_heard.elapsed() >= dead_after {
+                                tracing::warn!(silent_s = last_heard.elapsed().as_secs(), "ari websocket silent; taking it for dead");
+                                break;
+                            }
+                            if ws.send(Ws::Ping(Default::default())).await.is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                        m = ws.next() => m,
+                    };
+                    last_heard = tokio::time::Instant::now();
                     match msg {
                         Some(Ok(Ws::Text(t))) => {
                             if let Some(ev) = parse_event(t.as_str())
@@ -276,6 +309,52 @@ pub async fn run_events(url: String, tx: mpsc::UnboundedSender<Event>, connected
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A host that stops answering is noticed and reconnected to; one that answers pings is left alone.
+    #[tokio::test]
+    async fn the_events_websocket_detects_a_silent_peer_and_reconnects() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let lis = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = lis.local_addr().unwrap().port();
+        let accepted = std::sync::Arc::new(AtomicUsize::new(0));
+        let a = accepted.clone();
+        tokio::spawn(async move {
+            loop {
+                let (s, _) = lis.accept().await.unwrap();
+                a.fetch_add(1, SeqCst);
+                // The first connection is accepted and then never read: no pongs, as a dead host. Later ones answer.
+                let silent = a.load(SeqCst) == 1;
+                tokio::spawn(async move {
+                    let mut ws = tokio_tungstenite::accept_async(s).await.unwrap();
+                    if silent {
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                    } else {
+                        while ws.next().await.is_some() {}
+                    }
+                });
+            }
+        });
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (conn, mut conn_rx) = watch::channel(false);
+        let cancel = CancellationToken::new();
+        tokio::spawn(run_events_with(
+            format!("ws://127.0.0.1:{port}/ari/events?app=x&api_key=u:p"),
+            tx,
+            conn,
+            cancel.clone(),
+            Duration::from_millis(100),
+            Duration::from_millis(350),
+        ));
+        // Up, then down (silent), then up again on a second connection that stays.
+        tokio::time::timeout(Duration::from_secs(5), conn_rx.wait_for(|c| *c)).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), conn_rx.wait_for(|c| !*c)).await.expect("the silent peer is noticed").unwrap();
+        assert!(matches!(tokio::time::timeout(Duration::from_secs(5), rx.recv()).await, Ok(Some(Event::Reconnected))));
+        assert_eq!(accepted.load(SeqCst), 2);
+        tokio::time::sleep(Duration::from_millis(900)).await; // 2.5x the dead time: pongs keep it alive
+        assert!(*conn_rx.borrow(), "a peer that answers pings is not dropped");
+        assert_eq!(accepted.load(SeqCst), 2);
+        cancel.cancel();
+    }
 
     #[test]
     fn events_url_derivation() {

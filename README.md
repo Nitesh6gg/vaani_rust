@@ -30,7 +30,7 @@ Milestones 1-3 are done except QA analysis (below): a Rust call is a complete ca
 | `/metrics` (Prometheus text) and `/healthz` | done |
 | **Load generator** (`loadgen`: fake Asterisk + mock providers; `docs/LOADTEST.md`) | done |
 | **Call setup under bursts**: an inbound caller rings until its workflow is loaded and its STT is open, then is answered (`ANSWER_WAIT_SECONDS`, else hung up as congestion); 16 setups at once against Asterisk, 32 prepares at once, CPU guard (`LOAD_SHED_CPU_PERCENT`), bounded post-call work | done |
-| **Outbound HTTP identity and liveness**: every HTTP client and provider WebSocket sends `User-Agent: Rust-http-client/1.1` (gateways such as Bifrost name the app from it); the ARI REST client uses a 30 s TCP keepalive | done |
+| **Outbound HTTP identity and liveness**: every HTTP client and provider WebSocket sends `User-Agent: Rust-http-client/1.1` (gateways such as Bifrost name the app from it); the ARI REST client uses a 30 s TCP keepalive, and the ARI events WebSocket is pinged every 30 s and reconnected after 75 s of silence | done |
 | **OpenTelemetry**: logs and traces over OTLP/HTTP (`OTEL_EXPORTER_OTLP_ENDPOINT`), as in the Go server | done |
 
 Not ported yet (in rough priority order):
@@ -90,6 +90,7 @@ Same names as the Go server.
 | `CAMPAIGN_DIAL_WORKERS` `OUTBOUND_MAX_SETUP` | `10` `30` | contacts of one campaign dialed at once; the dialer holds back while this many answered calls wait in setup (0 = no cap) |
 | `LOAD_SHED_CPU_PERCENT` `LOAD_SHED_RESUME_PERCENT` | `90` `80` | CPU guard: while the whole machine's CPU (5 s average) is at/over the first, new calls are refused (inbound hung up as congestion before answering, campaigns don't dial); calls in progress are never dropped. 0 = off. Linux only |
 | `ANSWER_WAIT_SECONDS` | `10` | An inbound caller is answered only once its workflow is loaded and its STT is open; it rings meanwhile. If that, plus its turn at Asterisk (16 setups at once), takes longer than this, the caller is hung up as congestion (SIP 503) instead of being answered late. 0 = no limit. Outbound calls are already answered and unaffected |
+| `SETUP_CONCURRENCY` `PREPARE_CONCURRENCY` `SETUP_TIMEOUT_SECONDS` | `16` `32` `15` | call setups (answer, externalMedia, bridge) running against Asterisk at once; workflow loads + STT handshakes for unanswered callers at once; how long a staged call may wait for its media channel to enter Stasis before it is hung up |
 | `POST_CALL_WORKERS` `SHUTDOWN_WAIT_SECONDS` | `32` `60` | ended calls writing their Dograh record (last extraction, run completion, recording and transcript uploads, cost) at once, the rest wait with their recordings in memory (`vaani_post_call_running` / `_waiting`); how long a SIGTERM shutdown waits for calls and records still being written (it returns as soon as they are done) |
 | `REDIS_POOL_SIZE` | `4` | Redis connections of the campaign dialer (1 to 64) |
 | `ORPHAN_SWEEP_SECONDS` | `30` | every N s, hang up channels of this ARI app that Vaani lost track of (older than 90 s). Needs this Vaani to be the only one on its ARI app name. 0 = off |

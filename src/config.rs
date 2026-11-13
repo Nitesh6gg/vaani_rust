@@ -68,7 +68,13 @@ pub struct Config {
     /// to load its workflow, open its STT and get a turn at Asterisk. Past it the caller is hung up as congestion
     /// (SIP 503, so the trunk can try another server) instead of being answered late -- by then they have often gone.
     pub answer_wait: Duration,
-    /// A staged call whose media channel doesn't enter Stasis within this long is hung up (15 s; not a setting).
+    /// Call setups (answer, externalMedia, bridge) running against Asterisk at once (SETUP_CONCURRENCY, default 16): a burst
+    /// waits its turn in Vaani instead of piling onto Asterisk.
+    pub setup_concurrency: usize,
+    /// Workflow loads + STT handshakes for callers not yet answered, at once (PREPARE_CONCURRENCY, default 32): the rest of a
+    /// burst waits, inside its answer deadline, instead of hitting Postgres and Sarvam all together.
+    pub prepare_concurrency: usize,
+    /// A staged call whose media channel doesn't enter Stasis within this long is hung up (SETUP_TIMEOUT_SECONDS, default 15).
     pub setup_timeout: Duration,
     /// While the machine's CPU (a 5-second average, Asterisk included) is at or over this percent, new
     /// calls are refused -- inbound ones hung up as congestion before they are answered, and campaigns
@@ -189,7 +195,9 @@ impl Config {
             post_call_workers: get_num("POST_CALL_WORKERS", 32)?,
             shutdown_wait: secs("SHUTDOWN_WAIT_SECONDS", 60)?,
             redis_pool_size: get_num("REDIS_POOL_SIZE", 4)?,
-            setup_timeout: Duration::from_secs(15),
+            setup_concurrency: get_num("SETUP_CONCURRENCY", 16)?,
+            prepare_concurrency: get_num("PREPARE_CONCURRENCY", 32)?,
+            setup_timeout: secs("SETUP_TIMEOUT_SECONDS", 15)?,
             answer_wait: secs("ANSWER_WAIT_SECONDS", 10)?,
             load_shed_cpu_percent: get_num("LOAD_SHED_CPU_PERCENT", 90)?,
             load_resume_percent: get_num("LOAD_SHED_RESUME_PERCENT", 80)?,
@@ -272,6 +280,9 @@ impl Config {
         if self.dograh_db_url.is_empty() {
             bail!("config: DOGRAH_DB_URL is required (agent config is read from Dograh's Postgres)");
         }
+        if self.setup_concurrency == 0 || self.prepare_concurrency == 0 || self.setup_timeout.is_zero() {
+            bail!("config: SETUP_CONCURRENCY, PREPARE_CONCURRENCY and SETUP_TIMEOUT_SECONDS must be at least 1");
+        }
         if self.dograh_db_wait.is_zero() {
             bail!("config: DOGRAH_DB_WAIT_MS must be at least 1");
         }
@@ -317,6 +328,8 @@ impl Config {
             post_call_workers: 32,
             shutdown_wait: Duration::from_secs(10),
             redis_pool_size: 4,
+            setup_concurrency: 16,
+            prepare_concurrency: 32,
             setup_timeout: Duration::from_secs(15),
             answer_wait: Duration::from_secs(10),
             load_shed_cpu_percent: 0,

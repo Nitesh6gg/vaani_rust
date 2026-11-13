@@ -713,7 +713,7 @@ mod tests {
         delay: Duration,
         tweak: impl FnOnce(&mut RunnerConfig),
     ) -> Option<Rig> {
-        let redis = std::env::var("REDIS_TEST_URL").ok()?;
+        let redis = crate::dograh::store::test_service_url("REDIS_TEST_URL")?;
         // Ids no other run shares, so Redis counters from earlier runs can't interfere.
         let (org, campaign) = ((rand::random::<u32>() >> 8) as i32 + 1000, (rand::random::<u32>() >> 8) as i32 + 1000);
         let rows: String = contacts
@@ -804,11 +804,21 @@ mod tests {
         r.placer.end(1, out(false, "busy", 17));
         let run1: i64 = r.placer.placed.lock().unwrap()[1].4;
         wait_for("a retry to be scheduled", || futures_util::FutureExt::now_or_never(async { 0 }).is_some()).await;
-        tokio::time::sleep(Duration::from_millis(400)).await;
-        let g: Value = serde_json::from_str(
-            &db.query_one("SELECT gathered_context::text FROM workflow_runs WHERE id = $1", &[&run1]).await.unwrap().get::<_, String>(0),
-        )
-        .unwrap();
+        // The run is completed a moment after the end; poll for it instead of guessing how long that takes under load.
+        let mut g = Value::Null;
+        for _ in 0..200 {
+            g = serde_json::from_str(
+                &db.query_one("SELECT gathered_context::text FROM workflow_runs WHERE id = $1", &[&run1])
+                    .await
+                    .unwrap()
+                    .get::<_, String>(0),
+            )
+            .unwrap();
+            if g["call_disposition"].is_string() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
         assert_eq!((g["call_disposition"].as_str(), &g["call_tags"]), (Some("BUSY"), &json!(["not_connected", "telephony_busy"])));
         r.placer.end(2, out(true, "", 0));
         wait_for("the retry to be dialed", || r.placer.count() == 4).await;

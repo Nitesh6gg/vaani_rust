@@ -25,12 +25,20 @@ const WARM: usize = 4;
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_MAX_DURATION: Duration = Duration::from_secs(300);
 
+/// The URL of a service the tests need, or `None` (the test skips) when it is unset. With `REQUIRE_TEST_SERVICES` set (CI),
+/// a missing URL panics instead, so a run can't pass by skipping everything.
+#[cfg(test)]
+pub(crate) fn test_service_url(var: &str) -> Option<String> {
+    let url = std::env::var(var).ok();
+    assert!(url.is_some() || std::env::var_os("REQUIRE_TEST_SERVICES").is_none(), "REQUIRE_TEST_SERVICES is set but {var} is not");
+    url
+}
+
 /// What one call runs.
 pub struct LoadedWorkflow {
     pub id: i32,
     /// The definition version this call runs.
     pub definition_id: i64,
-    #[allow(dead_code)] // for the call's run record (next milestone)
     pub org_id: Option<i64>,
     pub workflow: Workflow,
     pub services: Services,
@@ -202,7 +210,7 @@ impl Store {
     /// connection held too long, or two held at once, show up at once.
     #[cfg(test)]
     pub async fn for_test_pool(schema: &str, sql: &str, max_conns: usize, wait: Duration) -> Option<(Self, String)> {
-        let url = std::env::var("DOGRAH_TEST_DB_URL").ok()?;
+        let url = test_service_url("DOGRAH_TEST_DB_URL")?;
         let admin = Self::open(&url, 1).await.unwrap();
         let db = admin.pool.get().await.unwrap();
         db.batch_execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema};")).await.unwrap();
