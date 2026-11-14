@@ -18,7 +18,9 @@ to-port list.
 - `src/load.rs` — CPU guard (`LOAD_SHED_CPU_PERCENT`): refuse *new* calls while the machine is over the limit; `src/ari/sweep.rs` —
   hangs up channels of our Stasis app that nothing tracks (`ORPHAN_SWEEP_SECONDS`)
 - `src/telemetry.rs` — OTLP logs and traces (`OTEL_EXPORTER_OTLP_ENDPOINT`): a `call` span per call (the call's trace id is the `trace_id`
-  on its log lines), `llm.request` child spans; no-op when unset
+  on its log lines), `llm.request` child spans; no-op when unset. Spans are `tracing` spans exported by `tracing-opentelemetry` (its layer sees
+  spans only, and the log filters are per layer, so `LOG_LEVEL` never hides them); the log lines go through our own layer, keyed by `call_id`
+  (a call's lines are written from many tasks that are in no span). Time is `jiff` (`Timestamp`; zones from its bundled tz database)
 - `src/bin/loadgen.rs` — load generator: fake Asterisk (ARI + AudioSocket callers) and mock STT/TTS/LLM (`docs/LOADTEST.md`)
 - `src/callagent.rs` — builds a call's agent from Dograh; `src/testkit.rs` — mock Sarvam/LLM servers
 

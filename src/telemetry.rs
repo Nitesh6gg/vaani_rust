@@ -5,7 +5,9 @@
 //!   a line that carries a `call_id` also carries that call's `trace_id` and `run_id`;
 //! - each call is one trace: a `call` span, with a child `llm.request` span per LLM HTTP attempt
 //!   (model, attempt, status, `llm.request_id`, `llm.completion_id`). The call's trace id is the
-//!   `trace_id` on its log lines, so a log line finds the call's trace.
+//!   `trace_id` on its log lines, so a log line finds the call's trace. The spans are `tracing` spans,
+//!   exported by `tracing-opentelemetry`; the log lines are pushed by our own layer, because a call's lines are
+//!   written from many tasks that are in no span -- what ties them to the call is the `call_id` field.
 //!
 //! Unset (the default): nothing is built, every function here is a cheap no-op. The service name is
 //! `vaani-engine-rust` (`OTEL_SERVICE_NAME` overrides it) so both engines can report to one SigNoz
@@ -13,15 +15,15 @@
 
 use anyhow::{Context as _, Result};
 use opentelemetry::{
-    Context, KeyValue,
+    KeyValue,
     logs::{AnyValue, LogRecord as _, Logger as _, LoggerProvider as _, Severity},
-    trace::{Span as _, SpanId, Status, TraceContextExt as _, TraceFlags, TraceId, Tracer as _, TracerProvider as _},
+    trace::{SpanId, Status, TraceContextExt as _, TraceFlags, TraceId, TracerProvider as _},
 };
 use opentelemetry_otlp::{LogExporter, SpanExporter, WithExportConfig};
 use opentelemetry_sdk::{
     Resource,
     logs::{SdkLogger, SdkLoggerProvider},
-    trace::{IdGenerator, SdkTracer, SdkTracerProvider, Span as SdkSpan},
+    trace::{IdGenerator, SdkTracer, SdkTracerProvider},
 };
 use std::{
     cell::Cell,
@@ -30,7 +32,8 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 use tracing::{Event, Subscriber, field::Visit};
-use tracing_subscriber::{Layer, layer::Context as LayerContext};
+use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+use tracing_subscriber::{Layer, layer::Context as LayerContext, registry::LookupSpan};
 
 const SERVICE_NAME: &str = "vaani-engine-rust";
 /// How long a finished call's trace id is kept for the log lines written after its teardown.
@@ -43,8 +46,8 @@ struct CallTrace {
     trace_id: TraceId,
     span_id: SpanId,
     run_id: Option<i64>,
-    /// The `call` span's context, the parent of its LLM requests; `None` once ended or when only logs are exported.
-    cx: Option<Context>,
+    /// The `call` span, the parent of its LLM requests; `None` once ended or when only logs are exported.
+    span: Option<tracing::Span>,
     at: Instant,
 }
 
@@ -100,6 +103,7 @@ fn random_span_id() -> SpanId {
 pub struct Telemetry {
     logs: Option<SdkLoggerProvider>,
     traces: Option<SdkTracerProvider>,
+    tracer: Option<SdkTracer>,
 }
 
 /// The tracing layer that pushes log lines over OTLP.
@@ -134,7 +138,7 @@ pub fn start() -> Result<(Telemetry, Option<OtlpLogs>)> {
 /// `logs` / `traces`: `None` = off; `Some(None)` = on, endpoint from the environment; `Some(Some(url))` = on, that URL.
 fn build(logs: Option<Option<String>>, traces: Option<Option<String>>) -> Result<(Telemetry, Option<OtlpLogs>)> {
     let res = resource();
-    let (mut tel, mut layer) = (Telemetry { logs: None, traces: None }, None);
+    let (mut tel, mut layer) = (Telemetry { logs: None, traces: None, tracer: None }, None);
 
     if let Some(url) = logs {
         let mut b = LogExporter::builder().with_http();
@@ -159,6 +163,7 @@ fn build(logs: Option<Option<String>>, traces: Option<Option<String>>) -> Result
             .with_id_generator(CallIds)
             .build();
         tracer = Some(provider.tracer("vaani"));
+        tel.tracer = tracer.clone();
         tel.traces = Some(provider);
     }
 
@@ -171,7 +176,25 @@ fn build(logs: Option<Option<String>>, traces: Option<Option<String>>) -> Result
 impl Telemetry {
     /// Nothing exported.
     pub fn off() -> Self {
-        Self { logs: None, traces: None }
+        Self { logs: None, traces: None, tracer: None }
+    }
+
+    /// The layer that exports `tracing` spans as OpenTelemetry spans; `None` with traces off. It sees spans only, never
+    /// events (so it doesn't switch every `debug!` on), and adds no attributes of its own beyond the span's fields.
+    pub fn span_layer<S>(&self) -> Option<Box<dyn Layer<S> + Send + Sync>>
+    where
+        S: Subscriber + for<'a> LookupSpan<'a> + Send + Sync,
+    {
+        use tracing_subscriber::filter::filter_fn;
+        let tracer = self.tracer.clone()?;
+        let layer = tracing_opentelemetry::layer()
+            .with_tracer(tracer)
+            .with_location(false)
+            .with_threads(false)
+            .with_level(false)
+            .with_target(false)
+            .with_tracked_inactivity(false);
+        Some(layer.with_filter(filter_fn(|m| m.is_span())).boxed())
     }
 
     pub fn enabled(&self) -> bool {
@@ -196,25 +219,30 @@ impl Telemetry {
 /// its `call` span.
 pub fn start_call(call_id: &str, attrs: &[(&'static str, String)], run_id: Option<i64>) {
     let Some(st) = state() else { return };
-    let trace_id = random_trace_id();
-    let (mut span_id, mut cx) = (SpanId::INVALID, None);
-    if let Some(tracer) = &st.tracer {
+    let mut trace_id = random_trace_id();
+    let (mut span_id, mut span) = (SpanId::INVALID, None);
+    if st.tracer.is_some() {
+        // A root span, which takes the id in `NEXT_TRACE` when it is started. tracing-opentelemetry starts it on first
+        // use, so the first `set_attribute` below does it, here, on this thread.
         NEXT_TRACE.with(|c| c.set(Some(trace_id)));
-        let mut kv = vec![KeyValue::new("call_id", call_id.to_string())];
-        kv.extend(attrs.iter().map(|(k, v)| KeyValue::new(*k, v.clone())));
-        if let Some(r) = run_id {
-            kv.push(KeyValue::new("run.id", r));
+        let sp = tracing::info_span!(parent: None, "call", call_id = %call_id);
+        for (k, v) in attrs {
+            sp.set_attribute(*k, v.clone());
         }
-        let span = tracer.span_builder("call").with_attributes(kv).start_with_context(tracer, &Context::new());
+        if let Some(r) = run_id {
+            sp.set_attribute("run.id", r);
+        }
         NEXT_TRACE.with(|c| c.set(None));
-        span_id = span.span_context().span_id();
-        cx = Some(Context::new().with_span(span));
+        let sc = sp.context().span().span_context().clone();
+        if sc.is_valid() {
+            (trace_id, span_id, span) = (sc.trace_id(), sc.span_id(), Some(sp));
+        }
     }
     let mut calls = st.calls.lock().unwrap();
     if calls.len() >= MAX_CALLS {
         calls.retain(|_, c| c.at.elapsed() < KEEP);
     }
-    calls.insert(call_id.to_string(), CallTrace { trace_id, span_id, run_id, cx, at: Instant::now() });
+    calls.insert(call_id.to_string(), CallTrace { trace_id, span_id, run_id, span, at: Instant::now() });
 }
 
 /// The run Dograh recorded for the call, once known: later lines carry it, and the span gets it.
@@ -222,8 +250,8 @@ pub fn set_run(call_id: &str, run_id: i64) {
     let Some(st) = state() else { return };
     if let Some(c) = st.calls.lock().unwrap().get_mut(call_id) {
         c.run_id = Some(run_id);
-        if let Some(cx) = &c.cx {
-            cx.span().set_attribute(KeyValue::new("run.id", run_id));
+        if let Some(sp) = &c.span {
+            sp.set_attribute("run.id", run_id);
         }
     }
 }
@@ -231,21 +259,21 @@ pub fn set_run(call_id: &str, run_id: i64) {
 /// The call's agent has left it: ends the `call` span. Its trace id stays for the lines written after.
 pub fn end_call(call_id: &str) {
     let Some(st) = state() else { return };
-    if let Some(c) = st.calls.lock().unwrap().get_mut(call_id)
-        && let Some(cx) = c.cx.take()
-    {
-        cx.span().end();
-    }
+    let span = st.calls.lock().unwrap().get_mut(call_id).and_then(|c| c.span.take());
+    drop(span); // the last handle closing is what ends the span
 }
 
 /// Everything about the call is logged: its trace id is no longer needed.
 pub fn forget_call(call_id: &str) {
     let Some(st) = state() else { return };
-    if let Some(c) = st.calls.lock().unwrap().remove(call_id)
-        && let Some(cx) = c.cx
-    {
-        cx.span().end();
-    }
+    let call = st.calls.lock().unwrap().remove(call_id);
+    drop(call);
+}
+
+/// The `call` span id of a call, for tests.
+#[cfg(test)]
+pub fn span_id_of(call_id: &str) -> Option<SpanId> {
+    state()?.calls.lock().unwrap().get(call_id).map(|c| c.span_id)
 }
 
 /// The trace id of a call (hex), for tests and diagnostics.
@@ -255,30 +283,31 @@ pub fn trace_id_of(call_id: &str) -> Option<TraceId> {
 }
 
 /// A request to the LLM, as a child span of its call's `call` span. `None` when traces are off.
-pub struct LlmSpan(SdkSpan);
+pub struct LlmSpan(tracing::Span);
 
 pub fn llm_span(call_id: &str) -> Option<LlmSpan> {
     let st = state()?;
-    let tracer = st.tracer.as_ref()?;
-    let parent = st.calls.lock().unwrap().get(call_id).and_then(|c| c.cx.clone()).unwrap_or_else(Context::new);
-    Some(LlmSpan(tracer.start_with_context("llm.request", &parent)))
+    st.tracer.as_ref()?;
+    let parent = st.calls.lock().unwrap().get(call_id).and_then(|c| c.span.clone());
+    Some(LlmSpan(match parent {
+        Some(p) => tracing::info_span!(parent: &p, "llm.request"),
+        None => tracing::info_span!(parent: None, "llm.request"),
+    }))
 }
 
 impl LlmSpan {
     /// Ends the span with what the request came to.
-    pub fn end(mut self, model: &str, attempt: u32, status: u16, request_id: &str, completion_id: &str, error: Option<&str>) {
-        self.0.set_attributes([
-            KeyValue::new("llm.model", model.to_string()),
-            KeyValue::new("llm.attempt", i64::from(attempt)),
-            KeyValue::new("http.status_code", i64::from(status)),
-            KeyValue::new("llm.request_id", request_id.to_string()),
-            KeyValue::new("llm.completion_id", completion_id.to_string()),
-        ]);
+    pub fn end(self, model: &str, attempt: u32, status: u16, request_id: &str, completion_id: &str, error: Option<&str>) {
+        let sp = &self.0;
+        sp.set_attribute("llm.model", model.to_string());
+        sp.set_attribute("llm.attempt", i64::from(attempt));
+        sp.set_attribute("http.status_code", i64::from(status));
+        sp.set_attribute("llm.request_id", request_id.to_string());
+        sp.set_attribute("llm.completion_id", completion_id.to_string());
         if let Some(e) = error {
-            self.0.add_event("exception", vec![KeyValue::new("exception.message", e.to_string())]);
-            self.0.set_status(Status::error(e.to_string()));
+            sp.add_event("exception", vec![KeyValue::new("exception.message", e.to_string())]);
+            sp.set_status(Status::error(e.to_string()));
         }
-        self.0.end();
     }
 }
 
@@ -392,6 +421,10 @@ mod tests {
 
     type Seen = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
 
+    static CALL_SPAN: Mutex<Option<SpanId>> = Mutex::new(None);
+    /// The telemetry state is process-wide: the tests that build it take turns.
+    static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     /// A collector: records every POST (path and protobuf body) and answers 200 with an empty response.
     async fn collector() -> (String, Seen) {
         let lis = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -447,14 +480,16 @@ mod tests {
     /// A call's log lines and its `call` / `llm.request` spans reach the collector under the call's trace id.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_calls_logs_and_spans_share_its_trace_id() {
+        let _turn = SERIAL.lock().await;
         let (url, seen) = collector().await;
         let (tel, layer) = build(Some(Some(format!("{url}/v1/logs"))), Some(Some(format!("{url}/v1/traces")))).unwrap();
         assert!(tel.enabled());
 
-        let subscriber = tracing_subscriber::registry().with(layer);
+        let subscriber = tracing_subscriber::registry().with(layer).with(tel.span_layer());
         let trace_id = tracing::subscriber::with_default(subscriber, || {
             start_call("call-otel-1", &[("direction", "outbound".into())], None);
             let trace_id = trace_id_of("call-otel-1").expect("registered");
+            *CALL_SPAN.lock().unwrap() = span_id_of("call-otel-1");
             tracing::info!(call_id = "call-otel-1", event = "call.answered", port = 20001, "call answered");
             set_run("call-otel-1", 6528);
             tracing::info!(call_id = "call-otel-1", event = "turn.user", "second line");
@@ -488,6 +523,12 @@ mod tests {
 
         let traces = traces.concat();
         assert!(contains(&traces, &tid), "spans are in the call's trace");
+        // The call span's id is its own and the two LLM requests' parent: three times in all.
+        let sid = CALL_SPAN.lock().unwrap().expect("span id").to_bytes();
+        assert_eq!(traces.windows(8).filter(|w| *w == sid).count(), 3, "llm.request spans are children of the call span");
+        for noise in ["code.file.path", "thread.id", "busy_ns", "idle_ns"] {
+            assert!(!contains(&traces, noise.as_bytes()), "{noise}: the span layer adds no attributes of its own");
+        }
         for want in [
             "call",
             "llm.request",
@@ -502,5 +543,28 @@ mod tests {
         ] {
             assert!(contains(&traces, want.as_bytes()), "{want} missing from the exported spans");
         }
+    }
+
+    /// The log layer's own level filter doesn't hide spans: LOG_LEVEL=error still exports the call's trace.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spans_are_exported_whatever_the_log_level() {
+        let _turn = SERIAL.lock().await;
+        use tracing_subscriber::{EnvFilter, Layer as _};
+        let (url, seen) = collector().await;
+        let (tel, layer) = build(Some(Some(format!("{url}/v1/logs"))), Some(Some(format!("{url}/v1/traces")))).unwrap();
+        let subscriber = tracing_subscriber::registry().with(layer.map(|l| l.with_filter(EnvFilter::new("error")))).with(tel.span_layer());
+        tracing::subscriber::with_default(subscriber, || {
+            start_call("call-otel-2", &[], None);
+            tracing::info!(call_id = "call-otel-2", "an info line the filter drops");
+            llm_span("call-otel-2").unwrap().end("m", 1, 200, "r", "c", None);
+            end_call("call-otel-2");
+            forget_call("call-otel-2");
+        });
+        tokio::task::spawn_blocking(move || tel.shutdown()).await.unwrap();
+        let seen = seen.lock().unwrap().clone();
+        let traces: Vec<u8> = seen.iter().filter(|(p, _)| p == "/v1/traces").flat_map(|(_, b)| b.clone()).collect();
+        let logs: Vec<u8> = seen.iter().filter(|(p, _)| p == "/v1/logs").flat_map(|(_, b)| b.clone()).collect();
+        assert!(contains(&traces, b"call-otel-2") && contains(&traces, b"llm.request"));
+        assert!(!contains(&logs, b"an info line"), "the log filter still applies to logs");
     }
 }

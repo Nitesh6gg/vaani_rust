@@ -59,3 +59,11 @@ engines it would requeue (double-dial) and interrupt the other engine's live wor
    against double dialing, but leftovers of the other cells stay until someone requeues them by hand.
 3. **One dialer for the fleet** (the campaign runner on one designated cell or lease-elected; the others only take calls): no
    shared-state change, at the cost of the dialer being a single point.
+
+## Dependency review (Nov 14)
+
+- `chrono` + `chrono-tz` replaced by `jiff` (Timestamp, bundled tz database): SigV4 dates, Dograh's isoformat timestamps, Asterisk creation times,
+  the campaign schedule and the template time zones, all checked by the existing tests (plus one for the timestamp shapes).
+- The call/LLM spans moved from hand-driven `SdkSpan`s to `tracing` spans exported by `tracing-opentelemetry`. The log bridge stays ours:
+  `opentelemetry-appender-tracing` takes a line's trace context from the current span, but a call's lines are written from many tasks that
+  are in no span, so the lines find their trace by `call_id`. This swap adds a dependency (`tracing-opentelemetry`) and removes about 40 lines.

@@ -26,13 +26,18 @@ use tokio_util::sync::CancellationToken;
 fn init_logging() -> telemetry::Telemetry {
     use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
     let level = std::env::var("LOG_LEVEL").unwrap_or_else(|_| "info".into());
-    let filter = EnvFilter::try_new(&level).unwrap_or_else(|_| EnvFilter::new("info"));
+    // One filter per log layer (not a global one): the span layer must see the call spans whatever LOG_LEVEL is.
+    let filter = || EnvFilter::try_new(&level).unwrap_or_else(|_| EnvFilter::new("info"));
     let (tel, otlp, failed) = match telemetry::start() {
         Ok((tel, otlp)) => (tel, otlp, None),
         Err(e) => (telemetry::Telemetry::off(), None, Some(format!("{e:#}"))),
     };
     let stderr = if std::env::var("LOG_FORMAT").is_ok_and(|f| f == "json") { fmt::layer().json().boxed() } else { fmt::layer().boxed() };
-    tracing_subscriber::registry().with(filter).with(stderr).with(otlp).init();
+    tracing_subscriber::registry()
+        .with(stderr.with_filter(filter()))
+        .with(otlp.map(|l| l.with_filter(filter())))
+        .with(tel.span_layer())
+        .init();
     if let Some(e) = failed {
         tracing::warn!(event = "telemetry.disabled", error = %e, "otlp export disabled; could not configure it");
     } else if tel.enabled() {
