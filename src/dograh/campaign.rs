@@ -5,7 +5,7 @@
 
 use super::{Store, outbound::DialSettings, store::Cached};
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, Datelike, Timelike, Utc};
+use jiff::{Timestamp, tz::TimeZone};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use std::time::Duration;
@@ -62,7 +62,7 @@ pub struct BreakerConfig {
 pub struct Schedule {
     pub enabled: bool,
     /// `None` (an unknown timezone) allows every time, as Dograh does.
-    pub tz: Option<chrono_tz::Tz>,
+    pub tz: Option<TimeZone>,
     pub slots: Vec<ScheduleSlot>,
 }
 
@@ -76,10 +76,10 @@ pub struct ScheduleSlot {
 
 impl Schedule {
     /// No schedule, no slots or an unknown timezone allow every time.
-    pub fn allows(&self, now: DateTime<Utc>) -> bool {
-        let (true, Some(tz), false) = (self.enabled, self.tz, self.slots.is_empty()) else { return true };
-        let local = now.with_timezone(&tz);
-        let (day, hm) = (local.weekday().num_days_from_monday(), format!("{:02}:{:02}", local.hour(), local.minute()));
+    pub fn allows(&self, now: Timestamp) -> bool {
+        let (true, Some(tz), false) = (self.enabled, &self.tz, self.slots.is_empty()) else { return true };
+        let local = now.to_zoned(tz.clone());
+        let (day, hm) = (local.weekday().to_monday_zero_offset() as u32, format!("{:02}:{:02}", local.hour(), local.minute()));
         self.slots.iter().any(|s| s.day == day && s.start <= hm && hm < s.end)
     }
 }
@@ -163,7 +163,7 @@ pub fn parse_campaign(c: &mut Campaign, retry_json: &str, meta_json: &str) -> Re
     if let Some(sc) = m.schedule_config {
         c.schedule.enabled = sc.enabled;
         let tz = if sc.timezone.is_empty() { "UTC" } else { &sc.timezone };
-        c.schedule.tz = tz.parse().ok();
+        c.schedule.tz = TimeZone::get(tz).ok();
         c.schedule.slots =
             sc.slots.into_iter().map(|s| ScheduleSlot { day: s.day_of_week, start: s.start_time, end: s.end_time }).collect();
     }
@@ -270,7 +270,7 @@ impl Store {
     /// rest in the order they were loaded, and marks them 'processing'. FOR UPDATE SKIP LOCKED means two
     /// claimers never get the same row. Dograh picks the regular rows at random; loading order is kept
     /// here so a CSV is called top to bottom.
-    pub async fn claim_runs(&self, campaign: i32, limit: i64, now: DateTime<Utc>) -> Result<Vec<QueuedRun>> {
+    pub async fn claim_runs(&self, campaign: i32, limit: i64, now: Timestamp) -> Result<Vec<QueuedRun>> {
         let db = self.db().await?;
         let rows = db
             .query(
@@ -283,7 +283,7 @@ impl Store {
                  UPDATE queued_runs q SET state = 'processing'
                  FROM due WHERE q.id = due.id
                  RETURNING q.id::int, q.campaign_id::int, q.source_uuid, COALESCE(q.context_variables::text, '{}'), COALESCE(q.retry_count, 0)::int",
-                &[&campaign, &now.to_rfc3339(), &limit],
+                &[&campaign, &now.to_string(), &limit],
             )
             .await
             .context("dograh: claim runs")?;
@@ -333,13 +333,13 @@ impl Store {
     /// variables plus is_retry / retry_attempt / retry_reason, source_uuid "<original>_retry_<n>", the
     /// attempt counted in retry_count. A retry that already exists (same campaign, source and attempt)
     /// is left alone, so a repeated call can't queue two.
-    pub async fn schedule_retry(&self, run: &QueuedRun, reason: &str, delay: Duration, now: DateTime<Utc>) -> Result<()> {
+    pub async fn schedule_retry(&self, run: &QueuedRun, reason: &str, delay: Duration, now: Timestamp) -> Result<()> {
         let mut vars = run.variables.clone();
         vars.insert("is_retry".into(), Value::Bool(true));
         vars.insert("retry_attempt".into(), Value::from(run.retry_count + 1));
         vars.insert("retry_reason".into(), Value::from(reason));
         let (attempt, source) = (run.retry_count + 1, format!("{}_retry_{}", run.source_uuid, run.retry_count + 1));
-        let due = (now + chrono::Duration::from_std(delay).unwrap_or_default()).to_rfc3339();
+        let due = now.checked_add(delay).unwrap_or(now).to_string();
         let db = self.db().await?;
         db.execute(
             "INSERT INTO queued_runs (campaign_id, source_uuid, context_variables, state, retry_count, parent_queued_run_id, scheduled_for, retry_reason, created_at)
@@ -427,7 +427,7 @@ impl Store {
     /// call never reached the agent). A 'running' run is stale only when `include_running`: right after a
     /// restart, when nothing of this Vaani's is alive -- later, a finished call's record is still being
     /// written while its run reads 'running'.
-    pub async fn stale_runs(&self, initialized_before: DateTime<Utc>, include_running: bool, live: &[i64]) -> Result<Vec<StaleRun>> {
+    pub async fn stale_runs(&self, initialized_before: Timestamp, include_running: bool, live: &[i64]) -> Result<Vec<StaleRun>> {
         let db = self.db().await?;
         let rows = db
             .query(
@@ -438,7 +438,7 @@ impl Store {
                        AND ((r.state::text = 'initialized' AND r.created_at < $2::text::timestamptz) OR ($3::bool AND r.state::text = 'running'))
                      ORDER BY r.id"
                 ),
-                &[&live, &initialized_before.to_rfc3339(), &include_running],
+                &[&live, &initialized_before.to_string(), &include_running],
             )
             .await
             .context("dograh: stale runs")?;
@@ -489,7 +489,6 @@ fn wallet_blocks(mode: Option<&str>, rate: Option<f64>, balance: Option<f64>, cr
 mod tests {
     use super::*;
     use crate::testkit::CAMPAIGN_SCHEMA;
-    use chrono::TimeZone;
 
     fn campaign(retry: &str, meta: &str) -> Campaign {
         let mut c = Campaign::default();
@@ -507,7 +506,7 @@ mod tests {
             (true, 0.5, Duration::from_secs(120), 5)
         );
         assert_eq!(c.max_concurrency, 0);
-        assert!(!c.schedule.enabled && c.schedule.allows(Utc::now()));
+        assert!(!c.schedule.enabled && c.schedule.allows(Timestamp::now()));
     }
 
     #[test]
@@ -532,11 +531,11 @@ mod tests {
             "slots": [{"day_of_week": 0, "start_time": "09:00", "end_time": "18:00"}]}}"#,
         );
         // Monday 2026-11-02, 10:00 IST = 04:30 UTC
-        let at = |h, m| Utc.with_ymd_and_hms(2026, 11, 2, h, m, 0).unwrap();
+        let at = |h, m| -> Timestamp { format!("2026-11-02T{h:02}:{m:02}:00Z").parse().unwrap() };
         assert!(c.schedule.allows(at(4, 30)));
         assert!(!c.schedule.allows(at(12, 30)), "18:00 IST is the end: exclusive");
         assert!(!c.schedule.allows(at(3, 0)), "08:30 IST is before the window");
-        assert!(!c.schedule.allows(Utc.with_ymd_and_hms(2026, 11, 3, 4, 30, 0).unwrap()), "Tuesday has no slot");
+        assert!(!c.schedule.allows("2026-11-03T04:30:00Z".parse::<Timestamp>().unwrap()), "Tuesday has no slot");
         let unknown = campaign(
             "",
             r#"{"schedule_config": {"enabled": true, "timezone": "Nowhere/Land", "slots": [{"day_of_week": 0, "start_time": "09:00", "end_time": "10:00"}]}}"#,
@@ -608,7 +607,7 @@ mod tests {
         assert!(!store.dial_check(99, 3).await.unwrap().running, "no such campaign");
 
         // Scheduled retries first (earliest first), then loading order; a future retry isn't due.
-        let now = Utc::now();
+        let now = Timestamp::now();
         let first = store.claim_runs(1, 3, now).await.unwrap();
         assert_eq!(first.iter().map(|q| q.source_uuid.as_str()).collect::<Vec<_>>(), ["retry-early", "retry-late", "a"]);
         assert_eq!(first[2].variables["phone_number"], "+911");
@@ -681,7 +680,7 @@ mod tests {
         );
 
         // An initialized run nobody is running goes stale; one a live call accounts for doesn't.
-        let later = Utc::now() + chrono::Duration::minutes(10);
+        let later = Timestamp::now() + jiff::SignedDuration::from_mins(10);
         assert!(store.stale_runs(later, false, &[run]).await.unwrap().is_empty());
         let stale = store.stale_runs(later, false, &[]).await.unwrap();
         assert_eq!((stale.len(), stale[0].id, stale[0].org_id, stale[0].state.as_str()), (1, run, 3, "initialized"));

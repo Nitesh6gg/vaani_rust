@@ -8,12 +8,11 @@ description = "Real-time voice agent: Asterisk ARI + AudioSocket media plane + S
 [dependencies]
 anyhow = "1"
 base64 = "0.23"
-chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-chrono-tz = "0.10"
 deadpool-postgres = "0.14"
 earshot = "1.2"
 futures-util = "0.3"
 hmac = "0.13"
+jiff = { version = "0.2", features = ["tzdb-bundle-always"] }
 opentelemetry = "0.33"
 opentelemetry-otlp = { version = "0.33", default-features = false, features = ["http-proto", "reqwest-blocking-client", "reqwest-rustls", "trace", "logs"] }
 opentelemetry_sdk = "0.33"

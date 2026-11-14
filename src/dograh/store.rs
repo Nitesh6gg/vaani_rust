@@ -9,8 +9,8 @@ use super::{
 };
 use crate::{agent::workflow::Workflow, metrics};
 use anyhow::{Context, Result, anyhow};
-use chrono::Utc;
 use deadpool_postgres::{Pool, Runtime};
+use jiff::Timestamp;
 use serde_json::{Map, Value};
 use std::{sync::Arc, time::Duration};
 use tokio_postgres::{NoTls, Row, types::ToSql};
@@ -187,7 +187,7 @@ impl Store {
         let (pks, by_id) = wf.recording_needs(&tool_rows);
         let (clips, mut warnings) = self.load_clips(org_id, &pks, by_id).await;
         let (workflow, build_warnings) =
-            wfjson::build(&wf, &vars, &tool_rows, &clips, Utc::now()).with_context(|| format!("dograh: workflow {workflow_id}"))?;
+            wfjson::build(&wf, &vars, &tool_rows, &clips, Timestamp::now()).with_context(|| format!("dograh: workflow {workflow_id}"))?;
         warnings.extend(build_warnings);
         let (services, w) =
             services::resolve(&user_config, &def_config).with_context(|| format!("dograh: workflow {workflow_id}: models"))?;

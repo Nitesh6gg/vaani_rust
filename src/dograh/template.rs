@@ -2,7 +2,7 @@
 //! `{{path | default}}`, `{{path | fallback:default}}`, plus the built-ins
 //! `current_time[_<Zone>]` and `current_weekday[_<Zone>]`.
 
-use chrono::{DateTime, Utc};
+use jiff::{Timestamp, tz::TimeZone};
 use regex::{Captures, Regex};
 use serde_json::{Map, Value};
 use std::sync::LazyLock;
@@ -12,7 +12,7 @@ static VAR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\{\{\s*([^|\s}]+)(?:
 /// bare `{{current_weekday}}`/`{{current_time}}` in the same template inherits.
 static BUILTIN_TZ: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\{\{\s*(?:current_time|current_weekday)_([^|\s}]+)").unwrap());
 
-pub fn render(s: &str, vars: &Map<String, Value>, now: DateTime<Utc>) -> String {
+pub fn render(s: &str, vars: &Map<String, Value>, now: Timestamp) -> String {
     if s.is_empty() {
         return String::new();
     }
@@ -42,7 +42,7 @@ pub fn render(s: &str, vars: &Map<String, Value>, now: DateTime<Utc>) -> String 
     out.replace("\\n", "\n")
 }
 
-fn builtin(path: &str, default_tz: &str, now: DateTime<Utc>) -> Option<String> {
+fn builtin(path: &str, default_tz: &str, now: Timestamp) -> Option<String> {
     let (zone, weekday) = if path == "current_time" {
         (default_tz, false)
     } else if let Some(z) = path.strip_prefix("current_time_") {
@@ -54,9 +54,9 @@ fn builtin(path: &str, default_tz: &str, now: DateTime<Utc>) -> Option<String> {
         (z, true)
     };
     // An unknown zone isn't a built-in (Dograh logs it and falls through to vars).
-    let tz: chrono_tz::Tz = if zone.is_empty() { chrono_tz::UTC } else { zone.parse().ok()? };
-    let t = now.with_timezone(&tz);
-    Some(if weekday { t.format("%A").to_string() } else { t.format("%Y-%m-%d %H:%M:%S %Z").to_string() })
+    let tz = if zone.is_empty() { TimeZone::UTC } else { TimeZone::get(zone).ok()? };
+    let t = now.to_zoned(tz);
+    Some(if weekday { t.strftime("%A").to_string() } else { t.strftime("%Y-%m-%d %H:%M:%S %Z").to_string() })
 }
 
 /// Follows a dotted path ("customer.address.city") into vars.
@@ -99,14 +99,13 @@ fn py_title(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
     use serde_json::json;
 
     fn vars(v: Value) -> Map<String, Value> {
         v.as_object().unwrap().clone()
     }
-    fn now() -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 3, 4, 20, 30, 0).unwrap() // a Wednesday, 02:00 next day in IST
+    fn now() -> Timestamp {
+        "2026-03-04T20:30:00Z".parse().unwrap() // a Wednesday, 02:00 next day in IST
     }
 
     #[test]

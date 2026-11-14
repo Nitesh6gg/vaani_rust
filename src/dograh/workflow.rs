@@ -18,7 +18,7 @@ use crate::{
     ai::llm::FunctionDef,
 };
 use anyhow::{Result, anyhow, bail};
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -158,7 +158,7 @@ pub fn build(
     vars: &Map<String, Value>,
     tool_rows: &[ToolRow],
     clips: &ClipSet,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Result<(Workflow, Vec<String>)> {
     let render = |s: &str| template::render(s, vars, now);
     let mut warnings = vec![];
@@ -312,7 +312,7 @@ mod tests {
             credential: None,
         }];
         let vars = json!({"caller_number": "08448805135"});
-        let (w, warnings) = build(&wf, vars.as_object().unwrap(), &rows, &ClipSet::default(), Utc::now()).unwrap();
+        let (w, warnings) = build(&wf, vars.as_object().unwrap(), &rows, &ClipSet::default(), Timestamp::now()).unwrap();
 
         let start = &w.nodes[w.start];
         assert_eq!(start.name, "Start Call");
@@ -346,18 +346,18 @@ mod tests {
     #[test]
     fn greeting_and_structural_errors() {
         let wf = WorkflowJson::parse(r#"{"nodes":[{"id":"1","type":"startCall","data":{"name":"S","is_start":true,"greeting":"Namaste {{name | ji}}"}}],"edges":[]}"#).unwrap();
-        let (w, _) = build(&wf, &Map::new(), &[], &ClipSet::default(), Utc::now()).unwrap();
+        let (w, _) = build(&wf, &Map::new(), &[], &ClipSet::default(), Timestamp::now()).unwrap();
         assert_eq!(w.nodes[0].greeting, "Namaste ji");
 
         let no_start = WorkflowJson::parse(r#"{"nodes":[{"id":"1","type":"agentNode","data":{}}]}"#).unwrap();
-        assert!(build(&no_start, &Map::new(), &[], &ClipSet::default(), Utc::now()).is_err());
+        assert!(build(&no_start, &Map::new(), &[], &ClipSet::default(), Timestamp::now()).is_err());
         let bad_edge = WorkflowJson::parse(
             r#"{"nodes":[{"id":"1","data":{"is_start":true}}],"edges":[{"source":"1","target":"9","data":{"label":"x"}}]}"#,
         )
         .unwrap();
-        assert!(build(&bad_edge, &Map::new(), &[], &ClipSet::default(), Utc::now()).is_err());
+        assert!(build(&bad_edge, &Map::new(), &[], &ClipSet::default(), Timestamp::now()).is_err());
         let two = WorkflowJson::parse(r#"{"nodes":[{"id":"1","data":{"is_start":true}},{"id":"2","data":{"is_start":true}}]}"#).unwrap();
-        assert!(build(&two, &Map::new(), &[], &ClipSet::default(), Utc::now()).is_err());
+        assert!(build(&two, &Map::new(), &[], &ClipSet::default(), Timestamp::now()).is_err());
     }
 
     #[test]

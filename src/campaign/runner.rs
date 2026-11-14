@@ -14,8 +14,8 @@ use crate::{
     metrics,
 };
 use anyhow::Result;
-use chrono::Utc;
 use futures_util::future::BoxFuture;
+use jiff::Timestamp;
 use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
@@ -294,7 +294,7 @@ impl Runner {
         // The database checks and the breaker (Redis) don't depend on each other: one round trip each, at once.
         let (chk, breaker) = tokio::join!(self.store.dial_check(c.id, c.organization_id), self.lim.breaker_open(c.id, &c.breaker));
         let Ok(chk) = chk else { return Step::Stop };
-        if !chk.running || !c.schedule.allows(Utc::now()) {
+        if !chk.running || !c.schedule.allows(Timestamp::now()) {
             return Step::Stop;
         }
         if let Ok((true, stats)) = breaker {
@@ -335,7 +335,7 @@ impl Runner {
             Err(e) => return self.limit_failed(c, "slot limiter", e),
         };
 
-        match self.store.claim_runs(c.id, 1, Utc::now()).await {
+        match self.store.claim_runs(c.id, 1, Timestamp::now()).await {
             Ok(mut runs) if !runs.is_empty() => self.place(c, runs.remove(0), settings, slot).await,
             Ok(_) => {
                 self.release(&slot).await;
@@ -543,7 +543,7 @@ impl Runner {
             let res = if q.retry_count >= c.retry.max_retries {
                 self.store.add_failed_row(c.id).await // retries used up
             } else {
-                let r = self.store.schedule_retry(q, reason, c.retry.delay, Utc::now()).await;
+                let r = self.store.schedule_retry(q, reason, c.retry.delay, Timestamp::now()).await;
                 if r.is_ok() {
                     metrics::CAMPAIGN_RETRIES.fetch_add(1, Relaxed);
                 }
@@ -606,7 +606,8 @@ impl Runner {
     /// after the ring timeout, and -- right after a restart only -- calls the restart cut off.
     async fn sweep(&self, startup: bool) {
         let live: Vec<i64> = self.state.lock().unwrap().live_runs.iter().copied().collect();
-        let before = Utc::now() - chrono::Duration::from_std(self.cfg.ring_timeout + Duration::from_secs(60)).unwrap_or_default();
+        let now = Timestamp::now();
+        let before = now.checked_sub(self.cfg.ring_timeout + Duration::from_secs(60)).unwrap_or(now);
         let stale = match self.store.stale_runs(before, startup, &live).await {
             Ok(s) => s,
             Err(e) => {

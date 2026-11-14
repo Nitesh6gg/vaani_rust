@@ -228,7 +228,7 @@ impl Manager {
             if !metrics::ARI_CONNECTED.load(Relaxed) {
                 continue;
             }
-            if let Err(e) = super::sweep::sweep_once(&self.ari, &self.cfg.ari_app, chrono::Utc::now(), |id| self.tracks(id)).await {
+            if let Err(e) = super::sweep::sweep_once(&self.ari, &self.cfg.ari_app, jiff::Timestamp::now(), |id| self.tracks(id)).await {
                 tracing::warn!(event = "channel.sweep_failed", error = %format!("{e:#}"), "orphan channel sweep failed");
             }
         }

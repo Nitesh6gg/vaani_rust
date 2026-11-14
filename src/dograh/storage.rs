@@ -5,8 +5,8 @@
 
 use crate::ai::llm;
 use anyhow::{Result, bail};
-use chrono::{DateTime, Utc};
 use hmac::{Hmac, KeyInit, Mac};
+use jiff::Timestamp;
 use sha2::{Digest, Sha256};
 
 /// The region MinIO signs for unless configured otherwise.
@@ -56,9 +56,9 @@ impl Storage {
     /// authorization)`. Signs content-type, host, x-amz-content-sha256 and
     /// x-amz-date -- what the MinIO Python client (minio/signer.py) signs for the
     /// same request.
-    fn sign(&self, method: &str, path: &str, content_type: &str, body: &[u8], now: DateTime<Utc>) -> (String, String, String) {
-        let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
-        let day = now.format("%Y%m%d").to_string();
+    fn sign(&self, method: &str, path: &str, content_type: &str, body: &[u8], now: Timestamp) -> (String, String, String) {
+        let amz_date = now.strftime("%Y%m%dT%H%M%SZ").to_string();
+        let day = now.strftime("%Y%m%d").to_string();
         let payload_hash = hex(&Sha256::digest(body));
 
         const SIGNED: &str = "content-type;host;x-amz-content-sha256;x-amz-date";
@@ -83,7 +83,7 @@ impl Storage {
 
     fn request(&self, method: reqwest::Method, key: &str, content_type: &str, body: &[u8]) -> reqwest::RequestBuilder {
         let (url, path) = self.url(key);
-        let (date, hash, auth) = self.sign(method.as_str(), &path, content_type, body, Utc::now());
+        let (date, hash, auth) = self.sign(method.as_str(), &path, content_type, body, Timestamp::now());
         llm::http()
             .request(method, url)
             .header("Content-Type", content_type)
@@ -132,7 +132,6 @@ impl Storage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
@@ -159,7 +158,7 @@ mod tests {
             "/voice-audio/recordings/42.wav",
             "audio/wav",
             b"hello",
-            Utc.with_ymd_and_hms(2026, 10, 5, 12, 0, 0).unwrap(),
+            "2026-10-05T12:00:00Z".parse().unwrap(),
         );
         assert_eq!(date, "20261005T120000Z");
         assert_eq!(

@@ -4,7 +4,7 @@
 //! audio). Owned by the agent task, so no locking.
 
 use crate::ai::llm::Usage;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use std::{collections::HashMap, time::Instant};
@@ -45,15 +45,16 @@ pub struct LogEvent {
 
 /// Python's `isoformat()` on a UTC datetime, which is what Dograh stores: the
 /// event's own timestamp with microseconds, a turn's with milliseconds.
-fn event_time(t: DateTime<Utc>) -> String {
-    t.format("%Y-%m-%dT%H:%M:%S%.6f+00:00").to_string()
+fn event_time(t: Timestamp) -> String {
+    t.strftime("%Y-%m-%dT%H:%M:%S%.6f+00:00").to_string()
 }
-fn turn_time(t: DateTime<Utc>) -> String {
-    t.format("%Y-%m-%dT%H:%M:%S%.3f+00:00").to_string()
+fn turn_time(t: Timestamp) -> String {
+    t.strftime("%Y-%m-%dT%H:%M:%S%.3f+00:00").to_string()
 }
 /// The wall-clock time a past `Instant` corresponds to.
-fn wall(at: Instant) -> DateTime<Utc> {
-    Utc::now() - chrono::Duration::from_std(at.elapsed()).unwrap_or_default()
+fn wall(at: Instant) -> Timestamp {
+    let now = Timestamp::now();
+    now.checked_sub(at.elapsed()).unwrap_or(now)
 }
 
 /// Dograh's _safe_parse_timestamp/_event_sort_key: the payload's (turn)
@@ -62,7 +63,7 @@ fn wall(at: Instant) -> DateTime<Utc> {
 /// were logged in.
 pub fn event_sort_time(e: &LogEvent) -> i64 {
     let ts = e.payload.get("timestamp").and_then(Value::as_str).filter(|t| !t.is_empty()).unwrap_or(&e.timestamp);
-    DateTime::parse_from_rfc3339(ts).map(|t| t.timestamp_millis()).unwrap_or(0)
+    ts.parse::<Timestamp>().map(|t| t.as_millisecond()).unwrap_or(0)
 }
 
 #[derive(Default)]
@@ -144,7 +145,14 @@ impl Summary {
 impl CallLog {
     fn add(&mut self, kind: &str, payload: Map<String, Value>) {
         let (node_id, node_name) = self.node.clone().unwrap_or_default();
-        self.events.push(LogEvent { kind: kind.into(), payload, timestamp: event_time(Utc::now()), turn: self.turn, node_id, node_name });
+        self.events.push(LogEvent {
+            kind: kind.into(),
+            payload,
+            timestamp: event_time(Timestamp::now()),
+            turn: self.turn,
+            node_id,
+            node_name,
+        });
     }
 
     fn obj(v: Value) -> Map<String, Value> {
@@ -174,13 +182,13 @@ impl CallLog {
     pub fn user_said(&mut self, text: &str, started: Option<Instant>) {
         self.turn += 1;
         self.user_spoke |= !text.is_empty();
-        let ts = turn_time(started.map(wall).unwrap_or_else(Utc::now));
+        let ts = turn_time(started.map(wall).unwrap_or_else(Timestamp::now));
         self.add(USER_TRANSCRIPTION, Self::obj(json!({"text": text, "final": true, "timestamp": ts})));
     }
 
     /// What the caller heard of one reply; `started` is when the reply began.
     pub fn agent_said(&mut self, text: &str, started: Option<Instant>) {
-        let ts = turn_time(started.map(wall).unwrap_or_else(Utc::now));
+        let ts = turn_time(started.map(wall).unwrap_or_else(Timestamp::now));
         self.add(BOT_TEXT, Self::obj(json!({"text": text, "timestamp": ts})));
     }
 
@@ -313,5 +321,15 @@ mod tests {
         l.llm_used("LLM|||m", Usage { prompt: 1, completion: 1, total: 2, cached: 0 });
         assert_eq!(l.llm_usage["LLM|||m"], Usage { prompt: 6, completion: 3, total: 9, cached: 1 });
         assert_eq!(l.events[0].payload["result"], Value::Null);
+    }
+
+    /// Python's isoformat() shapes Dograh stores: microseconds for an event, milliseconds for a turn, "+00:00", and sorted back by milliseconds.
+    #[test]
+    fn timestamps_have_dograhs_shapes_and_sort_back() {
+        let t: Timestamp = "2026-11-13T06:25:54.123456789Z".parse().unwrap();
+        assert_eq!(event_time(t), "2026-11-13T06:25:54.123456+00:00");
+        assert_eq!(turn_time(t), "2026-11-13T06:25:54.123+00:00");
+        assert_eq!(turn_time(t).parse::<Timestamp>().unwrap().as_millisecond(), t.as_millisecond());
+        assert!(wall(Instant::now() - Duration::from_secs(5)) < Timestamp::now());
     }
 }

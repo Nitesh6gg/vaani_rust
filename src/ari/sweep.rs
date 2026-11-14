@@ -6,7 +6,7 @@
 
 use super::{Ari, http};
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, Utc};
+use jiff::{Timestamp, fmt::strtime::BrokenDownTime};
 use serde::Deserialize;
 use std::time::Duration;
 
@@ -35,12 +35,11 @@ pub struct DialplanApp {
 
 impl ChannelInfo {
     /// When the channel was created ("2026-11-09T11:29:50.123+0000"); `None` if unreadable.
-    fn created(&self) -> Option<DateTime<Utc>> {
+    fn created(&self) -> Option<Timestamp> {
         ["%Y-%m-%dT%H:%M:%S%.f%z", "%Y-%m-%dT%H:%M:%S%z"]
             .iter()
-            .find_map(|f| DateTime::parse_from_str(&self.creationtime, f).ok())
-            .or_else(|| DateTime::parse_from_rfc3339(&self.creationtime).ok())
-            .map(|t| t.with_timezone(&Utc))
+            .find_map(|f| BrokenDownTime::parse(f, &self.creationtime).ok()?.to_timestamp().ok())
+            .or_else(|| self.creationtime.parse().ok())
     }
 }
 
@@ -59,13 +58,13 @@ impl Ari {
 
 /// Hangs up the channels of Stasis app `app` that are older than 90 s and that `tracked` doesn't know;
 /// returns their ids.
-pub async fn sweep_once(ari: &Ari, app: &str, now: DateTime<Utc>, tracked: impl Fn(&str) -> bool) -> Result<Vec<String>> {
+pub async fn sweep_once(ari: &Ari, app: &str, now: Timestamp, tracked: impl Fn(&str) -> bool) -> Result<Vec<String>> {
     let mut hung = vec![];
     for ch in ari.list_channels().await? {
         let ours =
             ch.dialplan.app_name == "Stasis" && (ch.dialplan.app_data == app || ch.dialplan.app_data.starts_with(&format!("{app},")));
         let Some(created) = ch.created() else { continue };
-        let age = (now - created).to_std().unwrap_or_default();
+        let age = Duration::try_from(now.duration_since(created)).unwrap_or_default();
         if !ours || age < ORPHAN_MIN_AGE || tracked(&ch.id) {
             continue;
         }
@@ -116,13 +115,13 @@ mod tests {
         (Ari::new(&url, "u", "p", "vaani"), log)
     }
 
-    fn json(now: DateTime<Utc>, rows: &[(&str, &str, &str, i64)]) -> String {
+    fn json(now: Timestamp, rows: &[(&str, &str, &str, i64)]) -> String {
         let items: Vec<String> = rows
             .iter()
             .map(|(id, app, data, age)| {
                 format!(
                     r#"{{"id":"{id}","name":"AudioSocket/x","creationtime":"{}","dialplan":{{"app_name":"{app}","app_data":"{data}"}}}}"#,
-                    (now - chrono::Duration::seconds(*age)).format("%Y-%m-%dT%H:%M:%S%.3f%z")
+                    (now - jiff::SignedDuration::from_secs(*age)).strftime("%Y-%m-%dT%H:%M:%S%.3f%z")
                 )
             })
             .collect();
@@ -131,7 +130,7 @@ mod tests {
 
     #[tokio::test]
     async fn hangs_up_only_channels_vaani_lost_track_of() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let (ari, log) = asterisk(
             json(
                 now,
@@ -162,7 +161,7 @@ mod tests {
     #[tokio::test]
     async fn an_unreadable_list_hangs_up_nothing() {
         let (ari, log) = asterisk("oops".into(), 500).await;
-        assert!(sweep_once(&ari, "vaani", Utc::now(), |_| false).await.is_err());
+        assert!(sweep_once(&ari, "vaani", Timestamp::now(), |_| false).await.is_err());
         assert!(!log.lock().unwrap().iter().any(|l| l.starts_with("DELETE")));
     }
 
