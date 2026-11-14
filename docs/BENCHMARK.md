@@ -163,3 +163,20 @@ metrics scraped every 10 s. Release build.
   19–26%. Close to its limit at ~150 talking, as with the Go engine (96% at 141 talking on Nov 9).
 - STT audio sent: 20,672 s for 34,807 s of calls (59%).
 
+
+## Allocator comparison (Nov 14, development sandbox, not production)
+
+glibc malloc (default) vs `mimalloc` 0.1 vs `tikv-jemallocator` 0.6, the same source built with a Cargo feature, 3 interleaved runs each.
+Release build; loadgen with mock providers on the same 4-vCPU box (so absolute figures are optimistic); 800 concurrent calls, ramp 40/s,
+40 s calls, 45 s hold, `LOG_LEVEL=warn`. "After" is RSS 12 s after the last call ended. Agent audio was 1.00 in every run.
+
+| Allocator | Core per call | Peak RSS | RSS after the run | Gaps > 60 ms |
+|---|---|---|---|---|
+| glibc (default) | 0.00260 | **1,180 MB** | 526 MB | 0 |
+| mimalloc | **0.00250** (-4%, in all 3 runs) | 1,688 MB (+43%) | 205 MB | 0 |
+| jemalloc | 0.00260 | 1,398 MB (+18%) | **82 MB** | 578 in one run, 0 in the other two |
+
+Reading: none wins outright. The default has the lowest peak, which is what a box must be sized for; mimalloc saves about 4% CPU for 43% more
+peak memory; jemalloc gives memory back best after a burst for 18% more peak. The default stays. If engine memory after load matters more than
+the peak (a box shared with other work), jemalloc is the one to retest, on the real box and with real providers. Not tested: decay tuning
+(`MALLOC_CONF`), glibc's `MALLOC_ARENA_MAX`/`malloc_trim`, long steady runs.
