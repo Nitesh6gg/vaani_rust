@@ -5,7 +5,7 @@ exist yet. Settings are in the `README.md` environment table, measured numbers i
 
 ## Start, health, stop
 
-- **Start:** `./target/release/vaani` with the environment from `README.md`. It needs ffmpeg on `PATH`, Dograh's Postgres
+- **Start:** `./target/release/vaani` with the environment from `README.md`. It needs ffmpeg on `PATH`, `ca-certificates` (HTTPS is verified against the system trust store), Dograh's Postgres
   (`DOGRAH_DB_URL`), MinIO settings, Sarvam keys through Dograh, and Redis only if campaigns are enabled. One process connects one ARI
   WebSocket under `ARI_APP`; **no two engines may share an app name** (Asterisk sends a Stasis app's events only to the most
   recently connected client).

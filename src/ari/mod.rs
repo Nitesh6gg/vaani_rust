@@ -229,7 +229,8 @@ pub fn uuid_v4() -> String {
 }
 
 /// How often the events WebSocket is pinged, and how long it may be silent (no frame of any kind, a pong included)
-/// before it is taken for dead. Asterisk's idle app sends no events, so without a ping a dead host looks the same as a quiet one.
+/// before it is taken for dead. The silence is checked on each ping tick, so a dead peer is noticed between `WS_DEAD_AFTER` and
+/// `WS_DEAD_AFTER` + `WS_PING_EVERY` (75 to 105 s). Asterisk's idle app sends no events, so without a ping a dead host looks the same as a quiet one.
 const WS_PING_EVERY: Duration = Duration::from_secs(30);
 const WS_DEAD_AFTER: Duration = Duration::from_secs(75);
 
@@ -272,7 +273,9 @@ async fn run_events_with(
                                 tracing::warn!(silent_s = last_heard.elapsed().as_secs(), "ari websocket silent; taking it for dead");
                                 break;
                             }
-                            if ws.send(Ws::Ping(Default::default())).await.is_err() {
+                            // A peer that stopped reading can fill the socket's buffer and block this send for good: bound it.
+                            if !matches!(tokio::time::timeout(ping_every, ws.send(Ws::Ping(Default::default()))).await, Ok(Ok(()))) {
+                                tracing::warn!("ari websocket ping could not be sent; taking it for dead");
                                 break;
                             }
                             continue;

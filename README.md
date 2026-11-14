@@ -30,7 +30,7 @@ Milestones 1-3 are done except QA analysis (below): a Rust call is a complete ca
 | `/metrics` (Prometheus text) and `/healthz` | done |
 | **Load generator** (`loadgen`: fake Asterisk + mock providers; `docs/LOADTEST.md`) | done |
 | **Call setup under bursts**: an inbound caller rings until its workflow is loaded and its STT is open, then is answered (`ANSWER_WAIT_SECONDS`, else hung up as congestion); 16 setups at once against Asterisk, 32 prepares at once, CPU guard (`LOAD_SHED_CPU_PERCENT`), bounded post-call work | done |
-| **Outbound HTTP identity and liveness**: every HTTP client and provider WebSocket sends `User-Agent: Rust-http-client/1.1` (gateways such as Bifrost name the app from it); the ARI REST client uses a 30 s TCP keepalive, and the ARI events WebSocket is pinged every 30 s and reconnected after 75 s of silence | done |
+| **Outbound HTTP identity and liveness**: every HTTP client and provider WebSocket sends `User-Agent: Rust-http-client/1.1` (gateways such as Bifrost name the app from it); the ARI REST client uses a 30 s TCP keepalive, and the ARI events WebSocket is pinged every 30 s and reconnected after 75-105 s of silence | done |
 | **OpenTelemetry**: logs and traces over OTLP/HTTP (`OTEL_EXPORTER_OTLP_ENDPOINT`), as in the Go server | done |
 
 Not ported yet (in rough priority order):
@@ -39,7 +39,7 @@ Not ported yet (in rough priority order):
 2. Debug WAV recording
 3. TLS to Dograh's Postgres (`tokio-postgres-rustls`)
 
-Needs on the server: **ffmpeg** on `PATH` (recorded clips) and Dograh's `MINIO_*` settings (see below).
+Needs on the server: **ffmpeg** on `PATH` (recorded clips), **ca-certificates** (HTTPS is checked against the system trust store), and Dograh's `MINIO_*` settings (see below).
 
 Out of scope by decision: RTP transport, FreeSWITCH/mod_earshot, TEN VAD, RMS-energy VAD.
 

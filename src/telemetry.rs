@@ -246,6 +246,7 @@ pub fn start_call(call_id: &str, attrs: &[(&'static str, String)], run_id: Optio
 }
 
 /// The run Dograh recorded for the call, once known: later lines carry it, and the span gets it.
+/// (Setting the attribute under the map lock is fine; what must never happen under it is *dropping* a span -- see `end_call`.)
 pub fn set_run(call_id: &str, run_id: i64) {
     let Some(st) = state() else { return };
     if let Some(c) = st.calls.lock().unwrap().get_mut(call_id) {

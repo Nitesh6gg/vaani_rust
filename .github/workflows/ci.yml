@@ -29,8 +29,10 @@ jobs:
           --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 5s --health-retries 10
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned: a new stable release can add lints that fail `-D warnings`; bump it on purpose.
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.97.0
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y ffmpeg
