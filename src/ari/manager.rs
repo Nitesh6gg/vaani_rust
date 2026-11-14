@@ -410,22 +410,10 @@ impl Manager {
         // The call's trace (a no-op unless OTLP export is on): every line about it carries its trace id.
         crate::telemetry::start_call(&call.info.id, &[("direction", call.info.direction.to_string())], call.info.run_id);
 
-        // If the media channel never enters Stasis (its event lost, Asterisk wedged) nothing else would
-        // ever end this call: hang it up after the setup timeout.
-        {
-            let (m, c) = (self.clone(), call.clone());
-            self.tracker.spawn(async move {
-                tokio::select! {
-                    _ = c.cancel.cancelled() => {}
-                    _ = c.arrived.cancelled() => {}
-                    _ = tokio::time::sleep(m.cfg.setup_timeout) => {
-                        tracing::warn!(call_id = %c.info.id, external_id = %c.external_id, event = "call.setup_timeout", after_s = m.cfg.setup_timeout.as_secs(),
-                            "call setup timed out: its media channel never entered Stasis; hanging it up");
-                        metrics::CALLS_SETUP_TIMEOUT.fetch_add(1, Relaxed);
-                        m.teardown(&c);
-                    }
-                }
-            });
+        // A call we placed is answered already: its setup clock starts now. An inbound caller's starts at its answer (in `setup`),
+        // not while it rings: the time spent getting ready is `ANSWER_WAIT_SECONDS`' to bound, and must not eat the media channel's.
+        if call.out.is_some() {
+            self.arm_setup_timer(&call);
         }
 
         let m = self.clone();
@@ -449,7 +437,25 @@ impl Manager {
         });
     }
 
-    async fn setup(&self, call: &Arc<Call>) -> anyhow::Result<()> {
+    /// If the media channel never enters Stasis (its event lost, Asterisk wedged) nothing else would ever end the call:
+    /// hang it up after the setup timeout.
+    fn arm_setup_timer(self: &Arc<Self>, call: &Arc<Call>) {
+        let (m, c) = (self.clone(), call.clone());
+        self.tracker.spawn(async move {
+            tokio::select! {
+                _ = c.cancel.cancelled() => {}
+                _ = c.arrived.cancelled() => {}
+                _ = tokio::time::sleep(m.cfg.setup_timeout) => {
+                    tracing::warn!(call_id = %c.info.id, external_id = %c.external_id, event = "call.setup_timeout", after_s = m.cfg.setup_timeout.as_secs(),
+                        "call setup timed out: its media channel never entered Stasis; hanging it up");
+                    metrics::CALLS_SETUP_TIMEOUT.fetch_add(1, Relaxed);
+                    m.teardown(&c);
+                }
+            }
+        });
+    }
+
+    async fn setup(self: &Arc<Self>, call: &Arc<Call>) -> anyhow::Result<()> {
         use anyhow::Context;
         let id = &call.info.id;
         // An inbound caller is answered only once the agent is ready to talk (workflow loaded, STT open), so
@@ -469,6 +475,7 @@ impl Manager {
         if call.out.is_none() {
             self.ari.answer(id).await.context("answer")?;
             call.res.lock().unwrap().answered = true;
+            self.arm_setup_timer(call);
         }
 
         // Listen BEFORE telling Asterisk where to connect (invariant #9). A port whose previous call is
@@ -1521,6 +1528,41 @@ mod tests {
         assert!(!logged(&log, "externalMedia"));
         assert!(mgr.calls.lock().unwrap().is_empty());
         assert_eq!(mgr.ports.in_use(), 0);
+    }
+
+    /// The media channel's setup clock starts at the answer, not while the caller rings: a caller who waited for the agent
+    /// still gets the whole `SETUP_TIMEOUT_SECONDS` for its media channel to arrive.
+    #[tokio::test]
+    async fn the_setup_timer_starts_at_the_answer_not_while_ringing() {
+        let slow = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stt_url = format!("ws://{}/ws", slow.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let (s, _) = slow.accept().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(700)).await; // the agent takes 0.7 s to be ready
+                tokio::spawn(async move {
+                    let _ws = tokio_tungstenite::accept_async(s).await;
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                });
+            }
+        });
+        let Some((mgr, log)) = ready_mgr("t_mgr_timer_at_answer", |c| {
+            c.stt_ws_url = stt_url;
+            c.setup_timeout = Duration::from_millis(1000);
+        })
+        .await
+        else {
+            return eprintln!("skipped: DOGRAH_TEST_DB_URL not set");
+        };
+        mgr.on_event(Event::StasisStart { channel: channel("caller-1"), args: vec![] });
+        wait_for("the answer", || logged(&log, "/answer")).await;
+        let answered = std::time::Instant::now();
+        wait_for("the setup timeout hangup", || logged(&log, "DELETE /ari/channels/caller-1")).await;
+        assert!(
+            answered.elapsed() >= Duration::from_millis(900),
+            "the media channel got its full second after the answer, not what was left after ringing: {:?}",
+            answered.elapsed()
+        );
     }
 
     /// An answered call whose externalMedia channel never enters Stasis is hung up, its port freed.
