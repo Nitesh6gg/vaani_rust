@@ -180,3 +180,31 @@ Reading: none wins outright. The default has the lowest peak, which is what a bo
 peak memory; jemalloc gives memory back best after a burst for 18% more peak. The default stays. If engine memory after load matters more than
 the peak (a box shared with other work), jemalloc is the one to retest, on the real box and with real providers. Not tested: decay tuning
 (`MALLOC_CONF`), glibc's `MALLOC_ARENA_MAX`/`malloc_trim`, long steady runs.
+
+## base64-simd and simd-json vs base64 and serde_json (Nov 14, development sandbox)
+
+**Micro-benchmarks** (a scratch crate, release build, AVX2 machine, base64 0.22 / base64-simd 0.8 / serde_json / simd-json 0.15, the work the engine does per message):
+
+| Operation | Current | SIMD | |
+|---|---|---|---|
+| base64 encode, one 640 B frame (STT, 50/s per call) | 248 ns | 97 ns | 2.6x faster |
+| base64 decode, 32 KB TTS chunk | 13.5 us | 3.7 us | 3.6x faster |
+| STT audio message, `json!` + `to_string` | 833 ns | 970 ns (simd-json) | **slower** |
+| same message with `format!` and base64-simd | | 129 ns | 6.5x faster (no JSON library) |
+| TTS audio message parse (43 KB) | 4.5 us | 12.5 us (simd-json, incl. the copy it needs) | **2.8x slower** |
+| STT transcript event parse (140 B) | 112 ns | 331 ns | **3x slower** |
+| LLM stream chunk parse (160 B) | 172 ns | 418 ns | **2.4x slower** |
+
+simd-json parses in place, so it needs a mutable copy of every `&str` we receive; our messages are small, which is where it loses.
+
+**Load test** (800 concurrent calls, 3 interleaved runs per binary, the same method as the allocator test, mock providers, shared 4-vCPU box):
+
+| Binary | Core per call (avg, min-max) | Peak RSS |
+|---|---|---|
+| baseline | 0.00242 (0.00224-0.00251) | 1,178 MB |
+| base64-simd (STT encode, TTS decode) | 0.00237 (0.00229-0.00244) | 1,175 MB |
+| simd-json (STT, TTS and LLM parsing) | 0.00234 (0.00219-0.00251) | 1,181 MB |
+
+The three differences (2-3%) are smaller than the spread between runs of the same binary (12%): **no measurable end-to-end difference.**
+At 800 calls the STT encode is 40,000 frames/s x ~150 ns saved = about 0.006 core of the ~1.9 the engine uses (0.3%); building the STT
+message with `format!` would save about 0.03 core (1.5%). Neither is worth a dependency.
