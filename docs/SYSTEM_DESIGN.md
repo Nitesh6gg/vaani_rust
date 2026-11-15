@@ -16,7 +16,8 @@ figures come from `BENCHMARK.md` and `GO_VS_RUST.md`.
 - Reply latency: keep the 454 ms median of campaign 25 and bring its p95 (4.4 s) under control.
 
 **Constraints**
-- Asterisk 22 with ARI and AudioSocket. Config stays in Dograh.
+- Asterisk **20.19** (not 22) with ARI and AudioSocket; its SIP trunks run on the deprecated `chan_sip`, PJSIP has no
+  endpoints (`ASTERISK.md`). Config stays in Dograh.
 - SIP trunk of 40 cps and 1,000 channels *including ringing*.
 - LLM quota of 1,000 req/min. Sarvam stream limits are unknown.
 
@@ -27,11 +28,13 @@ figures come from `BENCHMARK.md` and `GO_VS_RUST.md`.
 | Engine CPU per call, mock providers | 0.0048 core | 1,000-call load test (`BENCHMARK.md`) |
 | Engine CPU per call, real campaign | 0.0101 core | campaign 25 |
 | Engine memory | 2.7 MB/call (includes ~1.9 MB per call-minute of recording) | load test |
-| Asterisk (4 cores) | main thread 74-86% at ~150 talking calls | campaign 25 |
+| Asterisk (4 cores) | whole process 54-86% of one core (box 67% idle) at ~150 talking calls; busiest thread 2.6% at 652 channels. **Not** a single-thread ceiling (corrected Nov 15) | campaign 25, `ASTERISK.md` |
 | Trunk | 40 cps, 1,000 channels | deployment |
 | LLM | ~4,400 req/min needed at 1,000 calls vs 1,000 quota | earlier audit |
 
-At 1,000 calls the engine needs about 10 cores for real traffic. Asterisk is the first thing to saturate, not the engine.
+At 1,000 calls the engine needs about 10 cores for real traffic. What saturates first is not established: Asterisk was
+assumed to, but at 150 talking it used about half a core of four. The limits actually seen are the trunk's (cause 34)
+and the LLM's (429, 7% of turns on Nov 15), and Redis stalls of 1-2 s in the dialer.
 
 ## 3. High-level design: cells
 
@@ -82,21 +85,22 @@ Missing for this to work end to end:
 
 - **Failover:** the dispatcher health-checks cells and stops sending to one that is draining or failing.
 - **Drain mode:** stop accepting new calls, finish the calls up, flush post-call work, then restart. Not built.
-- **Monitoring, per cell:** rejects by reason (`cpu`, `answer_wait`), the setup queue, the post-call backlog, pool wait, Asterisk main-thread CPU. Alert on rejection rate, not only on errors.
+- **Monitoring, per cell:** rejects by reason (`cpu`, `answer_wait`), the setup queue, the post-call backlog, pool wait, Asterisk per-thread CPU (not the `htop` process row). Alert on rejection rate, not only on errors.
 - **Capacity alarm:** page when a cell sustains over 70% of its measured call count, before the CPU guard starts refusing calls.
 
 ## 7. Trade-offs
 
 | Decision | Gain | Cost |
 |---|---|---|
-| Cells (one Asterisk + engine each) | A failure is contained; scales linearly; fits Asterisk's single-thread limit | A dispatcher to run; shared-state fixes; more boxes |
-| One big Asterisk | Simple | Single thread is the ceiling; one failure drops everything |
+| Cells (one Asterisk + engine each) | A failure is contained; scales linearly; keeps each Asterisk (a deprecated single-socket `chan_sip` stack) small | A dispatcher to run; shared-state fixes; more boxes |
+| One big Asterisk | Simple | One failure drops everything; its ceiling at 300+ talking is unmeasured (no single-thread limit has been shown) |
 | Refuse early (503) over queueing | No dead air; trunk can fail over | Some calls are bounced in a burst |
 | Per-cell engine over a shared engine pool | Fault isolation; local AudioSocket | Idle capacity per cell |
 
 ## 8. Assumptions and open questions
 
-- The 150-calls-per-Asterisk figure comes from one campaign on one 4-core box; more cores may not help if the main thread is the limit. Measure a second size.
+- The 150-calls-per-Asterisk figure is where the campaigns stopped, **not a measured limit**: no thread was saturated at ~150 talking (652 channels). Measure Asterisk at 300+ talking before sizing cells by it.
+- The shared services (Redis, Postgres behind pgbouncer, MinIO, the Bifrost LLM gateway) run on one box (`master`); Redis stalls of 1-2 s were seen there. Their limits, and `pgbouncer`'s pool settings, count as much as the engine's pools.
 - Sarvam's stream limits and the LLM quota decide the real ceiling. Get both from the vendors.
 - Does the trunk support 503 failover and spreading INVITEs across Asterisks? Confirm with the carrier.
 

@@ -5,6 +5,12 @@ stopped. Org settings: `CONCURRENT_CALL_LIMIT` 400, `DIAL_RATE_LIMIT_PER_SECOND`
 Source: SigNoz (`service.name = 'vaani-engine-rust'`), the engine's logs and 10-s metrics. Short version and the
 comparison with Go: `BENCHMARK.md`, `GO_VS_RUST.md`.
 
+> **Correction (Nov 15).** This report says Asterisk's "main thread" was at 74-86% of a core. Reading the box showed that
+> `htop` row was the **whole Asterisk process** summed over its threads; the first thread's own CPU counter is 0.8
+> CPU-seconds in 17 weeks. No single thread was saturated, so "Asterisk's main thread is the limit" is not supported.
+> Details and the live measurements at 650 channels: `ASTERISK.md`. The figures about the engine, Redis and the caller
+> audio below are unchanged.
+
 ## Summary
 
 The engine handled every answered call without losing a call, losing audio to dead media, or raising an agent error,
@@ -26,7 +32,7 @@ audio dropped in 40% of calls, Redis timeouts in the dialer, and two short burst
 
 Dialing ran at 13-15 calls per second. The 35/s limit was never reached: calls in flight sat at exactly 400 for six
 minutes, and with calls ringing up to 30 s, 400 in flight allows about 13 new calls a second. To dial faster, raise
-`CONCURRENT_CALL_LIMIT` (and watch Asterisk's main thread).
+`CONCURRENT_CALL_LIMIT` (and watch Asterisk's CPU).
 
 ## What happened to the 4,987 dials
 
@@ -109,7 +115,7 @@ recording that is not available (`34bk399q`) and the agent spoke the text instea
    frames (3.8 s) in one call. Short calls (< 10 s) lost about 7.6 frames each, longer ones about 5.8, so the loss does
    not grow with length: it most likely happens at the start of the call. The agent reads one caller frame per 20 ms
    tick from a 5-frame (100 ms) queue, so any delay or burst overflows it. The load test (even audio, instant fake
-   providers) showed 0 drops; the real Asterisk (main thread at 86%) and real providers did not.
+   providers) showed 0 drops; the real Asterisk (process at 86% of a core, see the correction at the top) and real providers did not.
 2. **Redis timeouts in the dialer**: 32 slot releases, 17 circuit-breaker writes and 17 rate or slot checks timed
    out, in three bursts. A slot that is not released keeps one of the 400 busy until its 20-minute stale timeout.
    The Go engine logged none in 7 days, but that does not show Redis is healthy: go-redis waits 5 s per command and
@@ -117,7 +123,8 @@ recording that is not available (`34bk399q`) and the agent spoke the text instea
    multiplexed connection (verified in the redis crate's docs) and its default timeout is not documented, so it
    reports the same stall as errors. Cause of the stall itself: open.
 3. **4 calls failed to start**: 3 `bind media port ...: Address already in use`, 1 externalMedia 500 from Asterisk.
-4. **Asterisk's main thread at 74-86% of one core** (box 19-26%), the component closest to its limit.
+4. **Asterisk's process at 74-86% of one core** (box 19-26%). First read as one saturated thread; corrected Nov 15 (see
+   the top): it is the whole process, spread over its threads.
 
 ## Cost (from the `run.cost` records, 2,353 calls)
 
@@ -155,7 +162,7 @@ TTS dominates because every answered call plays the greeting, even when the call
 | Agent | barge-in false alarms | 43% of pauses | Watch |
 | Agent | missing clip `34bk399q` | 37 | **Fix** (workflow) |
 | Redis | slot-release / limit / breaker timeouts | 32 / 17 / 17 | **Fix** |
-| Asterisk | main thread | 74-86% of a core | Watch |
+| Asterisk | whole process (not one thread) | 74-86% of a core | Watch |
 
 ## Next
 
@@ -165,4 +172,4 @@ TTS dominates because every answered call plays the greeting, even when the call
 3. Redis: an explicit timeout, retry a failed slot release, count Redis errors; check `redis-cli --latency` during a
    campaign.
 4. Port reuse: check the order in which a call frees its port and closes its listener.
-5. To dial faster: raise `CONCURRENT_CALL_LIMIT`, watching Asterisk's main thread.
+5. To dial faster: raise `CONCURRENT_CALL_LIMIT`, watching Asterisk's CPU and the trunk's cause-34 rejects.

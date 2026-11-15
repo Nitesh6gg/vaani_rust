@@ -60,6 +60,12 @@ story of one call.
 - **A campaign is paused:** the circuit breaker tripped (failure rate), Redis was unreachable, or the org limit was hit:
   `campaign.paused` states which. Restart recovery requeues contacts that were never dialed and marks dialed ones processed
   (`campaign.recovered`).
+- **`llm.fallback` / `llm.error` rising, `llm.request` warnings with status 429:** the LLM provider is rate-limiting. The
+  engine retries and then speaks a canned line. Check the key and limit in Bifrost and at Sarvam; it is not an engine fault.
+- **`campaign.redis_slow` logs:** a Redis step took over its threshold (the `ms` and `op` fields say how long and which
+  step). If they come in bursts, capture Redis latency and the shared box's load; see `ASTERISK.md` section 6.
+- **Asterisk looks busy:** read per-thread CPU, not the `htop` process row (which sums all threads); the monitor script
+  and what to read in it are in `ASTERISK.md` section 6.
 
 ## Known limits (see `TECH_DEBT.md`, `SYSTEM_DESIGN.md`)
 

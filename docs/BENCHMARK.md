@@ -95,6 +95,7 @@ metrics scraped every 10 s. Release build.
 | Rust | Nov 10 17:09 IST, campaign 22 retries, 266 dials in < 5 s | 118 | 3,039 s (51 min) | 55 (10-s max) | 265 | 0.42 (1-min avg) | **0.0144** | 229 MB | 25 | 556 |
 | Rust (load generator, mocks) | Nov 11, 1,000 concurrent calls, engine alone, generator on a second machine (`LOADTEST.md`) | 7,101 | 425,860 s | 1,000 | – | 4.78 (1-min avg, 30% of the box) | **0.0048** | 2.71 GB | 17 | 7,576 |
 | Rust | **Nov 11 17:39 IST, campaign 25 (`test_R_4K`), 4,987 dials, org limit 400 / 35 per s** | 2,354 | 34,807 s (580 min) | **149** (1-min max) | **400** (= org limit) | **1.01** (1-min avg, 6.3% of the box) | **0.0101** | 554 MB | 40 | 1,359 |
+| Rust | **Nov 15 15:44 IST, campaign 25 again, 2,697 dials resolved** (first run with the finer latency buckets and the Dograh `subscribeAll` fix) | 1,245 | 22,692 s (378 min) | **153** (1-min avg max) | – | 0.60 in the ramp minute (the peak minute was not pulled) | **0.0104** | 674 MB | – | – |
 | Go (for comparison) | Nov 9 19:18 IST, campaign 22, 385 dials, after the event-loop fix | 173 | 4,792 s (80 min) | 72 | 227 | 1.78 (1-min avg) | **0.046** | 548 MB | ~23 | 1,107 goroutines |
 
 ### Per-run detail
@@ -159,9 +160,54 @@ metrics scraped every 10 s. Release build.
   none, but go-redis waits 5 s and retries 3 times, which hides a short stall; see `CAMPAIGN_25_REPORT.md`.
 - 4 setup failures: 3 `bind media port …: Address already in use` (a port handed out again while still in use) and
   1 externalMedia 500 from Asterisk.
-- Asterisk (separate 4-core box, `htop` during the run): its main thread at 74–86% of one core, the box at
-  19–26%. Close to its limit at ~150 talking, as with the Go engine (96% at 141 talking on Nov 9).
+- Asterisk (separate 4-core box, `htop` during the run): its process row at 74–86% of one core, the box at
+  19–26%. **Corrected Nov 15:** this was first read as "the main thread, close to its limit". The row was the whole
+  process summed over its threads (the first thread's own counter shows 0.8 CPU-seconds in 17 weeks), so no thread was
+  saturated. See `ASTERISK.md`.
 - STT audio sent: 20,672 s for 34,807 s of calls (59%).
+
+**Nov 15, 2026 — campaign 25 again (`test_R_4K`), second sustained real campaign on Rust, ~150 talking**
+
+- Build: the engine restarted at 15:21 IST with the finer TTFB buckets (`0fea6d4`). Window used for the figures:
+  15:43 IST (10:13 UTC) onward; the campaign was started by hand, and an Asterisk monitor and SigNoz were read during
+  it. Org limits were not re-checked in this run (they were 400 concurrent / 35 per second on Nov 11). This was not a
+  clean end-to-end figure set: the run was read while it was still ramping, and the monitor script stopped at 15:40
+  (before the campaign), so the Asterisk numbers are 10-second hand samples (`ASTERISK.md`).
+- Outcomes (`vaani_campaign_outcomes_total`, 2,697 resolved): **1,245 connected (46%)**, 1,016 no-answer, 421
+  rejected, 10 failed, 5 busy. `call.summary` count 1,245 = connected. Average call **18.2 s** (22,692 s / 1,245).
+- **CPU: 235.7 CPU-s for 22,692 talk-s = 0.0104 core per talking call**, the same as Nov 11 (0.0101). Peak RSS 674 MB.
+  The ramp minute was 0.60 cores for about 153 talking.
+- **Latency**, from the new finer histograms (a percentile is interpolated inside its bucket, so treat the p99 as
+  approximate): LLM first token p50 ≈ 322 ms / p95 ≈ 1,108 ms / p99 ≈ 2,457 ms (949 observations); TTS first audio
+  p50 ≈ 317 / p95 ≈ 1,951 / p99 ≈ 4,032 ms (2,251); STT endpoint p50 ≈ 84 / p95 ≈ 157 / p99 ≈ 580 ms (864).
+  Nov 11 was LLM 284 / 1,186 and TTS 416 / 2,572 ms (p50 / p95), from log lines not histograms.
+- **Why the buckets changed:** with the old 400-800 ms bucket, one 449 ms reply showed a p99 of 776 ms on the dashboard
+  (a 6-call test). Rust's latency histograms now have bounds 50, 100, 150, 200, 250, 300, 400, 500, 600, 800, 1000,
+  1200, 1600, 3200, ... 25600 (the Go server still uses its doubling buckets).
+- **After a confirmed barge-in the reply is slower by about 145 ms.** The cut closes the TTS WebSocket, and the next
+  turn reconnects *before* it asks the LLM (`turn_task`). In three Nov 11 calls (18 cuts) a new `tts.connected` followed
+  every cut 133-163 ms later, and replies after a cut took 462-733 ms to first audio (median ~570). A pause that turns out
+  false (no cut) costs nothing: the test call's two false pauses were followed by normal replies. The test call's own
+  200-300 ms replies were mostly pre-recorded clips (no synthesis); the only reply that needed TTS took 449 ms.
+- Interruptions: 655 pauses, **293 confirmed (45%)**, 362 false (55%). 1,245 calls.
+- **The LLM was rate-limited.** 71 turns (7% of 1,020 LLM turns) failed after retries and fell back to a canned line
+  (`llm.error` = `llm.fallback` = 71); 679 failed request attempts (`llm.request`). Every one I read was HTTP **429**
+  "Rate limit exceeded" from Sarvam through Bifrost, on the key named `sarvam_test_key` (`sarvam-105b-conversations`).
+- **Redis still stalls in bursts**, with the pool of 4 and the 5 s timeout in place: 103 `campaign.redis_slow` logs, the
+  slowest 1,813 ms (slot release), 1,285 ms (rate limiter), 1,240 ms (slot limiter), concentrated at 15:44-15:45 IST as
+  the dial burst began. Redis runs in Docker on the shared `master` box; the cause is not found (`TECH_DEBT.md` #15).
+- Caller audio: **11,850 frames dropped** (1.0% of the ~1.13 M frames in 22,692 s) and **137,048 heard late** (12%: kept,
+  not lost, thanks to the late-frame path). Nov 11 dropped 0.9% (that report had no late count). Which calls lost
+  frames was not looked at yet (`TECH_DEBT.md` #18).
+- Database pool: at most 4.8 connections in use of 80. Post-call backlog: up to ~23 jobs waiting (1-min average).
+  ARI event queue in the engine: at most 5.5.
+- 36 `tts.clip_missing` (the recording `34bk399q` still missing), 17 `channel.orphan` warnings, 1 `tts.error`.
+- **Asterisk at 652 channels** (10-s sample at 15:45:47): whole process 54% of one core, busiest thread 2.6%, box 67%
+  idle, 0 UDP receive-buffer errors, ARI queue for `vaani` peaked at depth 158 of 500. After Dograh dropped
+  `subscribeAll`, the five `org*` queues stayed at 1 event each (Nov 11 they had ~414,000 each and three went past 500).
+  The comparison with Nov 11 (74-86% of a core at a similar talking count) is one sample, so it is not conclusive.
+- **What it does not show:** the Asterisk limit (the run stayed at about 150 talking), a steady-state CPU figure (it
+  was read mid-ramp), or why Redis stalls.
 
 
 ## Allocator comparison (Nov 14, development sandbox, not production)

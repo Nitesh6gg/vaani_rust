@@ -11,9 +11,11 @@ comes from a real run; extrapolations are marked as such.
 - **Latency is the same in both**: it is set by the providers (Sarvam, the LLM), not by the engine.
 - **Go is the proven one**: it has run 3,545-dial campaigns with 141 calls talking at once; Rust has one run of
   118 calls (55 talking at once). Go also still has features Rust does not (below).
-- **Neither engine is the limit today.** At 141 talking calls Go used 26% of the box. The ceiling we keep hitting
-  is Asterisk (4 cores, one thread at 96%) and the SIP trunk (cause-34 rejects). Switching engines does not raise
-  the number of calls the system can carry until Asterisk and the trunk are scaled.
+- **Neither engine is the limit today.** At 141 talking calls Go used 26% of the box. The limits measured so far are
+  the SIP trunk (cause-34 rejects) and, on Nov 15, the LLM's rate limit (HTTP 429). Asterisk was first read as a
+  saturated single thread (96%); that was corrected on Nov 15, because the `htop` row was the whole process, and at
+  ~650 channels its busiest thread was at 2.6% (`ASTERISK.md`). Switching engines does not raise the number of calls
+  the system can carry until the trunk and the LLM quota are raised.
 - **Recommendation:** keep Go in production for now and make Rust the target. Switch after one sustained
   head-to-head test (≥150 talking calls, ≥10 minutes) where Rust stays error-free, and after QA analysis is ported.
 
@@ -86,7 +88,8 @@ would remove this.
 Rust's advantage grows with load: no GC pauses that grow with the heap, and a fixed per-call footprint. But the
 whole system's ceiling is set elsewhere today:
 
-- **Asterisk** (separate 4-core box): one thread at 96% during a campaign, while total CPU showed 27%.
+- **Asterisk** (separate 4-core box): the process row at 96% of a core during a campaign, total CPU 27%. *Corrected
+  Nov 15: this was the whole process, not one thread (`ASTERISK.md`).*
 - **SIP trunk**: 54 cause-34 ("no circuit/channel available") rejects in a 385-dial burst on Nov 9.
 - **Sarvam STT**: 113 STT errors at 120–140 talking calls on Nov 9 (Go); cause unconfirmed.
 
@@ -123,7 +126,7 @@ failure counts are not comparable; its CPU and load are.
 | Agent errors | 113 (all STT, at 120–140 talking) | 0 |
 | LLM first token p95 | 512 ms | 1,186 ms |
 | Trunk "no circuit" (cause 34) | not seen that run (54 on Nov 9 19:18) | 0 |
-| Asterisk main thread | 96% of a core | 74–86% of a core |
+| Asterisk process (the `htop` row, not one thread: `ASTERISK.md`) | 96% of a core | 74–86% of a core |
 
 What this adds to the comparison:
 - **The 3× CPU gap holds on real traffic at ~150 calls**, not only in the 55-call burst.
@@ -132,7 +135,12 @@ What this adds to the comparison:
   timeouts in the dialer**. See `BENCHMARK.md`.
 - Latency p95 was worse on Rust's run (LLM 1.2 s, TTS 2.6 s); at 6% CPU the engine is unlikely to be the cause, so
   provider latency under load is the first suspect.
-- At ~150 talking, **Asterisk's main thread is the component closest to its limit** with either engine.
+- At ~150 talking, Asterisk used about half to one core of four with either engine. It was first read as "the main
+  thread is closest to its limit"; that was corrected on Nov 15 (no thread was saturated, `ASTERISK.md`).
+
+**Update, Nov 15 (Rust only, campaign 25 again, ~153 talking, 1,245 answered).** CPU per talking call was **0.0104 core**
+(Nov 11: 0.0101), so the 3x gap to Go's 0.031 holds on a second real run. New this time: the LLM answered HTTP 429 on
+7% of turns, and Redis stalled for up to 1.8 s in bursts. Neither is engine CPU. Details: `BENCHMARK.md`.
 
 ## Where Go is still ahead
 
@@ -164,5 +172,6 @@ variable extraction, STT gate, orphan sweep and setup timeouts, OTLP logs and tr
 2. **Isolate the VAD**: one Go run with `VAD_MODE=energy`, to see how much of the 3× is TEN VAD.
 3. **Barge-in quality**: listen to 10–20 Rust calls with confirmed barge-ins.
 4. **Port QA analysis** to Rust.
-5. **Scale Asterisk** (more cores, or a second box) and get the trunk's calls-per-second and channel limits.
-   Without this, neither engine can be loaded past ~140 talking calls.
+5. **Get the trunk's calls-per-second and channel limits and the LLM's rate limit in writing**, and measure Asterisk at
+   300+ talking calls (the Nov 15 run stayed at ~150). The old claim that neither engine can pass ~140 talking calls
+   because Asterisk saturates is not supported.
