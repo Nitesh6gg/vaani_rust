@@ -66,7 +66,7 @@ pub fn call_rejected(reason: &str, direction: &str) {
     }
 }
 
-// Same names and buckets as the Go server's, so one set of dashboards and queries reads both engines.
+// Same names as the Go server's, and the same buckets except the finer latency ones (TTFB_MS), so one set of dashboards and queries reads both engines.
 
 /// A fixed-bucket Prometheus histogram on atomics. `N` is the bucket count: the bounds plus +Inf.
 pub struct Histogram<const N: usize> {
@@ -115,7 +115,11 @@ fn render_histogram(out: &mut String, name: &str, labels: &str, bounds: &[f64], 
 }
 
 /// 50ms..25.6s: a fast TTS first chunk through a slow LLM first token on a cold connection.
-const TTFB_MS: [f64; 10] = [50.0, 100.0, 200.0, 400.0, 800.0, 1600.0, 3200.0, 6400.0, 12800.0, 25600.0];
+/// Finer than the Go server's doubling buckets between 100ms and 1.6s, where replies live: a
+/// percentile is interpolated inside its bucket, so a 449ms reply in a 400-800ms bucket read as
+/// a p99 of 776ms. The Go bounds (50, 100, 200, ... 25600) are all still here.
+const TTFB_MS: [f64; 17] =
+    [50.0, 100.0, 150.0, 200.0, 250.0, 300.0, 400.0, 500.0, 600.0, 800.0, 1000.0, 1200.0, 1600.0, 3200.0, 6400.0, 12800.0, 25600.0];
 /// 1s..~34m.
 const CALL_SECONDS: [f64; 12] = [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0];
 /// 10ms..~20s.
@@ -123,11 +127,11 @@ const TOOL_MS: [f64; 12] = [10.0, 20.0, 40.0, 80.0, 160.0, 320.0, 640.0, 1280.0,
 const PACER_MS: [f64; 8] = [0.5, 1.0, 2.0, 3.0, 5.0, 8.0, 13.0, 21.0];
 
 /// Time from the transcript accepted to the first LLM token.
-pub static LLM_TTFT_MS: Histogram<11> = Histogram::new(&TTFB_MS);
+pub static LLM_TTFT_MS: Histogram<18> = Histogram::new(&TTFB_MS);
 /// Time from the transcript accepted to the first TTS audio.
-pub static TTS_TTFA_MS: Histogram<11> = Histogram::new(&TTFB_MS);
+pub static TTS_TTFA_MS: Histogram<18> = Histogram::new(&TTFB_MS);
 /// Time from Sarvam's END_SPEECH to its final transcript.
-pub static STT_ENDPOINT_MS: Histogram<11> = Histogram::new(&TTFB_MS);
+pub static STT_ENDPOINT_MS: Histogram<18> = Histogram::new(&TTFB_MS);
 /// Bridged calls, from staging (answer) to teardown.
 pub static CALL_DURATION_SECONDS: Histogram<13> = Histogram::new(&CALL_SECONDS);
 /// How far each 20ms tick of a call's writer was from its nominal interval.
