@@ -60,6 +60,12 @@ story of one call.
 - **A campaign is paused:** the circuit breaker tripped (failure rate), Redis was unreachable, or the org limit was hit:
   `campaign.paused` states which. Restart recovery requeues contacts that were never dialed and marks dialed ones processed
   (`campaign.recovered`).
+- **The agent stops too easily (interruptions feel too sensitive):** read `agent.barge_in.detected` against
+  `agent.barge_in.confirmed` and the `paused_ms` field (a long `paused_ms` is dead air). Raise `BARGE_IN_MIN_SPEECH_MS`
+  (200 default; 500 asks for half a second of caller speech), `BARGE_IN_GUARD_MS` (300; how long after the agent starts
+  talking it cannot be paused) and `VAD_THRESHOLD` (0.5; Earshot speech probability, 0.65 is stricter). In Dograh, turn
+  `allow_interrupt` off on a node the caller must hear whole (greeting, goodbye). An acknowledgement ("जी", "ok") over a
+  paused reply plays it on, and with no transcript it resumes after 1.2 s of caller silence.
 - **`llm.fallback` / `llm.error` rising, `llm.request` warnings with status 429:** the LLM provider is rate-limiting. The
   engine retries and then speaks a canned line. Check the key and limit in Bifrost and at Sarvam; it is not an engine fault.
 - **`campaign.redis_slow` logs:** a Redis step took over its threshold (the `ms` and `op` fields say how long and which

@@ -232,6 +232,43 @@ async fn backchannel_over_a_paused_reply_resumes_it() {
     assert_eq!((s.barge_ins, s.false_interruptions), (0, 1));
 }
 
+#[tokio::test]
+async fn an_acknowledgement_inside_the_post_cut_window_resumes_the_reply() {
+    // The transcript of the very sound that paused the reply lands within the post-cut silence window. It used
+    // to be ignored, leaving the agent silent until the next transcript.
+    let mut r = rig(60, true, "Please hold on a moment.").await; // 1.2s
+    assert!(collect_tone(&mut r, 3, Duration::from_secs(5)).await >= 3);
+    for _ in 0..3 {
+        r.inbound.send(loud()).await.unwrap(); // three votes pause the reply
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(30)).await; // paused now; the 100 ms window is still open
+    r.stt_tx.send(r#"{"type":"data","data":{"transcript":"जी"}}"#.into()).unwrap();
+    assert!(collect_tone(&mut r, 30, Duration::from_secs(5)).await >= 30, "reply resumed after an early acknowledgement");
+    assert_eq!(r.tts.closed.load(SeqCst), 0);
+    assert_eq!(r.llm_reqs.lock().unwrap().len(), 1, "no new turn: it was only an acknowledgement");
+    r.cancel.cancel();
+    let (mut s, fin) = r.done.await.unwrap();
+    fin.finish(&mut s).await;
+    assert_eq!((s.barge_ins, s.false_interruptions), (0, 1));
+}
+
+#[tokio::test]
+async fn a_pause_with_no_transcript_resumes_after_about_a_second() {
+    let mut r = rig(60, true, "Please hold on a moment.").await; // 1.2s
+    assert!(collect_tone(&mut r, 3, Duration::from_secs(5)).await >= 3);
+    for _ in 0..8 {
+        r.inbound.send(loud()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // Noise only: no transcript. It must play on well before the old 2 s.
+    assert!(collect_tone(&mut r, 3, Duration::from_millis(1700)).await >= 3, "resumed within ~1.4 s of the noise");
+    r.cancel.cancel();
+    let (mut s, fin) = r.done.await.unwrap();
+    fin.finish(&mut s).await;
+    assert_eq!((s.barge_ins, s.false_interruptions), (0, 1));
+}
+
 /// Rough capacity probe, not a unit test: `BENCH_CALLS=500 cargo test --release bench_concurrent_agents -- --ignored --nocapture`.
 /// N agents run against shared mock providers (so the figures include the mocks'
 /// own work in this process -- an upper bound). Prints RSS and CPU time per call

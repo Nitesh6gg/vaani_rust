@@ -15,7 +15,7 @@
 //! is CONFIRMED. A detected one first *pauses* playback (no frames popped, STT
 //! still fed, LLM/TTS keep queueing); a transcript confirms it and runs all
 //! five cuts (stop feeding the outbound queue, STT context, LLM cancel, TTS
-//! connection close, queue flush) while no transcript and 2s of quiet resumes
+//! connection close, queue flush) while no transcript and 1.2s of quiet resumes
 //! the reply from the start of the interrupted sentence. A pause is not a cut.
 //! The STT is fed the caller's audio continuously in every state; transcripts
 //! are filtered, not audio.
@@ -62,7 +62,9 @@ const SPEAKING_DRAIN_TIMEOUT_TICKS: u32 = 500;
 /// A paused reply resumes when no transcript confirmed the interruption and the
 /// caller has been quiet this long; the cap holds even if the STT's VAD never
 /// reports the caller stopping.
-const FALSE_INTERRUPTION: Duration = Duration::from_secs(2);
+/// How long the caller must be quiet, with no transcript, before a paused reply plays on (was 2 s; Sarvam's
+/// transcript lands ~0.7 s after speech ends, so 1.2 s still leaves room for it).
+const FALSE_INTERRUPTION: Duration = Duration::from_millis(1200);
 const FALSE_INTERRUPTION_MAX_PAUSE: Duration = Duration::from_secs(10);
 const MAX_TOOL_ROUNDS: usize = 5;
 const TOOL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -843,6 +845,14 @@ impl Agent {
             // Arrived too soon after the pause to be what the caller says now:
             // Sarvam needs ~0.7s after they stop, so this one was already on its
             // way. It neither confirms the interruption nor starts a turn.
+            //
+            // One exception: a bare acknowledgement ("जी", "ok") this soon is most likely the very sound that
+            // paused the reply, and ignoring it left the agent silent until the next transcript (5.5 s of dead
+            // air in a Nov 17 test call). Treat it as an acknowledgement and play on.
+            if self.paused && !self.closing && self.cfg.ack_filter && backchannel(&text) {
+                self.hold_speech(text, "an acknowledgement over a paused reply");
+                return self.resume_reply("backchannel");
+            }
             return ignore(self, "post_cut");
         }
 
