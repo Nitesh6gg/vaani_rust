@@ -69,7 +69,15 @@ story of one call.
 - **`llm.fallback` / `llm.error` rising, `llm.request` warnings with status 429:** the LLM provider is rate-limiting. The
   engine retries and then speaks a canned line. Check the key and limit in Bifrost and at Sarvam; it is not an engine fault.
 - **`campaign.redis_slow` logs:** a Redis step took over its threshold (the `ms` and `op` fields say how long and which
-  step). If they come in bursts, capture Redis latency and the shared box's load; see `ASTERISK.md` section 6.
+  step). On Nov 15 they came from the engine being at another site (18.5 ms through firewalls); with the engine on the
+  data server's network there were none (`ASTERISK.md` section 8). If they return, check where the engine runs first,
+  then capture Redis latency and the shared box's load (`ASTERISK.md` section 6).
+- **Callers say the agent does not hear them:** in `call.summary`, compare `packets_in` with `packets_out` (both count the
+  same connection; the agent sends every 20 ms). `packets_in` far below `packets_out` means caller audio did not reach the
+  engine. With `inbound_dropped` at 0 the loss is before the engine: check that call's channel in `sip show channelstats`
+  on Asterisk (`ASTERISK.md` section 6). Nov 17: 8.4% of calls under half (`CAMPAIGN_26_REPORT.md`).
+- **Long silences after a pause:** a `false interruption; resuming the reply` line with `paused_ms` near 10000 is a pause on
+  line noise that ran to the 10 s cap (`TECH_DEBT.md` #23).
 - **Asterisk looks busy:** read per-thread CPU, not the `htop` process row (which sums all threads); the monitor script
   and what to read in it are in `ASTERISK.md` section 6.
 

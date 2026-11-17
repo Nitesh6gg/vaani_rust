@@ -1,6 +1,7 @@
 # The Asterisk box: what we found and how to diagnose it
 
-Found Nov 15, 2026 by reading the box over SSH (read-only commands) while the Rust engine ran campaign 25 again.
+Found Nov 15, 2026 by reading the box over SSH (read-only commands) while the Rust engine ran campaign 25 again;
+Nov 17 (campaign 26, engine moved next to Asterisk) is section 8.
 Earlier reports (`BENCHMARK.md`, `CAMPAIGN_25_REPORT.md`, `GO_VS_RUST.md`, `SYSTEM_DESIGN.md`) said Asterisk's
 "main thread" was at 74-96% of a core. **That was wrong**; the correction is in section 3.
 
@@ -73,7 +74,7 @@ Seen while watching the Asterisk side; details in `BENCHMARK.md` and `TECH_DEBT.
 - **The LLM is rate-limited.** Sarvam answers HTTP 429 "Rate limit exceeded" through Bifrost on the key named
   `sarvam_test_key`: 71 turns of 1,020 fell back to a canned line (7%).
 - **Redis stalls for 1-2 s in bursts** (`campaign.redis_slow`). Redis runs in Docker on `master`, the same machine as
-  Postgres (behind pgbouncer), MinIO and Bifrost; whether the stall is Redis, the box or the network is not known yet.
+  Postgres (behind pgbouncer), MinIO and Bifrost. **Nov 17: gone once the engine moved** (section 8).
 
 ## 6. Commands for the next run
 
@@ -105,6 +106,8 @@ while true; do
   asterisk -rx "core show taskprocessors" | grep -E "ari:application|cdr:aggregator" | awk '{print "  "$1, $2, $3, $4}'
   echo -n "udp 5061 (Recv-Q): "; ss -uan 'sport = :5061' | tail -1
   echo -n "mem/swap: "; free -m | awk '/Mem:/{printf "avail=%sMB ",$7} /Swap:/{print "swap_used="$3"MB"}'
+  echo "rtp per channel (recv/lost/jitter, both ways):"
+  asterisk -rx "sip show channelstats" | grep -v "^Peer\|active SIP"
   } >> $OUT
 done
 EOF
@@ -119,6 +122,8 @@ What to read in the log:
 - A thread above about 70% names the limit; compare with the box line (box low and one thread high = a single-thread limit).
 - ARI queue "maxdepth" over 500 means events are backing up for an app.
 - `Recv-Q` growing on UDP 5061, or `receive buffer errors` rising, means the SIP socket is dropping.
+- `sip show channelstats`: a channel whose "Recv" count stops growing while the call is up gets no RTP from the trunk
+  (match it to a call with little caller audio in `call.summary` by time); high "Lost" or "Jitter" there is the trunk's.
 - To check a thread's name: `asterisk -rx "core show threads"` (the LWP is the tid).
 
 On `master` (Redis in Docker, no `redis-cli` on the host):
@@ -145,3 +150,39 @@ background save in progress at the burst points at persistence; a busy `minio`/`
 - The trunk's written limits (calls per second, channels). `SYSTEM_DESIGN.md` assumes 40 cps and 1,000 channels.
 - PJSIP migration (needed before Asterisk 21/22), the dead `vaani_fs` peer, and tightening the peer settings in `sip.conf`
   (shared secrets, `insecure=invite,port`, unknown access allowed).
+- Calls with missing caller audio (Nov 17, section 8): trunk or Asterisk? Needs `sip show channelstats` during a run.
+- The `CUT()` dialplan error and the refcount assertion in `messages.log`: which context and object (not looked at).
+
+## 8. Nov 17: the engine on the same network (campaign 26)
+
+The engine moved from 192.168.36.19 (the other site, 18.5 ms through the company firewalls) to 192.168.26.88 (0.5 ms).
+Full report: `CAMPAIGN_26_REPORT.md`.
+
+| | Nov 15 (engine at the other site) | Nov 17 (engine on 26.88) |
+|---|---|---|
+| `res_audiosocket` "Poll timed out while waiting for data" | 241 (243 channels failed, 15:46 IST) | **0** |
+| `campaign.redis_slow` in the dialer | 103 | **0** |
+| Caller frames dropped by the engine | 11,850 | **1** |
+
+Same engine media code both days, so the AudioSocket timeouts (`res_audiosocket` hangs up when a frame's payload comes
+more than 5 ms after its header) and the Redis stalls came from the link between the sites, not from Asterisk or Redis.
+**Keep the engine on the same network as Asterisk.**
+
+Read on the box on Nov 17:
+- `messages.log` for Nov 17 has 23 lines: three trunk-registration retries, an AudioSocket connect refused at 16:26 (the
+  old engine address, before `MEDIA_IP` was fixed) and ten pairs of "Web socket closed abruptly" / "WebSocket read error",
+  one per engine restart or stop (the last at 18:27:36, the hand stop). Nothing during the campaign.
+- **CDRs agree with the engine**: 1,435 ANSWERED CDRs with `Stasis(vaani,outbound,...)` on `SIP/server225`, 36,481
+  billable seconds (engine: 1,435 calls, 36,921 s).
+- UDP receive-buffer errors still 238,917 (the same as at 15:26 Nov 15): **none** in either campaign.
+- Box CPU at the peak (1-min, 176-185 talking): 1.03 of 4 cores busy, of which system 0.56 and softirq 0.28 (kernel
+  networking), user 0.44.
+
+The trunk (`sip show peer server225`): 192.168.26.225:50660, ulaw/alaw, `DirectMedia: No`, symmetric RTP, qualify 1 ms.
+`sip show settings`: **jitter buffer off**, RTP timeout off, RTP keepalive off. So Asterisk passes the trunk's RTP timing
+straight to the AudioSocket, and a call whose trunk sends no RTP gives the engine no caller frames (8.4% of calls got under
+half their caller audio, `CAMPAIGN_26_REPORT.md`).
+
+Old errors still in `messages.log` (none from Nov 17): about 160,000 `func_cut.c` "Syntax: CUT(...)" errors (a dialplan
+`CUT()` call missing an argument), 1,630 "Excessive refcount 100000 reached" assertions on one ao2 object, 4,224 "Too many
+open files" (all Jul 13), thousands of Dograh `res_websocket_client` connection failures, 938 "HTTP version not supported".

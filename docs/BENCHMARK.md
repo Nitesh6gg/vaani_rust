@@ -86,7 +86,7 @@ its log lines share a `trace_id`, so a slow reply in one engine can be followed 
 ## Results
 
 Box: 192.168.36.19 (16 vCPU Xeon Gold 6330, 32 GB, VMware), Vaani alone on it (the Go engine stopped),
-Asterisk, Postgres, Redis and Dograh on other servers. Source: SigNoz, `service.name = 'vaani-engine-rust'`,
+Asterisk, Postgres, Redis and Dograh on other servers (from Nov 17: 192.168.26.88, 32 cores, on their network). Source: SigNoz, `service.name = 'vaani-engine-rust'`,
 metrics scraped every 10 s. Release build.
 
 | Engine | Test | Answered | Talk time | Peak talking | Peak in flight | Peak CPU (cores) | **Core / talking call** | Peak RSS | Threads | Tasks |
@@ -96,6 +96,7 @@ metrics scraped every 10 s. Release build.
 | Rust (load generator, mocks) | Nov 11, 1,000 concurrent calls, engine alone, generator on a second machine (`LOADTEST.md`) | 7,101 | 425,860 s | 1,000 | – | 4.78 (1-min avg, 30% of the box) | **0.0048** | 2.71 GB | 17 | 7,576 |
 | Rust | **Nov 11 17:39 IST, campaign 25 (`test_R_4K`), 4,987 dials, org limit 400 / 35 per s** | 2,354 | 34,807 s (580 min) | **149** (1-min max) | **400** (= org limit) | **1.01** (1-min avg, 6.3% of the box) | **0.0101** | 554 MB | 40 | 1,359 |
 | Rust | **Nov 15 15:44 IST, campaign 25 again, 2,697 dials resolved** (first run with the finer latency buckets and the Dograh `subscribeAll` fix) | 1,245 | 22,692 s (378 min) | **153** (1-min avg max) | – | 0.60 in the ramp minute (the peak minute was not pulled) | **0.0104** | 674 MB | – | – |
+| Rust | **Nov 17 18:16 IST, campaign 26 resumed, 3,365 dials**, engine moved to **192.168.26.88** (32 cores, same network as Asterisk) | 1,435 | 36,921 s (615 min) | **185** (1-min max) | **500** | 1.95 (1-min avg, 6% of the box) | **0.0133** | 964 MB | – | – |
 | Go (for comparison) | Nov 9 19:18 IST, campaign 22, 385 dials, after the event-loop fix | 173 | 4,792 s (80 min) | 72 | 227 | 1.78 (1-min avg) | **0.046** | 548 MB | ~23 | 1,107 goroutines |
 
 ### Per-run detail
@@ -208,6 +209,26 @@ metrics scraped every 10 s. Release build.
   The comparison with Nov 11 (74-86% of a core at a similar talking count) is one sample, so it is not conclusive.
 - **What it does not show:** the Asterisk limit (the run stayed at about 150 talking), a steady-state CPU figure (it
   was read mid-ramp), or why Redis stalls.
+
+**Nov 17, 2026 — campaign 26 resumed, first run with the engine next to Asterisk** (full report: `CAMPAIGN_26_REPORT.md`)
+
+- **Box changed:** 192.168.26.88 (32 cores, 62 GB, Docker), on Asterisk's and the data server's network (0.5 ms), instead of
+  192.168.36.19 at the other site (18.5 ms through firewalls). Same media code as Nov 15 (only `e7a29a2`, barge-in, since).
+  Dialed 18:16-18:23 IST (12:46-12:53 UTC); engine stopped by hand at 18:27:36, 16 s after the last call: nothing lost.
+- Outcomes: 3,365 dials, **1,435 answered (43%)** (= `call.summary` = Asterisk's ANSWERED CDRs), 1,509 no-answer, 378
+  rejected (cause 21), 37 failed (cause 38, which tripped the breaker twice at the start), 4 busy. Average call 25.7 s.
+  Peak 350 dials in 10 s; in flight held at the 500 limit for three minutes.
+- **CPU: 492.7 CPU-s for 36,921 talk-s = 0.0133 core per talking call** (Nov 15: 0.0104; dial rate and box differ).
+  Peak 1.95 cores at 176-185 talking. RSS peak 964 MB.
+- **Media:** caller frames dropped **1** (Nov 15: 11,850), late 162,668 (9.4%, heard), agent frames dropped 0, pacer
+  p99 ≤ 0.5 ms, 2 `media.dead`. Asterisk: **0** AudioSocket poll timeouts (Nov 15: 241). Dialer: **0** `redis_slow` (Nov 15: 103).
+- **Caller audio missing** in 121 calls (8.4%) under half, 35 (2.4%) under a tenth: trunk or Asterisk, not the engine
+  (`TECH_DEBT.md` #22).
+- **Latency** (histograms): STT endpoint p50 86 / p95 171 ms; LLM first token 288 / 905 ms; TTS first audio 397 / 1,085 ms
+  (Nov 15 TTS p95 1,951). Per-call reply p95 (p95 across calls) 2.1 s.
+- LLM: 2,460 HTTP 429 attempts, 321 failed turns, 320 fallback lines (209 calls). 87 `tts.clip_missing`.
+- Interruptions: 1,023 pauses, 677 confirmed (66%); 157 resumed on noise with p90 **10 s** of silence (`TECH_DEBT.md` #23).
+- Asterisk peak 1.03 of 4 cores busy; data server 0.85 of 8.
 
 
 ## Allocator comparison (Nov 14, development sandbox, not production)

@@ -100,7 +100,10 @@ Missing for this to work end to end:
 ## 8. Assumptions and open questions
 
 - The 150-calls-per-Asterisk figure is where the campaigns stopped, **not a measured limit**: no thread was saturated at ~150 talking (652 channels). Measure Asterisk at 300+ talking before sizing cells by it.
-- The shared services (Redis, Postgres behind pgbouncer, MinIO, the Bifrost LLM gateway) run on one box (`master`); Redis stalls of 1-2 s were seen there. Their limits, and `pgbouncer`'s pool settings, count as much as the engine's pools.
+- The shared services (Redis, Postgres behind pgbouncer, MinIO, the Bifrost LLM gateway) run on one box (`master`). The
+  Redis stalls of 1-2 s seen on Nov 15 came from the engine being at another site; with the engine on the same network
+  (Nov 17) there were none, and Asterisk's AudioSocket timeouts went too (`ASTERISK.md` section 8). **A cell's engine
+  must sit on the same network as its Asterisk and the data services.** Their limits, and `pgbouncer`'s pool settings, count as much as the engine's pools.
 - Sarvam's stream limits and the LLM quota decide the real ceiling. Get both from the vendors.
 - Does the trunk support 503 failover and spreading INVITEs across Asterisks? Confirm with the carrier.
 
