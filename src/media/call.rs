@@ -36,13 +36,94 @@ const QUEUE: usize = 5;
 /// 40% of the calls of a real campaign lost caller audio, mostly their first words.
 pub const INBOUND_QUEUE: usize = 50;
 
-#[derive(Default)]
 pub struct MediaStats {
     pub packets_in: AtomicU64,
     pub packets_out: AtomicU64,
     pub silence_out: AtomicU64,
     pub malformed: AtomicU64,
     pub inbound_dropped: AtomicU64,
+    /// When the media connection was set up: the offsets below count from here.
+    origin: std::time::Instant,
+    /// Offsets (ms) of the first and the latest caller frame; `NEVER` until one arrives.
+    first_in_ms: AtomicU64,
+    last_in_ms: AtomicU64,
+    /// The longest wait (ms) between two caller frames.
+    max_gap_ms: AtomicU64,
+    /// When the media connection ended (offset, ms); `NEVER` while it is up. The gap at the end is measured to here, not to
+    /// when the summary happens to be written (which can wait behind other post-call work).
+    ended_ms: AtomicU64,
+}
+
+const NEVER: u64 = u64::MAX;
+
+impl Default for MediaStats {
+    fn default() -> Self {
+        Self {
+            packets_in: AtomicU64::new(0),
+            packets_out: AtomicU64::new(0),
+            silence_out: AtomicU64::new(0),
+            malformed: AtomicU64::new(0),
+            inbound_dropped: AtomicU64::new(0),
+            origin: std::time::Instant::now(),
+            first_in_ms: AtomicU64::new(NEVER),
+            last_in_ms: AtomicU64::new(NEVER),
+            max_gap_ms: AtomicU64::new(0),
+            ended_ms: AtomicU64::new(NEVER),
+        }
+    }
+}
+
+/// When the caller's audio arrived, over a call's media: what tells "no audio at all" from "it started late", "it had holes"
+/// and "it stopped before the end". Offsets are ms from the media connection.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CallerAudio {
+    pub first_ms: Option<u64>,
+    /// The longest wait between two caller frames (a clump of frames after a stall shows here).
+    pub max_gap_ms: u64,
+    /// How long before now the latest caller frame came (the whole age when there was none).
+    pub end_gap_ms: u64,
+}
+
+impl CallerAudio {
+    /// One word for the call's caller audio: `none` (no frame ever), `late_start` (first after 2 s), `gaps` (a wait of 1 s or
+    /// more inside the call), `stopped` (nothing for the last 5 s) or `ok`.
+    pub fn shape(&self) -> &'static str {
+        match self.first_ms {
+            None => "none",
+            Some(f) if f >= 2000 => "late_start",
+            _ if self.max_gap_ms >= 1000 => "gaps",
+            _ if self.end_gap_ms >= 5000 => "stopped",
+            _ => "ok",
+        }
+    }
+}
+
+impl MediaStats {
+    /// A caller frame has been read.
+    pub fn caller_frame(&self) {
+        let now = self.origin.elapsed().as_millis() as u64;
+        let _ = self.first_in_ms.compare_exchange(NEVER, now, Relaxed, Relaxed);
+        let prev = self.last_in_ms.swap(now, Relaxed);
+        if prev != NEVER {
+            self.max_gap_ms.fetch_max(now.saturating_sub(prev), Relaxed);
+        }
+    }
+
+    /// The media connection ended: the end gap stops growing.
+    pub fn media_ended(&self) {
+        let _ = self.ended_ms.compare_exchange(NEVER, self.origin.elapsed().as_millis() as u64, Relaxed, Relaxed);
+    }
+
+    pub fn caller_audio(&self) -> CallerAudio {
+        let ended = self.ended_ms.load(Relaxed);
+        let now = if ended == NEVER { self.origin.elapsed().as_millis() as u64 } else { ended };
+        let (first, last) = (self.first_in_ms.load(Relaxed), self.last_in_ms.load(Relaxed));
+        CallerAudio {
+            first_ms: (first != NEVER).then_some(first),
+            max_gap_ms: self.max_gap_ms.load(Relaxed),
+            end_gap_ms: if last == NEVER { now } else { now.saturating_sub(last) },
+        }
+    }
 }
 
 pub struct MediaIo {
@@ -152,6 +233,7 @@ async fn read_loop(
         match frame {
             audiosocket::Inbound::Audio(f) => {
                 stats.packets_in.fetch_add(1, Relaxed);
+                stats.caller_frame();
                 metrics::AUDIOSOCKET_FRAMES_IN.fetch_add(1, Relaxed);
                 metrics::AUDIOSOCKET_BYTES_IN.fetch_add(FRAME_SIZE as u64, Relaxed);
                 if tx.try_send(f).is_err() {
@@ -170,6 +252,7 @@ async fn read_loop(
             }
         }
     }
+    stats.media_ended();
     closed.cancel();
 }
 
@@ -177,6 +260,35 @@ async fn read_loop(
 mod tests {
     use super::*;
     use tokio::{io::AsyncReadExt, net::TcpListener};
+
+    #[test]
+    fn caller_audio_shapes() {
+        let a = |first_ms, max_gap_ms, end_gap_ms| CallerAudio { first_ms, max_gap_ms, end_gap_ms }.shape();
+        assert_eq!(a(None, 0, 9000), "none", "a silent caller, or one never heard");
+        assert_eq!(a(Some(3500), 20, 100), "late_start");
+        assert_eq!(a(Some(200), 1400, 100), "gaps");
+        assert_eq!(a(Some(200), 40, 7000), "stopped");
+        assert_eq!(a(Some(200), 40, 100), "ok");
+        assert_eq!(a(Some(1900), 999, 4999), "ok", "just inside every limit");
+    }
+
+    #[tokio::test]
+    async fn caller_frames_are_timed_from_the_connection() {
+        let s = MediaStats::default();
+        assert_eq!(s.caller_audio().first_ms, None);
+        assert!(s.caller_audio().end_gap_ms < 1000);
+        s.caller_frame();
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        s.caller_frame();
+        s.caller_frame();
+        let c = s.caller_audio();
+        assert!(c.first_ms.unwrap() < 100, "{c:?}");
+        assert!((100..400).contains(&c.max_gap_ms), "the 120 ms wait is the longest gap: {c:?}");
+        assert!(c.end_gap_ms < 100, "{c:?}");
+        s.media_ended();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(s.caller_audio().end_gap_ms < 100, "frozen when the media ended, not growing with the wait for the summary");
+    }
 
     #[tokio::test]
     async fn echo_frames_and_silence_filler() {

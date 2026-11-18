@@ -76,6 +76,11 @@ story of one call.
   same connection; the agent sends every 20 ms). `packets_in` far below `packets_out` means caller audio did not reach the
   engine. With `inbound_dropped` at 0 the loss is before the engine: check that call's channel in `sip show channelstats`
   on Asterisk (`ASTERISK.md` section 6). Nov 17: 8.4% of calls under half (`CAMPAIGN_26_REPORT.md`).
+  `call.summary` also says *how* the caller audio arrived: `caller_audio` is `none` (no frame ever: a silent caller, or audio
+  that never came), `late_start` (the first frame after 2 s; see `first_caller_frame_ms`), `gaps` (a wait of 1 s or more inside
+  the call; `max_caller_gap_ms`), `stopped` (nothing for the last 5 s; `caller_audio_end_gap_ms`) or `ok`. Count the calls by
+  `caller_audio` to separate silent callers from broken audio before looking at Asterisk; for `none` calls, group by
+  destination number prefix and trunk gateway.
 - **Long silences after a pause:** a `false interruption; resuming the reply` line with `paused_ms` near 10000 is a pause on
   line noise that ran to the 10 s cap (`TECH_DEBT.md` #23).
 - **Asterisk looks busy:** read per-thread CPU, not the `htop` process row (which sums all threads); the monitor script

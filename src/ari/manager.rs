@@ -121,6 +121,7 @@ struct CallEnd {
 /// reply latency, interruptions, errors, outcome).
 fn log_summary(id: &str, duration: Duration, s: &calllog::Summary, stats: &media_call::MediaStats) {
     let (p50, p95) = percentiles(&s.reply_latencies_ms);
+    let audio = stats.caller_audio();
     tracing::info!(call_id = %id, component = "agent", event = "call.summary", duration_s = duration.as_secs_f64().round() as u64,
         disposition = s.end_reason.unwrap_or(calllog::USER_HANGUP), user_turns = s.user_turns, agent_replies = s.agent_replies,
         bargeins = s.barge_ins, pauses = s.pauses, false_interruptions = s.false_interruptions,
@@ -128,7 +129,9 @@ fn log_summary(id: &str, duration: Duration, s: &calllog::Summary, stats: &media
         recording_bytes = s.recording.pcm_len(), stt_audio_s = (s.stt_seconds * 10.0).round() / 10.0,
         reply_latency_p50_ms = p50, reply_latency_p95_ms = p95, errors = ?s.errors,
         packets_in = stats.packets_in.load(Relaxed), packets_out = stats.packets_out.load(Relaxed),
-        silence_out = stats.silence_out.load(Relaxed), inbound_dropped = stats.inbound_dropped.load(Relaxed), "call summary");
+        silence_out = stats.silence_out.load(Relaxed), inbound_dropped = stats.inbound_dropped.load(Relaxed),
+        caller_audio = audio.shape(), first_caller_frame_ms = audio.first_ms, max_caller_gap_ms = audio.max_gap_ms,
+        caller_audio_end_gap_ms = audio.end_gap_ms, "call summary");
 }
 
 /// 50th and 95th percentile (nearest rank) of `v`, `None` when empty.
