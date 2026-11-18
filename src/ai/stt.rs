@@ -229,6 +229,36 @@ mod tests {
         assert_eq!(p("garbage"), None);
     }
 
+    /// What a provider's support asks for: the session's request id, the id on an error, and why the provider closed the socket.
+    #[tokio::test]
+    async fn the_providers_request_id_errors_and_close_reason_are_logged() {
+        use crate::testkit::logs;
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::protocol::{CloseFrame, frame::coding::CloseCode};
+        logs::install();
+        let lis = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/ws", lis.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (s, _) = lis.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(s).await.unwrap();
+            let _ = ws.send(Ws::text(r#"{"type":"events","data":{"signal_type":"START_SPEECH","request_id":"req-stt-1"}}"#)).await;
+            let _ = ws.send(Ws::text(r#"{"type":"error","data":{"message":"boom","request_id":"req-stt-2"}}"#)).await;
+            let _ = ws.send(Ws::Close(Some(CloseFrame { code: CloseCode::Error, reason: "idle timeout".into() }))).await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+        let cancel = CancellationToken::new();
+        let cfg = SttConfig { ws_url: url, api_key: "k".into(), model: "m".into(), language: "hi-IN".into(), flush_signal: false };
+        let (_stt, _events) = SttClient::connect("cap-stt", cfg, cancel.clone()).await.unwrap();
+
+        assert_eq!(logs::wait_for("cap-stt", "stt.session").await["request_id"], "req-stt-1");
+        let err = logs::wait_for("cap-stt", "stt.provider_error").await;
+        assert_eq!((err["request_id"].as_str(), err["message"].as_str()), ("req-stt-2", "boom"));
+        let closed = logs::wait_for("cap-stt", "stt.closed").await;
+        assert_eq!((closed["code"].as_str(), closed["reason"].as_str()), ("1011", "idle timeout"));
+        assert_eq!(logs::of("cap-stt").iter().filter(|l| l["event"] == "stt.session").count(), 1, "the session id is logged once");
+        cancel.cancel();
+    }
+
     #[test]
     fn url_carries_model_language_and_vad_signals() {
         let u = build_url(&SttConfig {

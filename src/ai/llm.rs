@@ -642,6 +642,28 @@ mod tests {
         assert_eq!((info.status, info.request_id.as_str(), info.completion_id.as_str()), (200, "req-200", "chatcmpl-7"));
     }
 
+    /// The turn's `llm.error` line names the status and request id of the attempt that failed it: what `stream` (the path the agent
+    /// uses, with its retries) leaves in `last_request`.
+    #[tokio::test]
+    async fn the_failed_turn_remembers_its_last_attempt() {
+        let c = LlmClient::new(&serve(vec![(429, "slow down".into())]).await, "k", "m1");
+        assert_eq!(c.last_request(), (0, String::new()), "nothing before the first attempt");
+
+        let mut c = LlmClient::new(&serve(vec![(429, "slow down".into())]).await, "k", "m1");
+        c.retries = 0;
+        let e = c.stream(&CancellationToken::new(), &[Message::new("user", "hi")], &[], &mut |_| {}).await.unwrap_err();
+        assert!(matches!(e, LlmError::Status { code: 429, .. }), "{e}");
+        assert_eq!(c.last_request(), (429, "req-429".to_string()));
+        assert_eq!(c.clone().last_request(), c.last_request(), "the clones the turns run on share it");
+
+        // A later attempt that works replaces it.
+        let sse = "data: {\"id\":\"chatcmpl-7\",\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\ndata: [DONE]\n\n";
+        let mut c = LlmClient::new(&serve(vec![(429, "slow down".into()), (200, sse.into())]).await, "k", "m1");
+        c.retry_max_wait = Duration::from_millis(20);
+        assert!(c.stream(&CancellationToken::new(), &[Message::new("user", "hi")], &[], &mut |_| {}).await.is_ok());
+        assert_eq!(c.last_request(), (200, "req-200".to_string()));
+    }
+
     #[test]
     fn a_requests_log_level_says_what_to_look_at() {
         use tracing::Level;

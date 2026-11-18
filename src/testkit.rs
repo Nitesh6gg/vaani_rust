@@ -289,3 +289,62 @@ pub(crate) const CAMPAIGN_SCHEMA: &str = r#"
         is_completed bool, usage_info json, cost_info json, initial_context json, gathered_context json, logs json, annotations json,
         created_at timestamptz, recording_url text, transcript_url text, storage_backend text, campaign_id int, queued_run_id int);
 "#;
+
+/// Captures the log lines of calls whose id starts with `cap-`, so a test can assert on what the engine logged (its `event`
+/// and fields). The subscriber is global and installed once; other tests are unaffected.
+pub(crate) mod logs {
+    use std::{collections::BTreeMap, fmt::Debug, sync::Mutex, sync::Once};
+    use tracing::{
+        Event, Subscriber,
+        field::{Field, Visit},
+    };
+    use tracing_subscriber::{Layer, layer::Context, layer::SubscriberExt, util::SubscriberInitExt};
+
+    pub type Logged = BTreeMap<String, String>;
+    static EVENTS: Mutex<Vec<Logged>> = Mutex::new(Vec::new());
+
+    #[derive(Default)]
+    struct Fields(Logged);
+    impl Visit for Fields {
+        fn record_debug(&mut self, f: &Field, v: &dyn Debug) {
+            self.0.insert(f.name().into(), format!("{v:?}"));
+        }
+        fn record_str(&mut self, f: &Field, v: &str) {
+            self.0.insert(f.name().into(), v.into());
+        }
+    }
+
+    struct Capture;
+    impl<S: Subscriber> Layer<S> for Capture {
+        fn on_event(&self, e: &Event<'_>, _: Context<'_, S>) {
+            let mut v = Fields::default();
+            e.record(&mut v);
+            if v.0.get("call_id").is_some_and(|c| c.starts_with("cap-")) {
+                EVENTS.lock().unwrap().push(v.0);
+            }
+        }
+    }
+
+    pub fn install() {
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            let _ = tracing_subscriber::registry().with(Capture).try_init();
+        });
+    }
+
+    /// The captured lines of `call_id`.
+    pub fn of(call_id: &str) -> Vec<Logged> {
+        EVENTS.lock().unwrap().iter().filter(|l| l.get("call_id").map(String::as_str) == Some(call_id)).cloned().collect()
+    }
+
+    /// The captured line of `call_id` whose `event` is `event`, once it has been logged (waits up to 5 s).
+    pub async fn wait_for(call_id: &str, event: &str) -> Logged {
+        for _ in 0..200 {
+            if let Some(l) = of(call_id).into_iter().find(|l| l.get("event").map(String::as_str) == Some(event)) {
+                return l;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("{call_id}: no {event} line was logged; got {:?}", of(call_id));
+    }
+}

@@ -328,6 +328,34 @@ fn truncate(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
 
+    /// What a provider's support asks for: the session's request id, the id on an error, and why the provider closed the socket.
+    #[tokio::test]
+    async fn the_providers_request_id_errors_and_close_reason_are_logged() {
+        use crate::testkit::logs;
+        use tokio_tungstenite::tungstenite::protocol::{CloseFrame, frame::coding::CloseCode};
+        logs::install();
+        let lis = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/ws", lis.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (s, _) = lis.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(s).await.unwrap();
+            let _ = ws.send(Ws::text(r#"{"type":"event","data":{"event_type":"started","request_id":"req-tts-1"}}"#)).await;
+            let _ = ws.send(Ws::text(r#"{"type":"error","data":{"message":"overloaded","request_id":"req-tts-2"}}"#)).await;
+            let _ = ws.send(Ws::Close(Some(CloseFrame { code: CloseCode::Error, reason: "try later".into() }))).await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+        let cancel = CancellationToken::new();
+        let cfg = TtsConfig { ws_url: url, api_key: "k".into(), model: "bulbul:v3".into(), voice: "v".into(), language: "hi-IN".into() };
+        let (_tts, _events) = TtsClient::connect("cap-tts", cfg, &cancel).await.unwrap();
+
+        assert_eq!(logs::wait_for("cap-tts", "tts.session").await["request_id"], "req-tts-1");
+        let err = logs::wait_for("cap-tts", "tts.provider_error").await;
+        assert_eq!((err["request_id"].as_str(), err["message"].as_str()), ("req-tts-2", "overloaded"));
+        let closed = logs::wait_for("cap-tts", "tts.closed").await;
+        assert!(closed["close"].contains("1011") && closed["close"].contains("try later"), "{closed:?}");
+        cancel.cancel();
+    }
+
     fn feed(book: &Mutex<Book>, tx: &mpsc::UnboundedSender<TtsEvent>, json: &str) {
         handle("t", json, book, tx);
     }
