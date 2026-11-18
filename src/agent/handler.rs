@@ -1718,7 +1718,11 @@ async fn run_llm_turn(c: &TurnCtx, tts: &Arc<TtsClient>) {
     match &err {
         None => tracing::debug!(call_id = %c.call_id, event = "llm.done", generation = c.generation,
             duration_ms = c.started.elapsed().as_millis() as u64, "llm turn complete"),
-        Some(e) => tracing::error!(call_id = %c.call_id, event = "llm.error", generation = c.generation, error = %e, "llm turn error"),
+        Some(e) => {
+            let (status, request_id) = c.llm.last_request();
+            tracing::error!(call_id = %c.call_id, event = "llm.error", generation = c.generation, model = %c.llm.model, status,
+                request_id = %request_id, error = %e, "llm turn error")
+        }
     }
 
     // Sent BEFORE end_generation: that can emit Done at once (nothing pending),

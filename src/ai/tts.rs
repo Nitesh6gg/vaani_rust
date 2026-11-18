@@ -15,7 +15,7 @@
 //! Events (audio, done, closed) travel on ONE channel, so a generation's audio
 //! is always delivered before its Done.
 
-use super::{WsStream, urlenc, ws_connect};
+use super::{WsStream, request_id_in, urlenc, ws_connect};
 use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use futures_util::{SinkExt, StreamExt};
@@ -235,6 +235,8 @@ struct InboundData {
     message: String,
     #[serde(default)]
     event_type: String,
+    #[serde(default)]
+    request_id: String,
 }
 
 async fn run(
@@ -249,6 +251,7 @@ async fn run(
     let mut ping = tokio::time::interval(KEEPALIVE);
     ping.tick().await; // first tick is immediate
 
+    let (mut session_logged, mut close) = (false, String::new());
     let self_closed = loop {
         tokio::select! {
             _ = cancel.cancelled() => break true,
@@ -260,8 +263,18 @@ async fn run(
                 if sink.send(Ws::text(m)).await.is_err() { break false; }
             }
             msg = rd.next() => match msg {
-                Some(Ok(Ws::Text(t))) => handle(&call_id, t.as_str(), &book, &events),
-                Some(Ok(Ws::Close(_))) | None => break false,
+                Some(Ok(Ws::Text(t))) => {
+                    if !session_logged && let Some(id) = request_id_in(t.as_str()) {
+                        session_logged = true;
+                        tracing::info!(call_id = %call_id, event = "tts.session", request_id = %id, "tts provider request id");
+                    }
+                    handle(&call_id, t.as_str(), &book, &events)
+                }
+                Some(Ok(Ws::Close(f))) => {
+                    if let Some(f) = f { close = format!("{} {}", u16::from(f.code), f.reason); }
+                    break false
+                }
+                None => break false,
                 Some(Ok(_)) => {}
                 Some(Err(e)) => { tracing::error!(call_id = %call_id, error = %e, "tts websocket error"); break false; }
             }
@@ -270,7 +283,7 @@ async fn run(
     if !self_closed {
         // A silent exit made "Sarvam stopped responding" and "we closed it"
         // indistinguishable in production: log loudly only if not ours.
-        tracing::error!(call_id = %call_id, "tts websocket closed by provider");
+        tracing::error!(call_id = %call_id, event = "tts.closed", close = %close, "tts websocket closed by provider");
     }
     book.lock().unwrap().closed = true;
     let _ = events.send(TtsEvent::Closed);
@@ -284,7 +297,7 @@ fn handle(call_id: &str, text: &str, book: &Mutex<Book>, events: &mpsc::Unbounde
             // Sarvam sends error INSTEAD of final: popping resolves the slot
             // and names exactly the sentence that was rejected.
             let (rejected, evs) = book.lock().unwrap().on_final();
-            tracing::warn!(call_id, message = %m.data.message, rejected_text = %truncate(&rejected, 80), "tts provider error");
+            tracing::warn!(call_id, event = "tts.provider_error", request_id = %m.data.request_id, message = %m.data.message, rejected_text = %truncate(&rejected, 80), "tts provider error");
             for e in evs {
                 let _ = events.send(e);
             }

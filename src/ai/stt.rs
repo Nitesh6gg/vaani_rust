@@ -11,7 +11,7 @@
 //! * Reconnect is lazy and one-shot with backoff, never a retry loop: a failed
 //!   send drops that frame and the next frame triggers one redial.
 
-use super::{WsStream, urlenc, ws_connect};
+use super::{WsStream, request_id_in, urlenc, ws_connect};
 use crate::media::Frame;
 use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -111,15 +111,17 @@ struct InboundData {
     error: String,
     #[serde(default)]
     message: String,
+    #[serde(default)]
+    request_id: String,
 }
 
 pub(crate) fn parse(text: &str, call_id: &str) -> Option<SttEvent> {
     let m: Inbound = serde_json::from_str(text).ok()?;
     if !m.data.error.is_empty() {
-        tracing::warn!(call_id, error = %m.data.error, "stt provider error");
+        tracing::warn!(call_id, event = "stt.provider_error", request_id = %m.data.request_id, error = %m.data.error, "stt provider error");
     }
     if !m.data.message.is_empty() {
-        tracing::warn!(call_id, message = %m.data.message, "stt provider error");
+        tracing::warn!(call_id, event = "stt.provider_error", request_id = %m.data.request_id, message = %m.data.message, "stt provider error");
     }
     match (m.kind.as_str(), m.data.signal_type.as_str()) {
         ("events", "START_SPEECH") => Some(SttEvent::SpeechStarted),
@@ -150,17 +152,31 @@ async fn run(
     let (sink, rd) = ws.split();
     let (mut sink, mut rd): (Option<Sink>, Option<SplitStream<WsStream>>) = (Some(sink), Some(rd));
     let (mut failures, mut next_dial) = (0u32, Instant::now());
+    let mut session_logged = false;
 
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
             msg = next_msg(&mut rd) => match msg {
                 Some(Ok(Ws::Text(t))) => {
+                    if !session_logged && let Some(id) = request_id_in(t.as_str()) {
+                        session_logged = true;
+                        tracing::info!(call_id = %call_id, event = "stt.session", request_id = %id, "stt provider request id");
+                    }
                     if let Some(ev) = parse(t.as_str(), &call_id) && events.send(ev).is_err() { break; }
                 }
+                Some(Ok(Ws::Close(f))) => {
+                    let (code, reason) = f.map(|f| (u16::from(f.code), f.reason.to_string())).unwrap_or_default();
+                    tracing::warn!(call_id = %call_id, event = "stt.closed", code, reason = %reason, "stt websocket closed by provider");
+                    sink = None; rd = None;
+                }
                 Some(Ok(_)) => {}
-                // Closed or errored: forget the connection; the next frame redials.
-                _ => { sink = None; rd = None; }
+                // Errored or ended: forget the connection; the next frame redials.
+                other => {
+                    let error = other.and_then(Result::err).map(|e| e.to_string()).unwrap_or_default();
+                    tracing::warn!(call_id = %call_id, event = "stt.closed", error = %error, "stt websocket ended");
+                    sink = None; rd = None;
+                }
             },
             cmd = cmds.recv() => {
                 let Some(cmd) = cmd else { break };

@@ -41,4 +41,29 @@ pub(crate) async fn ws_connect(
     Ok((ws, rid))
 }
 
+/// A `request_id` inside a Sarvam message (`data.request_id`, or top level): what their support asks for.
+/// Messages that don't contain the word are not parsed, so this is cheap to call on audio.
+pub(crate) fn request_id_in(text: &str) -> Option<String> {
+    if !text.contains("request_id") {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    let id = v.pointer("/data/request_id").or_else(|| v.get("request_id"))?.as_str()?;
+    (!id.is_empty()).then(|| id.to_string())
+}
+
 pub(crate) type WsStream = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+#[cfg(test)]
+mod tests {
+    use super::request_id_in;
+
+    #[test]
+    fn finds_a_request_id_in_data_or_top_level_and_skips_the_rest() {
+        assert_eq!(request_id_in(r#"{"type":"data","data":{"request_id":"r1","transcript":"x"}}"#).as_deref(), Some("r1"));
+        assert_eq!(request_id_in(r#"{"request_id":"r2"}"#).as_deref(), Some("r2"));
+        assert_eq!(request_id_in(r#"{"data":{"request_id":""}}"#), None);
+        assert_eq!(request_id_in(r#"{"type":"audio","data":{"audio":"AAAA"}}"#), None);
+        assert_eq!(request_id_in("not json request_id"), None);
+    }
+}

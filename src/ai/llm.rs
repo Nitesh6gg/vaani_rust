@@ -118,9 +118,16 @@ pub struct LlmClient {
     pub retry_max_wait: Duration,
     /// The call this client works for, so each request's span and log line belong to it ("" = none).
     pub call_id: String,
+    /// Status and request id of the latest attempt, so the turn's `llm.error` line can name it.
+    last: std::sync::Arc<std::sync::Mutex<(u16, String)>>,
 }
 
 impl LlmClient {
+    /// HTTP status and provider request id of the latest attempt (0 and "" before any).
+    pub fn last_request(&self) -> (u16, String) {
+        self.last.lock().unwrap().clone()
+    }
+
     pub fn new(base_url: &str, api_key: &str, model: &str) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').into(),
@@ -129,6 +136,7 @@ impl LlmClient {
             retries: 2,
             retry_max_wait: Duration::from_secs(2),
             call_id: String::new(),
+            last: Default::default(),
         }
     }
 
@@ -187,6 +195,7 @@ impl LlmClient {
         if let Some(span) = span {
             span.end(&self.model, attempt, info.status, &info.request_id, &info.completion_id, err.as_deref());
         }
+        *self.last.lock().unwrap() = (info.status, info.request_id.clone());
         let (call_id, model, ms) = (self.call_id.as_str(), self.model.as_str(), total.as_millis() as u64);
         let (status, rid, cid) = (info.status, info.request_id.as_str(), info.completion_id.as_str());
         match request_level(total, err.is_some()) {
