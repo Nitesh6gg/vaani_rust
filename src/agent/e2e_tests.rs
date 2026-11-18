@@ -130,6 +130,38 @@ async fn collect_tone(r: &mut Rig, n: usize, max: Duration) -> usize {
     seen
 }
 
+/// Drains outbound until no tone frame has come for `quiet` (the reply is paused, or over); `false` if it never went quiet in `max`.
+async fn wait_for_pause(r: &mut Rig, quiet: Duration, max: Duration) -> bool {
+    let (start, mut last_tone) = (std::time::Instant::now(), std::time::Instant::now());
+    while start.elapsed() < max {
+        match tokio::time::timeout(Duration::from_millis(10), r.outbound.recv()).await {
+            Ok(Some(f)) if is_tone(&f) => last_tone = std::time::Instant::now(),
+            Ok(None) => return false,
+            _ => {}
+        }
+        if last_tone.elapsed() >= quiet {
+            return true;
+        }
+    }
+    false
+}
+
+/// Talks over the reply until it is paused (its audio stops). How many loud frames the vote needs depends on timing, so this
+/// keeps sending them, a burst at a time, and looks at what comes out -- a test that only sends a fixed few can't tell a reply
+/// that resumed from one that was never paused.
+async fn pause_by_talking(r: &mut Rig) -> bool {
+    for _ in 0..6 {
+        for _ in 0..8 {
+            r.inbound.send(loud()).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        if wait_for_pause(r, Duration::from_millis(120), Duration::from_millis(400)).await {
+            return true;
+        }
+    }
+    false
+}
+
 fn loud() -> Frame {
     let mut f = SILENCE;
     for c in f.chunks_exact_mut(2) {
@@ -216,10 +248,7 @@ async fn confirmed_barge_in_pauses_then_cuts_all_five() {
 async fn backchannel_over_a_paused_reply_resumes_it() {
     let mut r = rig(60, true, "Please hold on a moment.").await; // 1.2s
     assert!(collect_tone(&mut r, 3, Duration::from_secs(5)).await >= 3);
-    for _ in 0..8 {
-        r.inbound.send(loud()).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    assert!(pause_by_talking(&mut r).await, "the loud frames paused the reply");
     tokio::time::sleep(Duration::from_millis(250)).await; // past post-cut silence
     r.stt_tx.send(r#"{"type":"data","data":{"transcript":"जी"}}"#.into()).unwrap();
     // The reply carries on (replayed from the sentence start): tone returns.
@@ -235,14 +264,15 @@ async fn backchannel_over_a_paused_reply_resumes_it() {
 #[tokio::test]
 async fn an_acknowledgement_inside_the_post_cut_window_resumes_the_reply() {
     // The transcript of the very sound that paused the reply lands within the post-cut silence window. It used
-    // to be ignored, leaving the agent silent until the next transcript.
-    let mut r = rig(60, true, "Please hold on a moment.").await; // 1.2s
+    // to be ignored, leaving the agent silent until the next transcript. The window is widened here so the test
+    // can wait for the pause to be seen and still be inside it, however busy the machine is.
+    let wf = Workflow {
+        start: 0,
+        nodes: vec![Node { name: "start".into(), prompt: "You are an agent.".into(), allow_interrupt: true, ..Default::default() }],
+    };
+    let mut r = rig_tuned(wf, 60, |_| sse("Please hold on a moment."), |c| c.post_cut_silence = Duration::from_millis(3000)).await; // 1.2s
     assert!(collect_tone(&mut r, 3, Duration::from_secs(5)).await >= 3);
-    for _ in 0..3 {
-        r.inbound.send(loud()).await.unwrap(); // three votes pause the reply
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    tokio::time::sleep(Duration::from_millis(30)).await; // paused now; the 100 ms window is still open
+    assert!(pause_by_talking(&mut r).await, "the loud frames paused the reply");
     r.stt_tx.send(r#"{"type":"data","data":{"transcript":"जी"}}"#.into()).unwrap();
     assert!(collect_tone(&mut r, 30, Duration::from_secs(5)).await >= 30, "reply resumed after an early acknowledgement");
     assert_eq!(r.tts.closed.load(SeqCst), 0);
@@ -257,12 +287,11 @@ async fn an_acknowledgement_inside_the_post_cut_window_resumes_the_reply() {
 async fn a_pause_with_no_transcript_resumes_after_about_a_second() {
     let mut r = rig(60, true, "Please hold on a moment.").await; // 1.2s
     assert!(collect_tone(&mut r, 3, Duration::from_secs(5)).await >= 3);
-    for _ in 0..8 {
-        r.inbound.send(loud()).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    // Noise only: no transcript. It must play on well before the old 2 s.
-    assert!(collect_tone(&mut r, 3, Duration::from_millis(1700)).await >= 3, "resumed within ~1.4 s of the noise");
+    // Noise only: no transcript. It must play on well before the old 2 s of quiet.
+    assert!(pause_by_talking(&mut r).await, "the loud frames paused the reply");
+    let paused = std::time::Instant::now();
+    assert!(collect_tone(&mut r, 3, Duration::from_millis(3000)).await >= 3, "the reply resumed");
+    assert!(paused.elapsed() < Duration::from_millis(1900), "resumed {:?} after the noise, not the old 2 s", paused.elapsed());
     r.cancel.cancel();
     let (mut s, fin) = r.done.await.unwrap();
     fin.finish(&mut s).await;

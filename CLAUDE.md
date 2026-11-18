@@ -35,7 +35,8 @@ to-port list.
 6. **One ARI WebSocket per process** (`ari::run_events`).
 7. **Barge-in = 5 cuts, only once CONFIRMED** (`Agent::confirm_interruption` → `cut_reply`): stop feeding
    the queue, cancel the turn (LLM), close the TTS connection, flush the queue; STT stays fed always. A
-   detected interruption only *pauses* (`paused`); no transcript + 2s quiet resumes from the sentence start.
+   detected interruption only *pauses* (`paused`); no transcript + 1.2s quiet (`FALSE_INTERRUPTION`) resumes from the sentence start, and a bare
+   acknowledgement ("जी", "ok") arriving over a paused reply resumes it at once.
 8. **slin16 end to end.** 9. **One media socket per call, bound BEFORE Asterisk is told the address**
    (`Manager::setup`; the manager test connects immediately after the externalMedia request returns).
 10. n/a (RTP). 11. **AudioSocket frame = ONE write** (`audiosocket::write_frame`, 643-byte buffer).
