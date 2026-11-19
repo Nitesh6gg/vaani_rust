@@ -809,7 +809,7 @@ impl Agent {
         match ev {
             SttEvent::SpeechStarted => self.on_caller_speech(true),
             SttEvent::SpeechEnded => self.on_caller_speech(false),
-            SttEvent::Final(text) => self.on_final_transcript(text),
+            SttEvent::Final(text, request_id) => self.on_final_transcript(text, request_id),
         }
     }
 
@@ -835,7 +835,8 @@ impl Agent {
         }
     }
 
-    fn on_final_transcript(&mut self, text: String) {
+    fn on_final_transcript(&mut self, text: String, request_id: String) {
+        tracing::info!(call_id = %self.id, event = "stt.transcript", request_id = %request_id, text = %text, "transcript received");
         let speech_end = self.speech_end_at.take();
         let ignore = |a: &Self, why: &str| {
             tracing::info!(call_id = %a.id, event = "stt.transcript.ignored", why, text = %text, "transcript ignored");

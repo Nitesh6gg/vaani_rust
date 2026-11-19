@@ -42,7 +42,8 @@ pub struct SttConfig {
 pub enum SttEvent {
     SpeechStarted,
     SpeechEnded,
-    Final(String),
+    /// A transcript and Sarvam's `request_id` for it (empty when the message carried none).
+    Final(String, String),
 }
 
 // One frame per 20ms tick, moved by value: boxing it would put an allocation on the hot path.
@@ -126,7 +127,7 @@ pub(crate) fn parse(text: &str, call_id: &str) -> Option<SttEvent> {
     match (m.kind.as_str(), m.data.signal_type.as_str()) {
         ("events", "START_SPEECH") => Some(SttEvent::SpeechStarted),
         ("events", "END_SPEECH") => Some(SttEvent::SpeechEnded),
-        ("data", _) if !m.data.transcript.is_empty() => Some(SttEvent::Final(m.data.transcript)),
+        ("data", _) if !m.data.transcript.is_empty() => Some(SttEvent::Final(m.data.transcript, m.data.request_id)),
         _ => None,
     }
 }
@@ -223,7 +224,8 @@ mod tests {
         let p = |s| parse(s, "t");
         assert_eq!(p(r#"{"type":"events","data":{"signal_type":"START_SPEECH"}}"#), Some(SttEvent::SpeechStarted));
         assert_eq!(p(r#"{"type":"events","data":{"signal_type":"END_SPEECH"}}"#), Some(SttEvent::SpeechEnded));
-        assert_eq!(p(r#"{"type":"data","data":{"transcript":"नमस्ते"}}"#), Some(SttEvent::Final("नमस्ते".into())));
+        assert_eq!(p(r#"{"type":"data","data":{"transcript":"नमस्ते"}}"#), Some(SttEvent::Final("नमस्ते".into(), String::new())));
+        assert_eq!(p(r#"{"type":"data","data":{"request_id":"r1","transcript":"x"}}"#), Some(SttEvent::Final("x".into(), "r1".into())));
         assert_eq!(p(r#"{"type":"data","data":{"transcript":""}}"#), None);
         assert_eq!(p(r#"{"type":"error","data":{"message":"boom"}}"#), None);
         assert_eq!(p("garbage"), None);
