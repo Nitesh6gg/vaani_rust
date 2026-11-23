@@ -34,6 +34,25 @@ The organization's Dograh telephony configuration must be provider `ari`; its `o
 `sip_technology`, `strip_number_prefix`, `from_numbers` and `number_workflow_map` give the dial
 string and caller ID (Vaani uses its own ARI connection from `.env`, never the config's ARI password):
 `<tech>/<number minus prefix>@<trunk>`, caller ID = the number mapped to the workflow, else the first of `from_numbers`.
+
+### Several caller IDs (DIDs) for one campaign
+
+A campaign can select some of the organization's `from_numbers` in Dograh's campaign form. They are stored in the
+campaign's `orchestrator_metadata`: `caller_ids` (the numbers) and `caller_id_strategy`. The selection **wins over**
+the number mapped to the workflow; without one, nothing changes.
+
+| Strategy | The call goes out on |
+|---|---|
+| `round_robin` (default) | the next selected number in turn (Redis counter `caller_id_rr:<campaign>`, advanced by Dograh's backend too) |
+| `random` | a random selected number |
+| `sticky` | always the same number for the same contact (FNV-1a hash of the dialed number, the same function as Dograh's backend) |
+
+A retry of a call that was not answered (busy, no answer, voicemail) goes out on a number **not tried yet** for that
+contact: the numbers its attempts used are kept in the queued run's variables (`tried_caller_ids`, oldest first).
+When every selected number was tried, the one tried longest ago is used again. If none of the selected numbers is in
+`from_numbers` any more (someone removed it), the campaign is **paused** (`campaign.paused`, reason "none of the
+campaign's selected caller IDs…") instead of dialing from a number nobody chose. A changed selection applies within
+`CAMPAIGN_POLL_SECONDS`. The `campaign.dialed` log line carries `caller_id`; Homer shows it as the call's From number.
 The Stasis app must be the one Vaani is connected as (`ARI_APP`): a dialed channel enters it on answer.
 
 ## How fast it dials

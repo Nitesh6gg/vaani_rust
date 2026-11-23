@@ -273,6 +273,16 @@ impl Limiter {
         }
     }
 
+    /// The next number of campaign `campaign`'s round-robin caller ID rotation. Dograh's backend advances
+    /// the same key (`caller_id_rr:<campaign>`), so the rotation carries on whichever engine dials.
+    pub async fn next_caller_index(&self, campaign: i32) -> Result<u64> {
+        let key = format!("caller_id_rr:{campaign}");
+        let n: i64 = redis::cmd("INCR").arg(&key).query_async(&mut self.rdb()).await.context("campaign: caller id rotation")?;
+        // Only a leftover key is at stake, so a failed EXPIRE is not worth failing the dial.
+        let _: Result<i64, _> = redis::cmd("EXPIRE").arg(&key).arg(7 * 24 * 3600).query_async(&mut self.rdb()).await;
+        Ok(n as u64)
+    }
+
     /// Reserves a concurrent-call slot for `org`, up to `limit` calls at once across both
     /// engines, and under Vaani's own cap. `None` when either is full.
     pub async fn acquire_slot(&self, org: i32, limit: i32) -> Result<Option<Slot>> {

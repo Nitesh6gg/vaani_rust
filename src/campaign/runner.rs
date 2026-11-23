@@ -3,6 +3,7 @@
 //! and the circuit breaker from how it ends. Dograh's UI starts, pauses and resumes
 //! campaigns; the Runner only follows their state.
 
+use super::caller_id::{self, Strategy};
 use super::limiter::{Limiter, Slot};
 use crate::{
     ari::outbound::{DialRequest, Outcome},
@@ -399,7 +400,11 @@ impl Runner {
             tracing::error!(component = "campaign", event = "campaign.place_failed", campaign_id = c.id, queued_run_id = q.id, error = %e, "campaign: {why}");
         };
 
-        let caller = settings.caller_id(c.workflow_id);
+        // `tried`: the numbers this contact's calls have used, this one included (empty without a selection).
+        let Some((caller, tried)) = self.choose_caller(c, &q, &settings, &phone).await else {
+            return self.give_back(&q, &slot).await;
+        };
+        let caller_shown = caller.clone();
 
         let run_id = match self.store.create_outbound_run(c, &q, &phone, &caller).await {
             Ok(id) => id,
@@ -412,7 +417,13 @@ impl Runner {
         self.add_inflight(c.id, 1);
         self.track(run_id, true);
 
-        let (me, camp, queued, held) = (self.clone(), c.clone(), q.clone(), slot.clone());
+        // A retry of an unanswered call goes out on another number: it inherits the numbers tried so far
+        // (schedule_retry copies the variables of this row).
+        let mut queued = q.clone();
+        if !tried.is_empty() {
+            queued.variables.insert("tried_caller_ids".into(), Value::from(tried));
+        }
+        let (me, camp, held) = (self.clone(), c.clone(), slot.clone());
         let req = DialRequest {
             endpoint: settings.endpoint(&phone),
             caller_id: caller,
@@ -442,8 +453,37 @@ impl Runner {
         metrics::CAMPAIGN_DIALS.fetch_add(1, Relaxed);
         self.set_run_state(&q, RunState::Processed).await;
         tracing::info!(component = "campaign", event = "campaign.dialed", campaign_id = c.id, org_id = c.organization_id, queued_run_id = q.id, run_id,
-            called_number = %phone, retry_count = q.retry_count, "campaign call placed");
+            called_number = %phone, caller_id = %caller_shown, retry_count = q.retry_count, "campaign call placed");
         Step::Dialed
+    }
+
+    /// The caller ID for contact `q`'s call, with the numbers tried for it so far (this one included).
+    /// Without a selection that is the organization's usual number (the one mapped to the workflow, else
+    /// the first), and nothing is tracked. With one, the strategy picks among the selected numbers that
+    /// are still configured, avoiding those an earlier attempt used. `None` (after pausing the campaign)
+    /// when none of the selected numbers is configured any more: dialing from another number would be a
+    /// surprise.
+    async fn choose_caller(&self, c: &Campaign, q: &QueuedRun, settings: &DialSettings, phone: &str) -> Option<(String, Vec<String>)> {
+        if c.caller_ids.is_empty() {
+            return Some((settings.caller_id(c.workflow_id), Vec::new()));
+        }
+        let cands = caller_id::candidates(&c.caller_ids, &settings.from_numbers);
+        if cands.is_empty() {
+            self.pause(c, "provider", "none of the campaign's selected caller IDs is configured any more").await;
+            return None;
+        }
+        let entropy: u64 = rand::random();
+        let counter = if c.caller_id_strategy == Strategy::RoundRobin {
+            // The rotation is a nicety: if Redis fails, a random start still spreads the calls.
+            self.lim.next_caller_index(c.id).await.unwrap_or(entropy)
+        } else {
+            0
+        };
+        let tried = caller_id::tried_of(&q.variables);
+        let number = caller_id::pick(&cands, c.caller_id_strategy, &tried, phone, counter, entropy)?;
+        tracing::debug!(component = "campaign", event = "campaign.caller_id", campaign_id = c.id, caller_id = %number,
+            strategy = c.caller_id_strategy.as_str(), selected = cands.len(), tried = tried.len(), "campaign: caller ID chosen");
+        Some((number.clone(), caller_id::with_tried(tried, &number)))
     }
 
     async fn give_back(&self, q: &QueuedRun, slot: &Slot) -> Step {

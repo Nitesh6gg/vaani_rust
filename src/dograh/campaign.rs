@@ -4,6 +4,7 @@
 //! so a campaign behaves the same whichever engine dials.
 
 use super::{Store, outbound::DialSettings, store::Cached};
+use crate::campaign::caller_id::{self, Strategy};
 use anyhow::{Context, Result, bail};
 use jiff::{Timestamp, tz::TimeZone};
 use serde::Deserialize;
@@ -22,6 +23,10 @@ pub struct Campaign {
     pub retry: RetryConfig,
     pub schedule: Schedule,
     pub breaker: BreakerConfig,
+    /// The organization's numbers this campaign calls from (orchestrator_metadata.caller_ids); empty =
+    /// the organization's default number.
+    pub caller_ids: Vec<String>,
+    pub caller_id_strategy: Strategy,
 }
 
 /// campaigns.retry_config.
@@ -109,6 +114,9 @@ struct MetaJson {
     max_concurrency: Option<i32>,
     schedule_config: Option<ScheduleJson>,
     circuit_breaker: Option<BreakerJson>,
+    /// A list, or one string, as Dograh accepts for from_numbers.
+    caller_ids: Option<Value>,
+    caller_id_strategy: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -151,6 +159,12 @@ pub fn parse_campaign(c: &mut Campaign, retry_json: &str, meta_json: &str) -> Re
         on_voicemail: r.retry_on_voicemail.unwrap_or(true),
     };
     c.max_concurrency = m.max_concurrency.unwrap_or(0);
+    c.caller_ids = caller_id::clean(match m.caller_ids {
+        Some(Value::Array(a)) => a.into_iter().filter_map(|v| v.as_str().map(String::from)).collect(),
+        Some(Value::String(s)) => vec![s],
+        _ => Vec::new(),
+    });
+    c.caller_id_strategy = Strategy::parse(m.caller_id_strategy.as_deref().unwrap_or_default());
 
     c.breaker = BreakerConfig { enabled: true, threshold: 0.5, window: Duration::from_secs(120), min_calls: 5 };
     if let Some(b) = m.circuit_breaker {
@@ -521,6 +535,25 @@ mod tests {
         assert!(!campaign(r#"{"enabled": false}"#, "").retry.eligible("no_answer"));
         let mut bad = Campaign::default();
         assert!(parse_campaign(&mut bad, "{nope", "").is_err());
+    }
+
+    #[test]
+    fn selected_caller_ids_and_strategy_are_read_from_the_metadata() {
+        let none = campaign("", "");
+        assert!(none.caller_ids.is_empty());
+        assert_eq!(none.caller_id_strategy, Strategy::RoundRobin);
+
+        let c = campaign("", r#"{"caller_ids": ["0731111", " ", "0732222", "0731111"], "caller_id_strategy": "sticky"}"#);
+        assert_eq!(c.caller_ids, ["0731111", "0732222"], "blanks and duplicates dropped");
+        assert_eq!(c.caller_id_strategy, Strategy::Sticky);
+
+        // One string is accepted as a list of one, and an unknown strategy is the default.
+        let one = campaign("", r#"{"caller_ids": "0731111", "caller_id_strategy": "nonsense"}"#);
+        assert_eq!(one.caller_ids, ["0731111"]);
+        assert_eq!(one.caller_id_strategy, Strategy::RoundRobin);
+
+        // Anything else is ignored rather than breaking the campaign.
+        assert!(campaign("", r#"{"caller_ids": 5}"#).caller_ids.is_empty());
     }
 
     #[test]
