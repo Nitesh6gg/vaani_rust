@@ -405,8 +405,12 @@ impl Runner {
             return self.give_back(&q, &slot).await;
         };
         let caller_shown = caller.clone();
+        // The call's own variables (what the agent and the Dograh run see): the dialer's list of numbers tried is its own
+        // bookkeeping, carried only on the row a retry is made from (below), never into the call.
+        let mut attempt = q.clone();
+        attempt.variables.remove(caller_id::TRIED_KEY);
 
-        let run_id = match self.store.create_outbound_run(c, &q, &phone, &caller).await {
+        let run_id = match self.store.create_outbound_run(c, &attempt, &phone, &caller).await {
             Ok(id) => id,
             Err(e) => {
                 give_back("creating the call's Dograh run failed", format!("{e:#}"));
@@ -419,9 +423,9 @@ impl Runner {
 
         // A retry of an unanswered call goes out on another number: it inherits the numbers tried so far
         // (schedule_retry copies the variables of this row).
-        let mut queued = q.clone();
+        let mut queued = attempt.clone();
         if !tried.is_empty() {
-            queued.variables.insert("tried_caller_ids".into(), Value::from(tried));
+            queued.variables.insert(caller_id::TRIED_KEY.into(), Value::from(tried));
         }
         let (me, camp, held) = (self.clone(), c.clone(), slot.clone());
         let req = DialRequest {
@@ -431,7 +435,7 @@ impl Runner {
             ring_timeout: self.cfg.ring_timeout,
             workflow_id: c.workflow_id,
             run_id,
-            variables: q.variables.clone(),
+            variables: attempt.variables,
             // On its own task, so the ARI event loop never waits on the database.
             done: Box::new(move |out| {
                 tokio::spawn(async move { me.finished(&camp, &queued, run_id, &held, out).await });
@@ -1118,6 +1122,97 @@ mod tests {
         assert_eq!(r.placer.count(), 0);
         assert_eq!(queued(&r).await, 2, "checked before a contact is claimed");
         assert_eq!(campaign_state(&r).await, "running", "an error to fix, not a reason to pause");
+        r.cancel.cancel();
+        r.task.await.unwrap();
+    }
+
+    async fn queued_count(db: &deadpool_postgres::Object) -> i64 {
+        db.query_one("SELECT count(*) FROM queued_runs WHERE state::text = 'queued'", &[]).await.unwrap().get(0)
+    }
+
+    /// Three numbers are configured for the organization; the campaign selects two (or whatever `meta` says).
+    const THREE_NUMBERS: &str = "UPDATE organization_configurations SET value = '{\"provider\": \"ari\", \"outbound_trunk\": \"carrier\", \"from_numbers\": [\"0731111\", \"0732222\", \"0733333\"]}' WHERE key = 'TELEPHONY_CONFIGURATION';";
+
+    /// A campaign that selects some of the organization's numbers dials only from those, taking turns.
+    #[tokio::test]
+    async fn selected_caller_ids_take_turns_and_the_rest_are_not_used() {
+        let meta = r#"{"caller_ids": ["0731111", "0732222"], "caller_id_strategy": "round_robin"}"#;
+        let Some(r) = rig("t_runner_did_rr", &["+911", "+912", "+913", "+914", "+915", "+916"], "{}", meta, THREE_NUMBERS, Some(20)).await
+        else {
+            return eprintln!("skipped: DOGRAH_TEST_DB_URL / REDIS_TEST_URL not set");
+        };
+        wait_for("six calls", || r.placer.count() == 6).await;
+        let callers: Vec<String> = r.placer.placed.lock().unwrap().iter().map(|p| p.1.clone()).collect();
+        for n in ["0731111", "0732222"] {
+            assert_eq!(callers.iter().filter(|c| *c == n).count(), 3, "each selected number gets half of the calls: {callers:?}");
+        }
+        assert!(!callers.iter().any(|c| c == "0733333"), "a number the campaign did not select is never used: {callers:?}");
+        // The run Dograh shows records the number the call used.
+        let db = r.store.db().await.unwrap();
+        let rows = db.query("SELECT DISTINCT initial_context::text FROM workflow_runs", &[]).await.unwrap();
+        assert!(!rows.is_empty());
+        r.cancel.cancel();
+        r.task.await.unwrap();
+    }
+
+    /// When none of the selected numbers is configured any more, the campaign pauses and no call goes out from another number.
+    #[tokio::test]
+    async fn a_selection_with_no_configured_number_pauses_the_campaign_and_keeps_the_contacts() {
+        let meta = r#"{"caller_ids": ["0739999"], "caller_id_strategy": "random"}"#;
+        let Some(r) = rig("t_runner_did_none", &["+911", "+912"], "{}", meta, THREE_NUMBERS, Some(20)).await else {
+            return eprintln!("skipped: DOGRAH_TEST_DB_URL / REDIS_TEST_URL not set");
+        };
+        for _ in 0..200 {
+            if campaign_state(&r).await == "paused" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(campaign_state(&r).await, "paused");
+        let db = r.store.db().await.unwrap();
+        for _ in 0..200 {
+            if queued_count(&db).await == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(r.placer.count(), 0, "nothing is dialed from a number the campaign did not select");
+        assert_eq!(queued_count(&db).await, 2, "both contacts are back in the queue, none lost");
+        r.cancel.cancel();
+        r.task.await.unwrap();
+    }
+
+    /// A retry of an unanswered call goes out on a number not tried yet, then the numbers take turns again; the bookkeeping
+    /// of which numbers were tried is the dialer's own and never reaches the call's variables or the Dograh run.
+    #[tokio::test]
+    async fn a_retry_uses_another_number_and_the_tried_list_stays_out_of_the_call() {
+        let meta = r#"{"caller_ids": ["0731111", "0732222"], "caller_id_strategy": "round_robin"}"#;
+        let retry = r#"{"max_retries": 3, "retry_delay_seconds": 1}"#;
+        let Some(r) = rig("t_runner_did_retry", &["+911"], retry, meta, THREE_NUMBERS, Some(20)).await else {
+            return eprintln!("skipped: DOGRAH_TEST_DB_URL / REDIS_TEST_URL not set");
+        };
+        let mut callers: Vec<String> = vec![];
+        for n in 0..4 {
+            wait_for("the next attempt", || r.placer.count() == n + 1).await;
+            callers.push(r.placer.placed.lock().unwrap()[n].1.clone());
+            r.placer.end(n, out(false, "busy", 17));
+        }
+        assert_ne!(callers[0], callers[1], "the retry goes out on the number not tried yet: {callers:?}");
+        assert_eq!((&callers[2], &callers[3]), (&callers[0], &callers[1]), "then they take turns, oldest try first: {callers:?}");
+        assert!(callers.iter().all(|c| c == "0731111" || c == "0732222"), "{callers:?}");
+        {
+            let placed = r.placer.placed.lock().unwrap();
+            for (i, p) in placed.iter().enumerate() {
+                assert!(!p.5.contains_key("tried_caller_ids"), "attempt {i}: the tried list reached the call's variables: {:?}", p.5);
+            }
+        }
+        let db = r.store.db().await.unwrap();
+        let leaked: i64 = db
+            .query_one("SELECT count(*) FROM workflow_runs WHERE initial_context::text LIKE '%tried_caller_ids%'", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(leaked, 0, "the tried list is not written into the Dograh run's context");
         r.cancel.cancel();
         r.task.await.unwrap();
     }

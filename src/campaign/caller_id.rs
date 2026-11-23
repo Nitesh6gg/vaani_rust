@@ -86,17 +86,22 @@ pub fn pick(cands: &[String], strategy: Strategy, tried: &[String], contact: &st
     Some(fresh[i as usize].clone())
 }
 
-/// The numbers a queued run's earlier attempts used.
+/// The variable a queued run carries its tried numbers in (the dialer's bookkeeping, not part of a call's variables).
+pub const TRIED_KEY: &str = "tried_caller_ids";
+
+/// The numbers a queued run's earlier attempts used, oldest try first.
 pub fn tried_of(vars: &Map<String, Value>) -> Vec<String> {
-    vars.get("tried_caller_ids")
+    vars.get(TRIED_KEY)
         .and_then(Value::as_array)
         .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
         .unwrap_or_default()
 }
 
-/// `tried` plus `last`, the number the attempt that is starting uses.
+/// `tried` plus `last`, the number the attempt that is starting uses. A number used again moves to the end (the
+/// most recent try), so when every number was tried the one tried longest ago is the next, and they take turns.
 pub fn with_tried(mut tried: Vec<String>, last: &str) -> Vec<String> {
-    if !last.is_empty() && !tried.iter().any(|t| t == last) {
+    if !last.is_empty() {
+        tried.retain(|t| t != last);
         tried.push(last.to_string());
     }
     tried
@@ -193,9 +198,24 @@ mod tests {
         let mut vars = Map::new();
         assert!(tried_of(&vars).is_empty());
         let t = with_tried(with_tried(Vec::new(), "0731111"), "0732222");
-        vars.insert("tried_caller_ids".into(), Value::from(t.clone()));
+        vars.insert(TRIED_KEY.into(), Value::from(t.clone()));
         assert_eq!(tried_of(&vars), t);
-        assert_eq!(with_tried(t.clone(), "0731111"), t, "no duplicates");
+        assert_eq!(with_tried(t.clone(), "0731111"), v(&["0732222", "0731111"]), "no duplicates: a number used again moves to the end");
         assert_eq!(with_tried(t.clone(), ""), t, "a blank number adds nothing");
+    }
+
+    /// Retries rotate: a number used again moves to the end of the tried list, so with two numbers the attempts alternate for as
+    /// long as it goes on (a list that kept its first order would reuse the same number every time once both were tried).
+    #[test]
+    fn retries_alternate_between_two_numbers_for_as_long_as_they_go_on() {
+        let cands = v(&["0731111", "0732222"]);
+        let (mut tried, mut used) = (Vec::new(), Vec::new());
+        for attempt in 0..6 {
+            let n = pick(&cands, Strategy::RoundRobin, &tried, "", attempt, 0).unwrap();
+            tried = with_tried(tried, &n);
+            used.push(n);
+        }
+        assert_eq!(used, v(&["0731111", "0732222", "0731111", "0732222", "0731111", "0732222"]));
+        assert_eq!(tried.len(), 2, "the list never grows past the selected numbers");
     }
 }
