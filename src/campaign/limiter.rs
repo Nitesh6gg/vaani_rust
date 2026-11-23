@@ -277,9 +277,19 @@ impl Limiter {
     /// the same key (`caller_id_rr:<campaign>`), so the rotation carries on whichever engine dials.
     pub async fn next_caller_index(&self, campaign: i32) -> Result<u64> {
         let key = format!("caller_id_rr:{campaign}");
-        let n: i64 = redis::cmd("INCR").arg(&key).query_async(&mut self.rdb()).await.context("campaign: caller id rotation")?;
-        // Only a leftover key is at stake, so a failed EXPIRE is not worth failing the dial.
-        let _: Result<i64, _> = redis::cmd("EXPIRE").arg(&key).arg(7 * 24 * 3600).query_async(&mut self.rdb()).await;
+        // One round trip for both commands (MULTI/EXEC, so nothing runs between them). The expiry only guards against a
+        // leftover key and its reply is not wanted; if the pair fails, the caller falls back to a random start.
+        let (n,): (i64,) = redis::pipe()
+            .atomic()
+            .cmd("INCR")
+            .arg(&key)
+            .cmd("EXPIRE")
+            .arg(&key)
+            .arg(7 * 24 * 3600)
+            .ignore()
+            .query_async(&mut self.rdb())
+            .await
+            .context("campaign: caller id rotation")?;
         Ok(n as u64)
     }
 
@@ -509,5 +519,16 @@ mod tests {
         assert_eq!(l.breaker_open(c, &cfg).await.unwrap().1.total(), 0);
         let off = BreakerConfig { enabled: false, ..cfg };
         assert_eq!(l.record_outcome(c, true, &off).await.unwrap(), (false, BreakerStats::default()), "a disabled breaker records nothing");
+    }
+
+    /// The round-robin counter counts up from 1 and carries an expiry (a leftover key must not live for ever).
+    #[tokio::test]
+    async fn the_caller_id_rotation_counts_up_and_expires() {
+        let Some((l, id)) = limiter(0).await else { return eprintln!("skipped: REDIS_TEST_URL not set") };
+        let key = format!("caller_id_rr:{id}");
+        assert_eq!((l.next_caller_index(id).await.unwrap(), l.next_caller_index(id).await.unwrap()), (1, 2));
+        let ttl: i64 = redis::cmd("TTL").arg(&key).query_async(&mut l.rdb()).await.unwrap();
+        assert!((1..=7 * 24 * 3600).contains(&ttl), "the key expires within a week, ttl = {ttl}");
+        let _: i64 = redis::cmd("DEL").arg(&key).query_async(&mut l.rdb()).await.unwrap();
     }
 }
