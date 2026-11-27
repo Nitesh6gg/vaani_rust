@@ -82,6 +82,8 @@ pub struct CallLog {
     pub held_delivered: u32,
     pub errors: HashMap<String, u32>,
     pub reply_latencies_ms: Vec<u64>,
+    /// The caller's real wait per reply: our VAD's last speech -> the reply's first audio.
+    pub caller_waits_ms: Vec<u64>,
     pub llm_usage: HashMap<String, Usage>,
     pub tts_chars: u64,
     pub stt_seconds: f64,
@@ -105,6 +107,8 @@ pub struct Summary {
     pub held_delivered: u32,
     pub errors: HashMap<String, u32>,
     pub reply_latencies_ms: Vec<u64>,
+    /// The caller's real wait per reply: our VAD's last speech -> the reply's first audio.
+    pub caller_waits_ms: Vec<u64>,
     pub llm_usage: HashMap<String, Usage>,
     pub tts_chars: u64,
     pub stt_seconds: f64,
@@ -208,6 +212,12 @@ impl CallLog {
         self.add(LATENCY, Self::obj(json!({"latency_seconds": d.as_secs_f64()})));
     }
 
+    /// One reply's wait from the caller's last speech (our VAD), which `reply_latency` starts after:
+    /// it begins at the STT's end-of-speech, which comes only after the flush's quiet. Summary only.
+    pub fn caller_wait(&mut self, d: std::time::Duration) {
+        self.caller_waits_ms.push(d.as_millis() as u64);
+    }
+
     /// One turn's time to first byte for a service ("stt", "llm", "tts").
     pub fn ttfb(&mut self, service: &str, d: std::time::Duration) {
         crate::metrics::ttfb(service, d);
@@ -247,6 +257,7 @@ impl CallLog {
             held_delivered: self.held_delivered,
             errors: self.errors,
             reply_latencies_ms: self.reply_latencies_ms,
+            caller_waits_ms: self.caller_waits_ms,
             llm_usage: self.llm_usage,
             tts_chars: self.tts_chars,
             stt_seconds: self.stt_seconds,

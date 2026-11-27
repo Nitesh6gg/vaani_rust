@@ -265,6 +265,13 @@ struct Agent {
     flushed_utt: Option<Instant>,
     llm_usage_key: String,
     turn_speech_end: Option<Instant>,
+    /// The turn's timing from the caller's side: our VAD's last speech before its transcript (what the
+    /// caller's wait starts from: the STT's end-of-speech comes only after our flush), the STT flush that
+    /// followed it, and whether the turn had to open its TTS socket first.
+    turn_vad_end: Option<Instant>,
+    turn_flush: Option<Instant>,
+    turn_tts_cold: bool,
+    flushed_at: Option<Instant>,
     /// Extractions running in the background, in the order they started.
     extracting: Vec<extract::Pending>,
     hold: Option<Hold>,
@@ -354,6 +361,10 @@ pub async fn run(cfg: AgentConfig, io: AgentIo, cancel: CancellationToken) -> (S
         flushed_utt: None,
         llm_usage_key,
         turn_speech_end: None,
+        turn_vad_end: None,
+        turn_flush: None,
+        turn_tts_cold: false,
+        flushed_at: None,
         extracting: vec![],
         hold: None,
         state: State::Listening,
@@ -538,6 +549,7 @@ impl Agent {
             return;
         }
         self.flushed_utt = Some(utt);
+        self.flushed_at = Some(Instant::now());
         if self.stt.flush() {
             tracing::debug!(call_id = %self.id, event = "stt.flush", quiet_ms = quiet.as_millis() as u64, "stt flush sent");
         } else {
@@ -899,6 +911,10 @@ impl Agent {
         self.turn += 1;
         self.log.user_said(&text, started);
         self.turn_speech_end = speech_end;
+        // Only a fresh transcript (not held speech) times a wait, as for `turn_speech_end`. A flush from
+        // before this utterance's last speech belongs to an earlier, ignored utterance.
+        self.turn_vad_end = speech_end.and(self.cfg.vad.last_speech_at()).filter(|l| started.is_none_or(|s| *l >= s));
+        self.turn_flush = self.flushed_at.take().filter(|f| self.turn_vad_end.is_some_and(|v| *f > v));
         let endpoint_ms = speech_end.map(|t| t.elapsed().as_millis() as u64);
         if let Some(t) = speech_end {
             // Sarvam's end-of-speech -> its transcript: Dograh's STT TTFB.
@@ -1038,6 +1054,7 @@ impl Agent {
         self.start_turn_chunks();
         let cancel = self.cancel.child_token();
         self.turn_cancel = Some(cancel.clone());
+        self.turn_tts_cold = self.tts.is_none();
         if self.tts.is_none() {
             self.next_conn += 1;
         }
@@ -1131,6 +1148,15 @@ impl Agent {
             if let Some(t) = self.turn_speech_end.take() {
                 // The caller's wait, from the STT's end-of-speech to the reply's first audio.
                 self.log.reply_latency(t.elapsed());
+            }
+            if let Some(v) = self.turn_vad_end.take() {
+                let wait = v.elapsed();
+                self.log.caller_wait(wait);
+                let ms = |a: Instant, b: Instant| b.saturating_duration_since(a).as_millis() as u64;
+                let flush = self.turn_flush.take();
+                tracing::debug!(call_id = %self.id, event = "turn.timing", generation, caller_wait_ms = wait.as_millis() as u64,
+                    vad_end_to_flush_ms = flush.map(|f| ms(v, f)), flush_to_transcript_ms = flush.map(|f| ms(f, self.turn_started)),
+                    transcript_to_audio_ms = ttfa.as_millis() as u64, tts_cold = self.turn_tts_cold, "turn timing");
             }
             // Start draining to the caller only once real audio has arrived,
             // not when text is merely sent: flipping earlier left a silence gap

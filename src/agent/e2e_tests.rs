@@ -672,6 +672,33 @@ async fn the_stt_is_asked_to_finalize_once_the_vad_hears_quiet_after_speech() {
     r.cancel.cancel();
 }
 
+#[tokio::test]
+async fn the_callers_wait_is_timed_from_their_last_speech_not_the_stts_end_of_speech() {
+    let wf = Workflow { start: 0, nodes: vec![Node { greeting: "Hi.".into(), ..start_node() }] };
+    let mut r = rig_tuned(wf, 2, |_| sse("ok."), |c| c.stt_flush_after = Duration::from_millis(200)).await;
+    let _ = heard(&mut r, 0, 2, Duration::from_secs(3)).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    r.stt_tx.send(r#"{"type":"events","data":{"signal_type":"START_SPEECH"}}"#.into()).unwrap();
+    feed_frames(&r, loud(), 10).await;
+    feed_frames(&r, SILENCE, 20).await; // 400ms of quiet: the flush goes out after 200ms of it
+    assert_eq!(r.stt_flushes.load(SeqCst), 1);
+    r.stt_tx.send(r#"{"type":"events","data":{"signal_type":"END_SPEECH"}}"#.into()).unwrap();
+    r.stt_tx.send(r#"{"type":"data","data":{"transcript":"hello"}}"#.into()).unwrap();
+    let _ = heard(&mut r, 0, 2, Duration::from_secs(3)).await;
+
+    r.cancel.cancel();
+    let (s, _) = r.done.await.unwrap();
+    assert_eq!((s.caller_waits_ms.len(), s.reply_latencies_ms.len()), (1, 1), "one reply, timed both ways");
+    // The caller's wait includes the ~400ms of quiet before END_SPEECH that the STT-based latency leaves out.
+    assert!(
+        s.caller_waits_ms[0] >= s.reply_latencies_ms[0] + 300,
+        "wait {}ms vs latency {}ms",
+        s.caller_waits_ms[0],
+        s.reply_latencies_ms[0]
+    );
+}
+
 // ------------------------------------------------------------ transfer ---
 
 use super::{

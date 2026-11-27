@@ -33,7 +33,9 @@ pub(crate) async fn ws_connect(
     // tungstenite's default 128 KiB read + write buffers per socket, times two
     // sockets per call, dominated a call's memory. Audio messages are ~1-2 KB.
     let cfg = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default().read_buffer_size(16 * 1024).write_buffer_size(0);
-    let (ws, resp) = tokio::time::timeout(timeout, tokio_tungstenite::connect_async_with_config(req, Some(cfg), false))
+    // `true` = TCP_NODELAY: Nagle would hold a small message (the STT flush, the TTS text) until Sarvam
+    // acknowledges the previous one -- up to a round trip added to the turn.
+    let (ws, resp) = tokio::time::timeout(timeout, tokio_tungstenite::connect_async_with_config(req, Some(cfg), true))
         .await
         .map_err(|_| anyhow::anyhow!("handshake timed out"))??;
     let rid =
