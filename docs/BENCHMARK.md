@@ -15,7 +15,7 @@ The same names, labels and histogram buckets the Go engine exports, so one set o
 | `vaani_tokio_alive_tasks` | the Rust analogue of `go_goroutines` (there is no `go_memstats_*`: compare RSS) |
 | `vaani_calls_active`, `vaani_calls_started_total{direction}`, `vaani_media_ports_in_use`, `vaani_calls_setting_up` | calls (started = bridged, as in Go) |
 | `vaani_call_duration_seconds` (histogram) | bridged calls, staging to teardown: `_count` = answered calls, `_sum` = talk time |
-| `vaani_llm_ttft_ms`, `vaani_tts_ttfa_ms`, `vaani_stt_endpoint_ms` (histograms, 50 ms..25.6 s) | latency |
+| `vaani_llm_ttft_ms`, `vaani_tts_ttfa_ms`, `vaani_stt_endpoint_ms`, `vaani_caller_wait_ms` (histograms, 50 ms..25.6 s; the last is the caller's last speech to the first reply audio, flush wait included) | latency |
 | `vaani_pacer_drift_ms` (histogram) | how far each 20 ms writer tick is from the nominal interval (a stall is one big miss) |
 | `vaani_agent_turns_total`, `vaani_agent_errors_total{stage}`, `vaani_agent_bargein_total`, `vaani_agent_interruption_pauses_total`, `vaani_agent_false_interruptions_total` | agent |
 | `vaani_llm_retries_total{result}`, `vaani_llm_fallback_total{kind}`, `vaani_tool_calls_total{tool,outcome}`, `vaani_tool_call_duration_ms{tool}` | LLM and tools |

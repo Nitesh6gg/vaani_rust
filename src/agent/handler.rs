@@ -913,7 +913,8 @@ impl Agent {
         self.turn_speech_end = speech_end;
         // Only a fresh transcript (not held speech) times a wait, as for `turn_speech_end`. A flush from
         // before this utterance's last speech belongs to an earlier, ignored utterance.
-        self.turn_vad_end = speech_end.and(self.cfg.vad.last_speech_at()).filter(|l| started.is_none_or(|s| *l >= s));
+        // The utterance's start must be known: without it, `last_speech_at` could be an earlier utterance's and inflate the wait.
+        self.turn_vad_end = speech_end.and(self.cfg.vad.last_speech_at()).filter(|l| started.is_some_and(|s| *l >= s));
         self.turn_flush = self.flushed_at.take().filter(|f| self.turn_vad_end.is_some_and(|v| *f > v));
         let endpoint_ms = speech_end.map(|t| t.elapsed().as_millis() as u64);
         if let Some(t) = speech_end {
@@ -1154,7 +1155,7 @@ impl Agent {
                 self.log.caller_wait(wait);
                 let ms = |a: Instant, b: Instant| b.saturating_duration_since(a).as_millis() as u64;
                 let flush = self.turn_flush.take();
-                tracing::debug!(call_id = %self.id, event = "turn.timing", generation, caller_wait_ms = wait.as_millis() as u64,
+                tracing::info!(call_id = %self.id, event = "turn.timing", generation, caller_wait_ms = wait.as_millis() as u64,
                     vad_end_to_flush_ms = flush.map(|f| ms(v, f)), flush_to_transcript_ms = flush.map(|f| ms(f, self.turn_started)),
                     transcript_to_audio_ms = ttfa.as_millis() as u64, tts_cold = self.turn_tts_cold, "turn timing");
             }

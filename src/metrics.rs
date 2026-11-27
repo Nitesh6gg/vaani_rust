@@ -132,10 +132,18 @@ pub static LLM_TTFT_MS: Histogram<18> = Histogram::new(&TTFB_MS);
 pub static TTS_TTFA_MS: Histogram<18> = Histogram::new(&TTFB_MS);
 /// Time from Sarvam's END_SPEECH to its final transcript.
 pub static STT_ENDPOINT_MS: Histogram<18> = Histogram::new(&TTFB_MS);
+/// The caller's wait for a reply: our VAD's last speech to the first reply audio the engine produces. It includes the
+/// flush's quiet that `reply_latency` (from Sarvam's END_SPEECH) leaves out; it excludes the playout queue (up to
+/// 100 ms), Asterisk and the phone network.
+pub static CALLER_WAIT_MS: Histogram<18> = Histogram::new(&TTFB_MS);
 /// Bridged calls, from staging (answer) to teardown.
 pub static CALL_DURATION_SECONDS: Histogram<13> = Histogram::new(&CALL_SECONDS);
 /// How far each 20ms tick of a call's writer was from its nominal interval.
 pub static PACER_DRIFT_MS: Histogram<9> = Histogram::new(&PACER_MS);
+
+pub fn caller_wait(d: std::time::Duration) {
+    CALLER_WAIT_MS.observe(d.as_secs_f64() * 1000.0);
+}
 
 /// The service a time-to-first-byte is for: "llm", "tts" or "stt" (Dograh's names).
 pub fn ttfb(service: &str, d: std::time::Duration) {
@@ -387,8 +395,12 @@ vaani_redis_errors_total {}
     for (d, c) in DIRECTIONS.iter().zip(&CALLS_STARTED) {
         out.push_str(&format!("vaani_calls_started_total{{direction=\"{d}\"}} {}\n", c.load(Relaxed)));
     }
-    for (name, h) in [("vaani_llm_ttft_ms", &LLM_TTFT_MS), ("vaani_tts_ttfa_ms", &TTS_TTFA_MS), ("vaani_stt_endpoint_ms", &STT_ENDPOINT_MS)]
-    {
+    for (name, h) in [
+        ("vaani_llm_ttft_ms", &LLM_TTFT_MS),
+        ("vaani_tts_ttfa_ms", &TTS_TTFA_MS),
+        ("vaani_stt_endpoint_ms", &STT_ENDPOINT_MS),
+        ("vaani_caller_wait_ms", &CALLER_WAIT_MS),
+    ] {
         out.push_str(&format!("# TYPE {name} histogram\n"));
         h.render(&mut out, name, "");
     }

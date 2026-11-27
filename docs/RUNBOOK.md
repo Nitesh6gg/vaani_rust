@@ -36,6 +36,7 @@ when any step before the answer fails. A staged call whose media channel never e
 | Is audio late? | `vaani_pacer_drift_ms`, `vaani_media_queue_dropped_total`, `vaani_media_inbound_dropped_total`, `vaani_media_inbound_late_total`, `vaani_media_watchdog_timeouts_total` |
 | Post-call work backing up? | `vaani_post_call_running`, `vaani_post_call_waiting`, `vaani_recording_bytes` (memory held by recordings) |
 | Postgres pool? | `vaani_db_pool_in_use`, `_waiting`, `_timeouts_total` (waiting or timeouts mean the pool or a slow dependency) |
+| How long do callers wait for a reply? | `vaani_caller_wait_ms` (a histogram: the caller's last speech to the first reply audio the engine produces, flush wait included; add about 100 ms for the playout queue, plus Asterisk and the phone network), `caller_wait_p50_ms` / `caller_wait_p95_ms` in `call.summary`, and one `turn.timing` line per reply: `vad_end_to_flush_ms`, `flush_to_transcript_ms`, `transcript_to_audio_ms`, `tts_cold` (true when the turn had to open its TTS socket). `reply_latency_*` starts at Sarvam's end-of-speech and leaves the flush wait out |
 | Providers slow? | `vaani_llm_ttft_ms`, `vaani_tts_ttfa_ms`, `vaani_stt_endpoint_ms`, `vaani_llm_retries_total`, `vaani_llm_fallback_total` |
 | Leaked channels? | `vaani_orphan_channels_hung_up_total` (the sweep, every `ORPHAN_SWEEP_SECONDS`), log events `channel.orphan`, `call.media_orphan` |
 | Campaigns | `vaani_campaign_*`, `vaani_redis_errors_total`; log events `campaign.paused`, `campaign.redis_slow`, `campaign.recovered` |

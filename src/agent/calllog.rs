@@ -212,9 +212,12 @@ impl CallLog {
         self.add(LATENCY, Self::obj(json!({"latency_seconds": d.as_secs_f64()})));
     }
 
-    /// One reply's wait from the caller's last speech (our VAD), which `reply_latency` starts after:
-    /// it begins at the STT's end-of-speech, which comes only after the flush's quiet. Summary only.
+    /// One reply's wait from the caller's last speech (our VAD) to the first reply audio the engine produces. It starts
+    /// before `reply_latency` does (that begins at the STT's end-of-speech, which comes only after the flush's quiet), and
+    /// it ends before the audio is heard: the playout queue (up to 100 ms), Asterisk and the phone network come after.
+    /// Not part of Dograh's call history: the call summary and `vaani_caller_wait_ms` only.
     pub fn caller_wait(&mut self, d: std::time::Duration) {
+        crate::metrics::caller_wait(d);
         self.caller_waits_ms.push(d.as_millis() as u64);
     }
 

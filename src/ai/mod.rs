@@ -58,6 +58,22 @@ pub(crate) type WsStream = tokio_tungstenite::WebSocketStream<tokio_tungstenite:
 
 #[cfg(test)]
 mod tests {
+    /// The Sarvam sockets send small messages (the STT flush, the TTS text) that Nagle would hold until the previous one is
+    /// acknowledged: they must be opened with TCP_NODELAY.
+    #[tokio::test]
+    async fn provider_websockets_are_opened_with_tcp_nodelay() {
+        let lis = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/ws", lis.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (s, _) = lis.accept().await.unwrap();
+            let _ws = tokio_tungstenite::accept_async(s).await;
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        });
+        let (ws, _) = super::ws_connect(&url, "x-key", "k", std::time::Duration::from_secs(3)).await.unwrap();
+        let tokio_tungstenite::MaybeTlsStream::Plain(tcp) = ws.get_ref() else { panic!("a ws:// url is a plain stream") };
+        assert!(tcp.nodelay().unwrap(), "TCP_NODELAY is set on the provider socket");
+    }
+
     use super::request_id_in;
 
     #[test]

@@ -697,6 +697,10 @@ async fn the_callers_wait_is_timed_from_their_last_speech_not_the_stts_end_of_sp
         s.caller_waits_ms[0],
         s.reply_latencies_ms[0]
     );
+    let hist = crate::metrics::render();
+    let count: u64 =
+        hist.lines().find_map(|l| l.strip_prefix("vaani_caller_wait_ms_count ")?.trim().parse().ok()).expect("the histogram is exported");
+    assert!(count >= 1, "the wait is counted in vaani_caller_wait_ms");
 }
 
 // ------------------------------------------------------------ transfer ---
